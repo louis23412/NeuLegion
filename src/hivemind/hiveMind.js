@@ -6373,6 +6373,8 @@ class HiveMind {
 
         this.#trainingStepCount++;
 
+        let finalProb;
+
         const trainingResults = this.#updateHiveState(inputs, target, true, true, true, true);
 
         this.#accumulateGradients(
@@ -6396,14 +6398,20 @@ class HiveMind {
 
             this.#applyGradients(false, false, 1);
 
-            this.#updateHiveState(inputs, target, false, false, true, false);
+            const finalResults = this.#updateHiveState(inputs, target, false, false, true, true);
+            finalProb = finalResults.probability;
 
             this.#hiveMemorySharing();
 
             this.#gradientAccumulation = this.#setGradientStructure();
         }
 
-        return this.#trainingStepCount;
+        else finalProb = trainingResults.probability;
+
+        return {
+            step : this.#trainingStepCount,
+            prob : finalProb
+        }
     }
 
     dumpState () {

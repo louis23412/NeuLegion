@@ -24,7 +24,8 @@ class HiveMindController {
 
     #globalAccuracy = {
         trainingSteps : 0,
-        skippedDuplicate : 0
+        skippedDuplicate : 0,
+        prob : 0
     }
 
     #cacheSize;
@@ -35,8 +36,9 @@ class HiveMindController {
     #controllerID;
     #directoryPath;
     #ensembleSize;
+    #type;
 
-    constructor ( id, dp, cs, es ) {
+    constructor ( id, dp, cs, es, type ) {
         this.#controllerID = id;
 
         try {
@@ -47,12 +49,13 @@ class HiveMindController {
             process.exit(1);
         }
 
+        this.#type = type;
         this.#cacheSize = cs;
         this.#ensembleSize = es;
         this.#chooseDimension(this.#ensembleSize);
 
         this.#indicators = new IndicatorProcessor();
-        this.#db = new Database(path.join(this.#directoryPath, `hivemind_controller_${this.#controllerID}.db`), { fileMustExist: false });
+        this.#db = new Database(path.join(this.#directoryPath, `${this.#type}-hivemind_controller_${this.#controllerID}.db`), { fileMustExist: false });
 
         this.#initDatabase();
         this.#loadGlobalAccuracy();
@@ -105,12 +108,16 @@ class HiveMindController {
 
         const trainingStepsRaw = selectStmt.get('training_steps');
         const skippedRaw = selectStmt.get('skipped_duplicate');
+        const probRaw = selectStmt.get('prob');
 
         if (trainingStepsRaw) {
             this.#globalAccuracy.trainingSteps = trainingStepsRaw.value;
         }
         if (skippedRaw) {
             this.#globalAccuracy.skippedDuplicate = skippedRaw.value;
+        }
+        if (probRaw) {
+            this.#globalAccuracy.prob = probRaw.value;
         }
     }
 
@@ -124,6 +131,7 @@ class HiveMindController {
         const transaction = this.#db.transaction(() => {
             upsertStmt.run('training_steps', this.#globalAccuracy.trainingSteps);
             upsertStmt.run('skipped_duplicate', this.#globalAccuracy.skippedDuplicate);
+            upsertStmt.run('prob', this.#globalAccuracy.prob);
         });
         transaction();
     }
@@ -358,10 +366,20 @@ class HiveMindController {
             for (const candle of candles) {
                 if (!candle || !isValidNumber(candle.high) || !isValidNumber(candle.low)) continue;
 
-                if (candle.low <= trade.stopLoss || candle.high >= trade.sellPrice) {
-                    const exitPrice = candle.low <= trade.stopLoss ? trade.stopLoss : trade.sellPrice;
-                    const outcome = candle.low <= trade.stopLoss ? 0 : 1;
-                    
+                const isLong = trade.sellPrice > trade.entryPrice;
+
+                const hitTakeProfit = isLong
+                    ? candle.high >= trade.sellPrice
+                    : candle.low <= trade.sellPrice;
+
+                const hitStopLoss = isLong
+                    ? candle.low <= trade.stopLoss
+                    : candle.high >= trade.stopLoss;
+
+                if (hitTakeProfit || hitStopLoss) {
+                    const exitPrice = hitTakeProfit ? trade.sellPrice : trade.stopLoss;
+                    const outcome = hitTakeProfit ? 1 : 0;
+
                     closedTrades.push({
                         timestamp: trade.timestamp,
                         entryPrice: trade.entryPrice,
@@ -446,7 +464,8 @@ class HiveMindController {
                 }
 
                 const result = this.#hivemind.train(flatFeatures, trade.outcome);
-                this.#globalAccuracy.trainingSteps = result;
+                this.#globalAccuracy.trainingSteps = result.step;
+                this.#globalAccuracy.prob = result.prob;
 
                 this.#hivemind.dumpState();
 
@@ -472,23 +491,22 @@ class HiveMindController {
         const features = this.#extractFeatures(indicators, this.#trainingCandleSize, this.#trainingIndicators);
         
         const entryPrice = indicators.lastClose;
-        const atrBasedSellPrice = indicators.lastClose + this.#config.atrFactor * indicators.lastAtr;
-        const atrBasedStopLoss = indicators.lastClose - this.#config.stopFactor * indicators.lastAtr;
 
-        const minPriceDelta = entryPrice * this.#config.minPriceMovement;
-        const maxPriceDelta = entryPrice * this.#config.maxPriceMovement;
+        const direction = this.#type === 'positive' ? 1 : (this.#type === 'negative' ? -1 : 0);
 
-        const sellPriceDelta = Math.min(
-            Math.max(atrBasedSellPrice - entryPrice, minPriceDelta),
-            maxPriceDelta
-        );
-        const sellPrice = truncateToDecimals(entryPrice + sellPriceDelta, 2);
+        const atr = indicators.lastAtr;
 
-        const stopLossDelta = Math.min(
-            Math.max(entryPrice - atrBasedStopLoss, minPriceDelta),
-            maxPriceDelta
-        );
-        const stopLoss = truncateToDecimals(entryPrice - stopLossDelta, 2);
+        const tpRawDistance = this.#config.atrFactor * atr;
+        const slRawDistance = this.#config.stopFactor * atr;
+
+        const minDelta = entryPrice * this.#config.minPriceMovement;
+        const maxDelta = entryPrice * this.#config.maxPriceMovement;
+
+        const tpDistance = Math.min(Math.max(tpRawDistance, minDelta), maxDelta);
+        const slDistance = Math.min(Math.max(slRawDistance, minDelta), maxDelta);
+
+        const sellPrice = truncateToDecimals(entryPrice + direction * tpDistance, 2);
+        const stopLoss = truncateToDecimals(entryPrice - direction * slDistance, 2);
 
         const insertTradeStmt = this.#db.prepare(`
             INSERT INTO open_trades (timestamp, sellPrice, stopLoss, entryPrice, features, confidence)
@@ -513,6 +531,7 @@ class HiveMindController {
         this.#processClosedTrades(1);
 
         return {
+            prob : truncateToDecimals(this.#globalAccuracy.prob * 100, 3),
             lastTrainingStep : this.#globalAccuracy.trainingSteps,
             skippedTraining : this.#globalAccuracy.skippedDuplicate,
             openSimulations,

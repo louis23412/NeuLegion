@@ -3,10 +3,10 @@ import { performance } from 'node:perf_hooks';
 
 import HiveMindController from './hivemind/hiveMindController.js';
 
-const { directoryPath, cacheSize, populationPerController, cache, id } = workerData;
+const { directoryPath, cacheSize, populationPerController, cache, id, type } = workerData;
 
 try {
-    const controller = new HiveMindController(id, directoryPath, cacheSize, populationPerController);
+    const controller = new HiveMindController(id, directoryPath, cacheSize, populationPerController, type);
 
     const start = performance.now();
     const signal = controller.getSignal(cache);
