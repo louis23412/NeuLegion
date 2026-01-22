@@ -2,7 +2,6 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
-import { performance } from 'node:perf_hooks';
 
 import HiveMind from './hiveMind.js';
 import IndicatorProcessor from './indicatorProcessor.js';
@@ -24,67 +23,39 @@ class HiveMindController {
     };
 
     #globalAccuracy = {
-        total : 0,
-        correct : 0,
-        currentPoints : 0,
-        maxPoints : 0
+        trainingSteps : 0,
+        skippedDuplicate : 0
     }
 
     #cacheSize;
     #inputSize;
     #trainingCandleSize;
     #trainingIndicators;
-    #trainingStep = 0;
-    #lastSaveStep = 0;
-    #openSimulations = 0;
 
-    constructor ( dp, cs, es ) {
-        this.#validateInputs(dp, cs, es);
+    #controllerID;
+    #directoryPath;
+    #ensembleSize;
+
+    constructor ( id, dp, cs, es ) {
+        this.#controllerID = id;
 
         try {
-            fs.mkdirSync(dp, { recursive: true });
+            this.#directoryPath = dp;
+            fs.mkdirSync(this.#directoryPath, { recursive: true });
         } catch (err) {
-            console.log(`Unable to create directory path "${dp}". ${err.message}`);
+            console.log(`Unable to create directory path "${this.#directoryPath}". ${err.message}`);
             process.exit(1);
         }
 
         this.#cacheSize = cs;
-        this.#chooseDimension(es);
+        this.#ensembleSize = es;
+        this.#chooseDimension(this.#ensembleSize);
 
-        this.#hivemind = new HiveMind(dp, es, this.#inputSize);
         this.#indicators = new IndicatorProcessor();
-        this.#db = new Database(path.join(dp, 'hivemind_controller.db'), { fileMustExist: false });
+        this.#db = new Database(path.join(this.#directoryPath, `hivemind_controller_${this.#controllerID}.db`), { fileMustExist: false });
 
         this.#initDatabase();
         this.#loadGlobalAccuracy();
-    }
-
-    #validateInputs (dp, cs, es) {
-        let dpIsValid = true;
-        if (typeof dp !== 'string') {
-            console.log(`Invalid directory path. Must be a string - Got: ${typeof dp} (${dp})`);
-            dpIsValid = false;
-        } else {
-            dp = dp.trim();
-            if (dp === '') {
-                console.log(`Invalid directory path. Must be a non-empty string - Got: empty`);
-                dpIsValid = false;
-            }
-        }
-
-        let csIsValid = true;
-        if (!isValidNumber(cs) || cs < 100) {
-            console.log(`Invalid cache size. Must be a number & at least 100 - Got: ${cs}`);
-            csIsValid = false;
-        }
-
-        let esIsValid = true;
-        if (!isValidNumber(es) || es < 1) {
-            console.log(`Invalid ensemble size. Must be a number & at least 1 - Got: ${es}`);
-            esIsValid = false;
-        }
-
-        if (!dpIsValid || !csIsValid || !esIsValid) process.exit(1);
     }
 
     #initDatabase () {
@@ -94,6 +65,14 @@ class HiveMindController {
                 sellPrice REAL NOT NULL,
                 stopLoss REAL NOT NULL,
                 entryPrice REAL NOT NULL,
+                features TEXT NOT NULL,
+                confidence REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS closed_trades (
+                timestamp TEXT PRIMARY KEY,
+                entryPrice REAL NOT NULL,
+                exitPrice REAL NOT NULL,
+                outcome INTEGER NOT NULL,
                 features TEXT NOT NULL,
                 confidence REAL NOT NULL
             );
@@ -124,22 +103,14 @@ class HiveMindController {
             SELECT value FROM global_stats WHERE key = ?
         `);
 
-        const totalRow = selectStmt.get('accuracy_total');
-        const correctRow = selectStmt.get('accuracy_correct');
-        const currentPointsRow = selectStmt.get('accuracy_current_points');
-        const maxPointsRow = selectStmt.get('accuracy_max_points');
+        const trainingStepsRaw = selectStmt.get('training_steps');
+        const skippedRaw = selectStmt.get('skipped_duplicate');
 
-        if (totalRow) {
-            this.#globalAccuracy.total = totalRow.value;
+        if (trainingStepsRaw) {
+            this.#globalAccuracy.trainingSteps = trainingStepsRaw.value;
         }
-        if (correctRow) {
-            this.#globalAccuracy.correct = correctRow.value;
-        }
-        if (currentPointsRow) {
-            this.#globalAccuracy.currentPoints = currentPointsRow.value;
-        }
-        if (maxPointsRow) {
-            this.#globalAccuracy.maxPoints = maxPointsRow.value;
+        if (skippedRaw) {
+            this.#globalAccuracy.skippedDuplicate = skippedRaw.value;
         }
     }
 
@@ -151,10 +122,8 @@ class HiveMindController {
         `);
 
         const transaction = this.#db.transaction(() => {
-            upsertStmt.run('accuracy_total', this.#globalAccuracy.total);
-            upsertStmt.run('accuracy_correct', this.#globalAccuracy.correct);
-            upsertStmt.run('accuracy_current_points', this.#globalAccuracy.currentPoints);
-            upsertStmt.run('accuracy_max_points', this.#globalAccuracy.maxPoints);
+            upsertStmt.run('training_steps', this.#globalAccuracy.trainingSteps);
+            upsertStmt.run('skipped_duplicate', this.#globalAccuracy.skippedDuplicate);
         });
         transaction();
     }
@@ -373,27 +342,8 @@ class HiveMindController {
         this.#trainingIndicators = bestInd;
     }
 
-    #dumpState (force = false) {
-        if (this.#lastSaveStep === this.#trainingStep && !force) return;
-
-        const saveStatus = this.#hivemind.dumpState()
-
-        if (!saveStatus.status) {
-            console.log(`Hivemind state save failed! Error: ${saveStatus.error} Trace: ${saveStatus.trace}`)
-            process.exit();
-        } else {
-            console.log('Hivemind state saved!')
-            this.#lastSaveStep = this.#trainingStep
-        }
-    }
-
-    #updateOpenTrades (candles, shouldSave, cutoff, checkpoint) {
+    #updateOpenTrades (candles) {
         if (!Array.isArray(candles) || candles.length === 0) return;
-
-        const G = '\x1b[32m';
-        const R = '\x1b[31m';
-        const Y = '\x1b[33m';
-        const X = '\x1b[0m';
 
         const tradesStmt = this.#db.prepare(`
             SELECT timestamp, sellPrice, stopLoss, entryPrice, features, confidence
@@ -402,7 +352,6 @@ class HiveMindController {
         const trades = tradesStmt.all();
 
         const closedTrades = [];
-        const keysToDelete = new Set();
 
         for (const trade of trades) {
             const features = JSON.parse(trade.features);
@@ -419,7 +368,7 @@ class HiveMindController {
                         exitPrice,
                         outcome,
                         features,
-                        confidence : trade.confidence
+                        confidence: trade.confidence
                     });
                     break;
                 }
@@ -428,138 +377,99 @@ class HiveMindController {
 
         if (closedTrades.length > 0) {
             const transaction = this.#db.transaction(() => {
-                const deleteTradeStmt = this.#db.prepare(`DELETE FROM open_trades WHERE timestamp = ?`);
-                const checkEncodingStmt = this.#db.prepare(`SELECT encoding FROM trained_features WHERE encoding = ?`);
-                const insertEncodingStmt = this.#db.prepare(`INSERT INTO trained_features (encoding) VALUES (?)`);
-
-                let tradeCounter = 0;
-                let completedTraining = 0;
-                let tradeWins = 0;
-                let tradeLosses = 0;
-                let skippedTraining = 0;
-                let lastTrainingTime = 0;
-                let allTrainingTimes = [];
+                const insertClosedStmt = this.#db.prepare(`
+                    INSERT INTO closed_trades 
+                    (timestamp, entryPrice, exitPrice, outcome, features, confidence) 
+                    VALUES (?, ?, ?, ?, ?, ?)
+                `);
+                const deleteOpenStmt = this.#db.prepare(`DELETE FROM open_trades WHERE timestamp = ?`);
 
                 for (const trade of closedTrades) {
-                    tradeCounter++;
-
-                    let printedLines = 2;
-                    console.log(`Training in progress for closed trade ${Y}${tradeCounter}${X} / ${Y}${closedTrades.length}${X} => ${trade.outcome === 1 ? `${G}win${X}` : `${R}loss${X}`} | Training step #${Y}${this.#trainingStep + 1}${X}`);
-                    console.log(`Training steps completed : ${Y}${completedTraining}${X} | Skipped (duplicate endcoding) : ${Y}${skippedTraining}${X} | Wins : ${Y}${tradeWins}${X} | Losses : ${Y}${tradeLosses}${X}`);
-
-                    if (completedTraining > 0) {
-                        const avgTime = Number((allTrainingTimes.reduce((a, x) => a += x , 0) / allTrainingTimes.length).toPrecision(3))
-                        console.log(`Previous training step took : ${Y}${lastTrainingTime}${X} seconds | Average training time : ${Y}${avgTime}${X} seconds`)
-                        printedLines = 3;
-                    }
-
-                    trade.outcome === 1 ? tradeWins++ : tradeLosses++
-
-                    if (trade.confidence !== -1) {
-                        this.#globalAccuracy.total++
-                        this.#globalAccuracy.maxPoints += 100
-
-                        if (trade.outcome === 1) {
-                            if (trade.confidence >= 50) {
-                                this.#globalAccuracy.correct++;
-                            }
-
-                            this.#globalAccuracy.currentPoints += trade.confidence
-                        }
-
-                        if (trade.outcome === 0) {
-                            if (trade.confidence < 50) {
-                               this.#globalAccuracy.correct++; 
-                            }
-
-                            this.#globalAccuracy.currentPoints += Math.abs(trade.confidence - 100)
-                        }
-                    }
-
-                    const flatFeatures = trade.features.flat()
-                    const encodingString = `${flatFeatures.join(',')}|${trade.outcome}`;
-                    const encodingHash = crypto.createHash('sha256').update(encodingString).digest('hex');
-
-                    const existingEncoding = checkEncodingStmt.get(encodingHash);
-                    if (existingEncoding) {
-                        keysToDelete.add(trade.timestamp);
-                        skippedTraining++;
-                        process.stdout.moveCursor(0, -printedLines);
-                        process.stdout.clearScreenDown();
-                        continue;
-                    }
-
-                    const start = performance.now();
-                    this.#trainingStep = this.#hivemind.train(flatFeatures, trade.outcome);
-                    const duration = performance.now() - start;
-
-                    lastTrainingTime = Number((duration / 1000).toPrecision(3));
-                    allTrainingTimes.push(lastTrainingTime);
-
-                    completedTraining++;
-
-                    insertEncodingStmt.run(encodingHash);
-                    keysToDelete.add(trade.timestamp);
-
-                    process.stdout.moveCursor(0, -printedLines);
-                    process.stdout.clearScreenDown();
-
-                    if (this.#trainingStep % checkpoint === 0) this.#dumpState();
-                    if (this.#trainingStep === cutoff ) { break }
+                    insertClosedStmt.run(
+                        trade.timestamp,
+                        trade.entryPrice,
+                        trade.exitPrice,
+                        trade.outcome,
+                        JSON.stringify(trade.features),
+                        trade.confidence
+                    );
+                    deleteOpenStmt.run(trade.timestamp);
                 }
-
-                if (completedTraining > 0) {
-                    const finalAvg = Number((allTrainingTimes.reduce((a, x) => a += x , 0) / allTrainingTimes.length).toPrecision(3));
-                    console.log(`\nAll training complete. Final step took: ${Y}${lastTrainingTime}${X} seconds | Final average: ${Y}${finalAvg}${X} seconds`);
-                    console.log(`Total completed: ${Y}${completedTraining}${X} | Skipped: ${Y}${skippedTraining}${X} | Wins: ${Y}${tradeWins}${X} | Losses: ${Y}${tradeLosses}${X}\n`);
-                }
-
-                if ( shouldSave || this.#trainingStep === cutoff ) this.#dumpState(shouldSave);
-
-                for (const key of keysToDelete) {
-                    deleteTradeStmt.run(key);
-                }
-
-                this.#saveGlobalAccuracy();
             });
 
             transaction();
-        } 
-        
-        else if (closedTrades.length === 0 && shouldSave) this.#dumpState(shouldSave);
+        }
     }
 
-    getSignal (candles, shouldPredict = true, shouldSave = true, cutoff = null, checkpoint = null) {
+    #processClosedTrades (processCount) {
+        const tradesStmt = this.#db.prepare(`
+            SELECT timestamp, entryPrice, exitPrice, outcome, features, confidence
+            FROM closed_trades
+            ORDER BY timestamp ASC
+            LIMIT ?
+        `);
+
+        const trades = tradesStmt.all(processCount);
+
+        if (trades.length === 0) {
+            return;
+        }
+
+        const checkEncodingStmt = this.#db.prepare(`SELECT encoding FROM trained_features WHERE encoding = ?`);
+        const insertEncodingStmt = this.#db.prepare(`INSERT INTO trained_features (encoding) VALUES (?)`);
+        const deleteTradeStmt = this.#db.prepare(`DELETE FROM closed_trades WHERE timestamp = ?`);
+
+        for (const row of trades) {
+            const trade = {
+                timestamp: row.timestamp,
+                entryPrice: row.entryPrice,
+                exitPrice: row.exitPrice,
+                outcome: row.outcome,
+                features: JSON.parse(row.features),
+                confidence: row.confidence
+            };
+
+            const flatFeatures = trade.features.flat();
+            const encodingString = `${flatFeatures.join(',')}|${trade.outcome}`;
+            const encodingHash = crypto.createHash('sha256').update(encodingString).digest('hex');
+
+            this.#db.transaction(() => {
+                const existingEncoding = checkEncodingStmt.get(encodingHash);
+                if (existingEncoding) {
+                    this.#globalAccuracy.skippedDuplicate++;
+                    deleteTradeStmt.run(trade.timestamp);
+                    return;
+                }
+
+                if (!this.#hivemind) {
+                    this.#hivemind = new HiveMind(this.#directoryPath, this.#ensembleSize, this.#inputSize, this.#controllerID);
+                }
+
+                const result = this.#hivemind.train(flatFeatures, trade.outcome);
+                this.#globalAccuracy.trainingSteps = result;
+
+                this.#hivemind.dumpState();
+
+                insertEncodingStmt.run(encodingHash);
+                deleteTradeStmt.run(trade.timestamp);
+            })();
+        }
+
+        this.#saveGlobalAccuracy();
+    }
+
+    getSignal (candles) {
         const { error, recentCandles, fullCandles } = this.#getRecentCandles(candles);
 
         if (error) return { error };
 
-        this.#updateOpenTrades(recentCandles, shouldSave, cutoff, checkpoint);
+        this.#updateOpenTrades(recentCandles);
 
         const indicators = this.#indicators.compute(fullCandles);
 
         if (indicators.error) return { error: 'Indicators error' };
 
         const features = this.#extractFeatures(indicators, this.#trainingCandleSize, this.#trainingIndicators);
-
-        let confidence = 'disabled';
-        let multiplier = 'disabled';
-
-        if (shouldPredict) {
-            confidence = truncateToDecimals(this.#hivemind.predict(features.flat()) * 100, 4);
-
-            const scaleFactor = Math.max(0, (confidence - this.#config.baseConfidenceThreshold) / (100 - this.#config.baseConfidenceThreshold));
-
-            multiplier = truncateToDecimals(
-                Math.min(
-                    Math.max(
-                        this.#config.minMultiplier + (this.#config.maxMultiplier - this.#config.minMultiplier) * scaleFactor, this.#config.minMultiplier
-                    ), 
-                    this.#config.maxMultiplier
-                ),
-                4
-            );
-        }
         
         const entryPrice = indicators.lastClose;
         const atrBasedSellPrice = indicators.lastClose + this.#config.atrFactor * indicators.lastAtr;
@@ -580,8 +490,6 @@ class HiveMindController {
         );
         const stopLoss = truncateToDecimals(entryPrice - stopLossDelta, 2);
 
-        const confidenceInsert = confidence !== 'disabled' ? confidence : -1
-
         const insertTradeStmt = this.#db.prepare(`
             INSERT INTO open_trades (timestamp, sellPrice, stopLoss, entryPrice, features, confidence)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -593,38 +501,22 @@ class HiveMindController {
             stopLoss,
             entryPrice,
             JSON.stringify(features),
-            confidenceInsert
+            -1
         );
 
-        let currentAcc;
-        let trueAcc;
-        if (confidenceInsert !== -1) {
-            currentAcc = this.#globalAccuracy.total > 0 
-                ? truncateToDecimals((this.#globalAccuracy.correct / this.#globalAccuracy.total) * 100, 3)
-                : '—'
-
-            trueAcc = this.#globalAccuracy.maxPoints > 0 
-                ? truncateToDecimals((this.#globalAccuracy.currentPoints / this.#globalAccuracy.maxPoints) * 100, 3)
-                : '—'
-        } else {
-            currentAcc = 'disabled';
-            trueAcc = 'disabled'
-        }
-
         const tradesStmt = this.#db.prepare(`SELECT timestamp FROM open_trades`);
-        this.#openSimulations = tradesStmt.all().length;
+        const openSimulations = tradesStmt.all().length;
+
+        const closedTradesStmt = this.#db.prepare(`SELECT timestamp FROM closed_trades`);
+        const pendingClosedTrades = closedTradesStmt.all().length;
+
+        this.#processClosedTrades(1);
 
         return {
-            entryPrice,
-            sellPrice,
-            stopLoss,
-            multiplier,
-            confidence,
-            threshold: this.#config.baseConfidenceThreshold,
-            lastTrainingStep : this.#trainingStep,
-            countAccuracy : currentAcc,
-            trueAccuracy : trueAcc,
-            openSimulations : this.#openSimulations
+            lastTrainingStep : this.#globalAccuracy.trainingSteps,
+            skippedTraining : this.#globalAccuracy.skippedDuplicate,
+            openSimulations,
+            pendingClosedTrades
         };
     }
 }

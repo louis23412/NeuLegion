@@ -1,15 +1,15 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { performance } from 'node:perf_hooks';
 
-import HiveMindController from '../hivemind/hiveMindController.js';
+import HiveMindController from './hivemind/hiveMindController.js';
 
-const { directoryPath, cacheSize, populationPerController, cache } = workerData;
+const { directoryPath, cacheSize, populationPerController, cache, id } = workerData;
 
 try {
-    const controller = new HiveMindController(directoryPath, cacheSize, populationPerController);
+    const controller = new HiveMindController(id, directoryPath, cacheSize, populationPerController);
 
     const start = performance.now();
-    const signal = controller.getSignal(cache, true, false, null, null);
+    const signal = controller.getSignal(cache);
     const end = performance.now();
     const duration = end - start;
 

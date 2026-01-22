@@ -12,6 +12,7 @@ const cache = [];
 const NUM_CONTROLLERS_PER_LAYER = [2, 2, 4, 8];
 const POPULATION_PER_CONTROLLER = 64;
 const CACHE_SIZE = 250;
+const MAX_CONCURRENT_WORKERS = 2;
 
 let layer = 0;
 
@@ -20,7 +21,7 @@ for (const numControllers of NUM_CONTROLLERS_PER_LAYER) {
     hiveLayers[layer] = [];
 
     for (let id = 0; id < numControllers; id++) {
-        const directoryPath = path.join(import.meta.dirname, '..', 'hive-clusters-states', `C${layer}ID${id}`);
+        const directoryPath = path.join(import.meta.dirname, '..', 'state', `Layer${layer}`, `L${layer}C${id}`);
 
         hiveLayers[layer].push({
             id,
@@ -45,121 +46,140 @@ for (const l in hiveLayers) {
 console.log(`Total Population: ${totalPop}`);
 console.log('--------------------------------------------------');
 
-const processCandles = () => {
+const totalClusters = Object.values(hiveLayers).reduce((acc, arr) => acc + arr.length, 0);
+let rank = 1;
+for (const layerKey in hiveLayers) {
+    for (const controller of hiveLayers[layerKey]) {
+        controller.weight = rank++;
+    }
+}
+const totalWeight = totalClusters * (totalClusters + 1) / 2;
+
+const runWorker = async (co, cache) => {
+    return new Promise((resolve, reject) => {
+        const worker = new Worker(new URL('./worker.js', import.meta.url), {
+            workerData: {
+                id: `L${co.layer}C${co.id}`,
+                directoryPath: co.directoryPath,
+                cacheSize: CACHE_SIZE,
+                populationPerController: POPULATION_PER_CONTROLLER,
+                cache,
+            },
+        });
+
+        worker.on('message', (msg) => {
+            worker.terminate();
+            if (msg.error) {
+                reject(new Error(msg.error));
+            } else {
+                resolve({
+                    co,
+                    signal: msg.signal,
+                    duration: msg.duration,
+                });
+            }
+        });
+
+        worker.on('error', reject);
+        worker.on('exit', (code) => {
+            if (code !== 0) {
+                reject(new Error(`Worker exited with code ${code}`));
+            }
+        });
+    });
+}
+
+const processBatch = async (counter) => {
+    const allControllers = Object.values(hiveLayers).flat();
+
+    console.log(`New batch(${counter}): Processing controllers...`);
+
+    const totalStart = performance.now();
+    let progressTracker = 0;
+    const results = [];
+
+    for (let index = 0; index < allControllers.length; index += MAX_CONCURRENT_WORKERS) {
+        const chunk = allControllers.slice(index, index + MAX_CONCURRENT_WORKERS);
+        const promises = chunk.map(co => runWorker(co, cache));
+
+        let chunkResults;
+        try {
+            chunkResults = await Promise.all(promises);
+        } catch (err) {
+            console.error('Error during parallel processing:', err);
+            process.exit(1);
+        }
+
+        chunkResults.forEach(result => {
+            if (progressTracker !== 0) {
+                process.stdout.moveCursor(0, -1);
+                process.stdout.clearScreenDown();
+            }
+
+            progressTracker++;
+
+            console.log(`Processed ${progressTracker}/${allControllers.length} controllers (${((progressTracker / allControllers.length) * 100).toFixed(2)}%)...`);
+
+            results.push(result);
+        });
+    }
+
+    const totalEnd = performance.now();
+    console.log(`Batch completed in ${((totalEnd - totalStart) / 1000).toFixed(2)} seconds`);
+
+    for (const { co, signal, duration } of results) {
+        co.lastSignal = signal;
+        co.signalSpeed = duration;
+    }
+}
+
+let counter = 0;
+const Y = '\x1b[33m';
+const X = '\x1b[0m';
+const processCandles = async () => {
+    const fileStream = fs.createReadStream(trainingFile);
     const rd = readline.createInterface({
-        input: fs.createReadStream(trainingFile),
+        input: fileStream,
+        crlfDelay: Infinity,
     });
 
-    let hasProcessed = false;
+    for await (const line of rd) {
+        if (!line.trim()) continue;
 
-    rd.on('line', (line) => {
-        if (!line.trim()) return;
+        let candle;
+        try {
+            candle = JSON.parse(line);
+        } catch (e) {
+            console.error('Invalid JSON line skipped:', line);
+            continue;
+        }
 
-        const candle = JSON.parse(line);
         cache.push(candle);
-
         if (cache.length > CACHE_SIZE) {
             cache.shift();
         }
 
-        if (cache.length >= CACHE_SIZE && !hasProcessed) {
-            hasProcessed = true;
+        if (cache.length === CACHE_SIZE) {
+            counter++;
 
-            const allControllers = Object.values(hiveLayers).flat();
+            await processBatch(counter);
 
-            console.log(`Cache ready (${CACHE_SIZE} candles). Processing ${allControllers.length} controllers in parallel using worker threads...`);
+            console.log('--');
+            for (const layer in hiveLayers) {
+                for (const cluster of hiveLayers[layer]) {
+                    const contribution = (cluster.weight / totalWeight * 100).toFixed(3);
+                    console.log(`Cluster ${Y}L${layer}C${cluster.id}${X} [cont ${Y}${contribution}${X} %] => Signal speed(s) : ${Y}${(cluster.signalSpeed / 1000).toFixed(3)}${X} | Steps : ${Y}${cluster.lastSignal.lastTrainingStep}${X} | Skipped : ${Y}${cluster.lastSignal.skippedTraining}${X} | Simulations : ${Y}${cluster.lastSignal.openSimulations}${X} | Pending : ${Y}${cluster.lastSignal.pendingClosedTrades}${X}`)
+                }
+                console.log('--');
+            }
 
-            const totalStart = performance.now();
-
-            const promises = allControllers.map((co) => {
-                return new Promise((resolve, reject) => {
-                    const worker = new Worker(new URL('./worker.js', import.meta.url), {
-                        workerData: {
-                            directoryPath: co.directoryPath,
-                            cacheSize: CACHE_SIZE,
-                            populationPerController: POPULATION_PER_CONTROLLER,
-                            cache,
-                        },
-                    });
-
-                    worker.on('message', (msg) => {
-                        worker.terminate();
-
-                        if (msg.error) {
-                            reject(new Error(msg.error));
-                        } else {
-                            resolve({
-                                co,
-                                signal: msg.signal,
-                                duration: msg.duration,
-                            });
-                        }
-                    });
-
-                    worker.on('error', reject);
-                    worker.on('exit', (code) => {
-                        if (code !== 0) {
-                            reject(new Error(`Worker exited with code ${code}`));
-                        }
-                    });
-                });
-            });
-
-            Promise.all(promises)
-                .then((results) => {
-                    const totalEnd = performance.now();
-                    console.log(`All workers completed in ${((totalEnd - totalStart) / 1000).toFixed(2)} seconds`);
-
-                    for (const { co, signal, duration } of results) {
-                        co.lastSignal = signal;
-                        co.signalSpeed = duration;
-                    }
-
-                    const aggregated = [];
-
-                    for (const layerKey in hiveLayers) {
-                        for (const co of hiveLayers[layerKey]) {
-                            if (co.lastSignal && co.signalSpeed > 0) {
-                                aggregated.push({
-                                    confidence: co.lastSignal.confidence,
-                                    speed: co.signalSpeed,
-                                    layer: co.layer,
-                                });
-                            }
-                        }
-                    }
-
-                    if (aggregated.length === 0) {
-                        console.log('No valid signals received.');
-                        process.exit(0);
-                    }
-
-                    const minSpeed = Math.min(...aggregated.map((c) => c.speed));
-
-                    let totalWeightedConf = 0;
-                    let totalWeight = 0;
-
-                    for (const ctrl of aggregated) {
-                        const speedScore = minSpeed / ctrl.speed;
-                        const layerScore = ctrl.layer + 1;
-
-                        const weight = speedScore + layerScore;
-
-                        totalWeightedConf += ctrl.confidence * weight;
-                        totalWeight += weight;
-                    }
-
-                    const finalConfidence = totalWeight > 0 ? totalWeightedConf / totalWeight : 0;
-
-                    console.log(`Final confidence: ${finalConfidence.toFixed(3)}%`);
-                    process.exit(0);
-                })
-                .catch((err) => {
-                    console.error('Error during parallel processing:', err);
-                    process.exit(1);
-                });
+            console.log('--------------------------------------------------');
         }
-    });
-};
+    }
 
-processCandles();
+    console.log('End of file reached. Processing complete.');
+}
+
+processCandles().catch(err => {
+    console.error('Unexpected error during processing:', err);
+});

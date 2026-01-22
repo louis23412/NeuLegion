@@ -32,9 +32,9 @@ class HiveMind {
     #tempOverloadFactor; #mergeTrimFactor;
     #trainingStepCount = 0;
 
-    constructor (dp, es, is) {
+    constructor (dp, es, is, id) {
         this.#directoryPath = dp;
-        this.#fileName = `hivemind_state-es=${es}-is=${is}.db`;
+        this.#fileName = `hivemind_state-ID=${id}-es=${es}-is=${is}.db`;
 
         const loadStatus = this.#loadState(es, is);
 
@@ -42,8 +42,6 @@ class HiveMind {
             console.log(`Load state failed! Error: ${loadStatus.error}. Trace: ${loadStatus.trace}`);
             process.exit();
         }
-
-        // console.log(loadStatus.message);
     }
 
     #loadState (ensembleSize, inputSize) {
@@ -76,8 +74,143 @@ class HiveMind {
 
             scalarKeys.forEach(key => {
                 const row = getMetadata.get(key);
-                if (row && isValidNumber(Number(row.value))) {
-                    this[`#${key}`] = Number(row.value);
+                if (row) {
+                    const value = Number(row.value);
+                    if (isValidNumber(value)) {
+                        switch (key) {
+                            case 'ensembleSize':
+                                this.#ensembleSize = value;
+                                break;
+                            case 'inputSize':
+                                this.#inputSize = value;
+                                break;
+                            case 'numLayers':
+                                this.#numLayers = value;
+                                break;
+                            case 'numHeads':
+                                this.#numHeads = value;
+                                break;
+                            case 'headDim':
+                                this.#headDim = value;
+                                break;
+                            case 'hiddenSize':
+                                this.#hiddenSize = value;
+                                break;
+                            case 'feedForwardSize':
+                                this.#feedForwardSize = value;
+                                break;
+                            case 'contextWindow':
+                                this.#contextWindow = value;
+                                break;
+                            case 'adaptiveWindow':
+                                this.#adaptiveWindow = value;
+                                break;
+                            case 'semanticMaxProtos':
+                                this.#semanticMaxProtos = value;
+                                break;
+                            case 'maxTrustHistory':
+                                this.#maxTrustHistory = value;
+                                break;
+                            case 'maxPerformanceHistory':
+                                this.#maxPerformanceHistory = value;
+                                break;
+                            case 'learningRate':
+                                this.#learningRate = value;
+                                break;
+                            case 'learningRateDecay':
+                                this.#learningRateDecay = value;
+                                break;
+                            case 'swarmIntelligenceFactor':
+                                this.#swarmIntelligenceFactor = value;
+                                break;
+                            case 'gradientResetFrequency':
+                                this.#gradientResetFrequency = value;
+                                break;
+                            case 'semanticLR':
+                                this.#semanticLR = value;
+                                break;
+                            case 'semanticBoost':
+                                this.#semanticBoost = value;
+                                break;
+                            case 'effectiveSemanticMax':
+                                this.#effectiveSemanticMax = value;
+                                break;
+                            case 'longTermMaxProtos':
+                                this.#longTermMaxProtos = value;
+                                break;
+                            case 'shortTermMaxProtos':
+                                this.#shortTermMaxProtos = value;
+                                break;
+                            case 'rawMaxProtos':
+                                this.#rawMaxProtos = value;
+                                break;
+                            case 'lowDim':
+                                this.#lowDim = value;
+                                break;
+                            case 'numProjections':
+                                this.#numProjections = value;
+                                break;
+                            case 'semanticMergeEvery':
+                                this.#semanticMergeEvery = value;
+                                break;
+                            case 'maxRetrievedProtos':
+                                this.#maxRetrievedProtos = value;
+                                break;
+                            case 'numRetrievalCandidates':
+                                this.#numRetrievalCandidates = value;
+                                break;
+                            case 'maxEpisodicConsider':
+                                this.#maxEpisodicConsider = value;
+                                break;
+                            case 'replaySamples':
+                                this.#replaySamples = value;
+                                break;
+                            case 'coreMaxProtos':
+                                this.#coreMaxProtos = value;
+                                break;
+                            case 'coreEpisodicMaxEntries':
+                                this.#coreEpisodicMaxEntries = value;
+                                break;
+                            case 'lshNumTables':
+                                this.#lshNumTables = value;
+                                break;
+                            case 'lshHashBits':
+                                this.#lshHashBits = value;
+                                break;
+                            case 'numLshSets':
+                                this.#numLshSets = value;
+                                break;
+                            case 'priorityMax':
+                                this.#priorityMax = value;
+                                break;
+                            case 'trainingStepCount':
+                                this.#trainingStepCount = value;
+                                break;
+                            case 'protoCapacityFactor':
+                                this.#protoCapacityFactor = value;
+                                break;
+                            case 'baseProtoCapacity':
+                                this.#baseProtoCapacity = value;
+                                break;
+                            case 'memoryFactor':
+                                this.#memoryFactor = value;
+                                break;
+                            case 'maxVariancePerDim':
+                                this.#maxVariancePerDim = value;
+                                break;
+                            case 'tempOverloadFactor':
+                                this.#tempOverloadFactor = value;
+                                break;
+                            case 'mergeTrimFactor':
+                                this.#mergeTrimFactor = value;
+                                break;
+                            case 'kernelGamma':
+                                this.#kernelGamma = value;
+                                break;
+                            default:
+                                console.warn(`Unexpected metadata key loaded: ${key}`);
+                        }
+                    }
                 }
             });
 
@@ -282,6 +415,7 @@ class HiveMind {
 
                 Object.values(groups).forEach(group => {
                     const { meta, idx, pos } = group;
+
                     const filteredMeans = means.filter(r => `${r.idx}_${hasWindow ? r.window : (hasEntry ? r.entry_idx : 0)}` === `${idx}_${pos}`);
                     const filteredVars = variances.filter(r => `${r.idx}_${hasWindow ? r.window : (hasEntry ? r.entry_idx : 0)}` === `${idx}_${pos}`);
 
@@ -326,7 +460,7 @@ class HiveMind {
                     else if (isCore) memoryArray = this.#coreEpisodic[idx];
 
                     if (isSemantic) {
-                        memoryArray = denseProtos;
+                        this.#semanticProtos[idx] = denseProtos;
                     } else {
                         while (memoryArray.length <= pos) memoryArray.push(null);
                         memoryArray[pos] = entry;
@@ -535,19 +669,19 @@ class HiveMind {
                 );
                 CREATE TABLE ensemble_weights (
                     idx INTEGER PRIMARY KEY,
-                    weight REAL
+                    value REAL
                 );
                 CREATE TABLE performance_scores (
                     idx INTEGER PRIMARY KEY,
-                    score REAL
+                    value REAL
                 );
                 CREATE TABLE agreement_scores (
                     idx INTEGER PRIMARY KEY,
-                    score REAL
+                    value REAL
                 );
                 CREATE TABLE specialization_scores (
                     idx INTEGER PRIMARY KEY,
-                    score REAL
+                    value REAL
                 );
                 CREATE TABLE historical_performance (
                     idx INTEGER,
@@ -563,7 +697,7 @@ class HiveMind {
                 );
                 CREATE TABLE adaptive_learning_rate (
                     idx INTEGER PRIMARY KEY,
-                    rate REAL
+                    value REAL
                 );
                 CREATE TABLE attention_weight_matrix (
                     idx INTEGER,
@@ -877,7 +1011,7 @@ class HiveMind {
                 lshHashBits: this.#lshHashBits,
                 numLshSets: this.#numLshSets,
                 priorityMax: this.#priorityMax,
-                protocapacityFactor: this.#protoCapacityFactor,
+                protoCapacityFactor: this.#protoCapacityFactor,
                 baseProtoCapacity: this.#baseProtoCapacity,
                 memoryFactor: this.#memoryFactor,
                 maxVariancePerDim: this.#maxVariancePerDim,
@@ -892,24 +1026,24 @@ class HiveMind {
                 insertMetadata.run(key, strValue);
             }
 
-            const insertEnsembleWeights = db.prepare('INSERT INTO ensemble_weights (idx, weight) VALUES (?, ?)');
-            this.#ensembleWeights.forEach((weight, idx) => {
-                if (isValidNumber(weight)) insertEnsembleWeights.run(idx, weight);
+            const insertEnsembleWeights = db.prepare('INSERT INTO ensemble_weights (idx, value) VALUES (?, ?)');
+            this.#ensembleWeights.forEach((value, idx) => {
+                if (isValidNumber(value)) insertEnsembleWeights.run(idx, value);
             });
 
-            const insertPerformanceScores = db.prepare('INSERT INTO performance_scores (idx, score) VALUES (?, ?)');
-            this.#performanceScores.forEach((score, idx) => {
-                if (isValidNumber(score)) insertPerformanceScores.run(idx, score);
+            const insertPerformanceScores = db.prepare('INSERT INTO performance_scores (idx, value) VALUES (?, ?)');
+            this.#performanceScores.forEach((value, idx) => {
+                if (isValidNumber(value)) insertPerformanceScores.run(idx, value);
             });
 
-            const insertAgreementScores = db.prepare('INSERT INTO agreement_scores (idx, score) VALUES (?, ?)');
-            this.#agreementScores.forEach((score, idx) => {
-                if (isValidNumber(score)) insertAgreementScores.run(idx, score);
+            const insertAgreementScores = db.prepare('INSERT INTO agreement_scores (idx, value) VALUES (?, ?)');
+            this.#agreementScores.forEach((value, idx) => {
+                if (isValidNumber(value)) insertAgreementScores.run(idx, value);
             });
 
-            const insertSpecializationScores = db.prepare('INSERT INTO specialization_scores (idx, score) VALUES (?, ?)');
-            this.#specializationScores.forEach((score, idx) => {
-                if (isValidNumber(score)) insertSpecializationScores.run(idx, score);
+            const insertSpecializationScores = db.prepare('INSERT INTO specialization_scores (idx, value) VALUES (?, ?)');
+            this.#specializationScores.forEach((value, idx) => {
+                if (isValidNumber(value)) insertSpecializationScores.run(idx, value);
             });
 
             const insertHistoricalPerformance = db.prepare('INSERT INTO historical_performance (idx, step, score) VALUES (?, ?, ?)');
@@ -926,9 +1060,9 @@ class HiveMind {
                 });
             });
 
-            const insertAdaptiveLearningRate = db.prepare('INSERT INTO adaptive_learning_rate (idx, rate) VALUES (?, ?)');
-            this.#adaptiveLearningRate.forEach((rate, idx) => {
-                if (isValidNumber(rate)) insertAdaptiveLearningRate.run(idx, rate);
+            const insertAdaptiveLearningRate = db.prepare('INSERT INTO adaptive_learning_rate (idx, value) VALUES (?, ?)');
+            this.#adaptiveLearningRate.forEach((value, idx) => {
+                if (isValidNumber(value)) insertAdaptiveLearningRate.run(idx, value);
             });
 
             const insertAttentionWeightMatrix = db.prepare('INSERT INTO attention_weight_matrix (idx, row, value) VALUES (?, ?, ?)');
@@ -1333,7 +1467,7 @@ class HiveMind {
 
             db.exec('COMMIT');
 
-            return { status: true };
+            return { status: true, message : 'State saved successfully!' };
         } catch (error) {
             if (db) db.exec('ROLLBACK');
             return {
@@ -6273,7 +6407,7 @@ class HiveMind {
     }
 
     dumpState () {
-        return this.#saveState()
+        return this.#saveState();
     }
 }
 
