@@ -9,10 +9,13 @@ const trainingFile = path.join(import.meta.dirname, 'candles.jsonl');
 const hiveLayers = {};
 const cache = [];
 
-const NUM_CONTROLLERS_PER_LAYER = [2, 2, 4, 8];
-const layerBaseWeights = [10, 9, 8, 7];
-const BASE_POPULATION = 32;
-const CACHE_SIZE = 250;
+const NUM_CONTROLLERS_PER_LAYER = [2, 2, 4, 4, 8, 12];
+const layerBaseWeights = [5, 5, 6, 6, 7, 8];
+const BASE_POPULATION = 64;
+const BASE_CACHE_SIZE = 250;
+const LAYER_CACHE_INCREMENT = 200;
+const MAX_LAYER = NUM_CONTROLLERS_PER_LAYER.length - 1;
+const MAX_CACHE_SIZE = BASE_CACHE_SIZE + LAYER_CACHE_INCREMENT * MAX_LAYER;
 const MAX_CONCURRENT_WORKERS = 2;
 
 let layer = 0;
@@ -35,7 +38,7 @@ for (const numControllers of NUM_CONTROLLERS_PER_LAYER) {
             layer,
             signalSpeed: 0,
             lastSignal: {},
-            pop : BASE_POPULATION * (layer + 1)
+            pop : BASE_POPULATION
         });
     }
 
@@ -68,15 +71,18 @@ for (const layerIdx in hiveLayers) {
     totalWeight += controllers.length * base;
 }
 
-const runWorker = async (co, cache) => {
+const runWorker = async (co) => {
+    const layerCacheSize = BASE_CACHE_SIZE + LAYER_CACHE_INCREMENT * co.layer;
+    const layerCache = cache.slice(-layerCacheSize);
+
     return new Promise((resolve, reject) => {
         const worker = new Worker(new URL('./worker.js', import.meta.url), {
             workerData: {
                 id: `L${co.layer}C${co.id}`,
                 directoryPath: co.directoryPath,
-                cacheSize: CACHE_SIZE,
+                cacheSize: layerCacheSize,
                 populationPerController: co.pop,
-                cache,
+                cache : layerCache,
                 type : co.type
             },
         });
@@ -114,7 +120,7 @@ const processBatch = async (counter) => {
 
     for (let index = 0; index < allControllers.length; index += MAX_CONCURRENT_WORKERS) {
         const chunk = allControllers.slice(index, index + MAX_CONCURRENT_WORKERS);
-        const promises = chunk.map(co => runWorker(co, cache));
+        const promises = chunk.map(co => runWorker(co));
 
         let chunkResults;
         try {
@@ -171,11 +177,11 @@ const processCandles = async () => {
         }
 
         cache.push(candle);
-        if (cache.length > CACHE_SIZE) {
+        if (cache.length > MAX_CACHE_SIZE) {
             cache.shift();
         }
 
-        if (cache.length === CACHE_SIZE) {
+        if (cache.length === MAX_CACHE_SIZE) {
             counter++;
 
             await processBatch(counter);
@@ -184,10 +190,47 @@ const processCandles = async () => {
             for (const layer in hiveLayers) {
                 for (const cluster of hiveLayers[layer]) {
                     const contribution = (cluster.weight / totalWeight * 100).toFixed(3);
-                    console.log(`Cluster ${Y}L${layer}C${cluster.id}P${cluster.pop}${X} [ Prob ${Y}${cluster.lastSignal.prob}${X} % - cont ${Y}${contribution}${X} % - type : ${cluster.type === 'positive' ? `${G}positive${X}` : `${R}negative${X}`}] => Signal speed(s) : ${Y}${(cluster.signalSpeed / 1000).toFixed(3)}${X} | Steps : ${Y}${cluster.lastSignal.lastTrainingStep}${X} | Skipped : ${Y}${cluster.lastSignal.skippedTraining}${X} | Simulations : ${Y}${cluster.lastSignal.openSimulations}${X} | Pending : ${Y}${cluster.lastSignal.pendingClosedTrades}${X}`)
+                    const clusterId = `L${layer}C${cluster.id}P${cluster.pop}`
+                    console.log(`Cluster ${cluster.type === 'positive' ? `${G}${clusterId}${X}` : `${R}${clusterId}${X}`} [ Prob ${Y}${cluster.lastSignal.prob}${X} % - cont ${Y}${contribution}${X} %] => Signal speed(s) : ${Y}${(cluster.signalSpeed / 1000).toFixed(3)}${X} | Steps : ${Y}${cluster.lastSignal.lastTrainingStep}${X} | Skipped : ${Y}${cluster.lastSignal.skippedTraining}${X} | Simulations : ${Y}${cluster.lastSignal.openSimulations}${X} | Pending : ${Y}${cluster.lastSignal.pendingClosedTrades}${X}`)
                 }
                 console.log('--');
             }
+
+            console.log('Overall Final Stats:');
+
+            let buyStrength = 0;
+            let sellStrength = 0;
+            let posWeight = 0;
+            let negWeight = 0;
+
+            Object.values(hiveLayers).flat().forEach(co => {
+                const prob = co.lastSignal.prob ?? 0;
+                if (co.type === 'positive') {
+                    buyStrength += co.weight * prob;
+                    posWeight += co.weight;
+                } else {
+                    sellStrength += co.weight * prob;
+                    negWeight += co.weight;
+                }
+            });
+
+            const weightedAvgBuyProb = posWeight > 0 ? (buyStrength / posWeight) : 0;
+            const weightedAvgSellProb = negWeight > 0 ? (sellStrength / negWeight) : 0;
+
+            console.log(`Weighted Average Buy Signal Probability: ${Y}${weightedAvgBuyProb.toFixed(2)}${X}%`);
+            console.log(`Weighted Average Sell Signal Probability: ${Y}${weightedAvgSellProb.toFixed(2)}${X}%`);
+
+            const netDiff = weightedAvgBuyProb - weightedAvgSellProb;
+            const finalBuyProb = 50 + (netDiff / 2);
+            const finalSellProb = 100 - finalBuyProb;
+
+            console.log(`Final Buy Probability: ${Y}${finalBuyProb.toFixed(2)}${X}%`);
+            console.log(`Final Sell Probability: ${Y}${finalSellProb.toFixed(2)}${X}%`);
+
+            const finalSignal = finalBuyProb > 50 ? 'BUY' :
+                                finalBuyProb < 50 ? 'SELL' : 'HOLD';
+
+            console.log(`Final Signal: ${Y}${finalSignal}${X}`);
 
             console.log('--------------------------------------------------');
         }
