@@ -12,15 +12,7 @@ class HiveMindController {
     #hivemind;
     #indicators;
     #db;
-    #config = {
-        minMultiplier: 1,
-        maxMultiplier: 2.5,
-        baseConfidenceThreshold: 50,
-        atrFactor: 2.5,
-        stopFactor: 1,
-        minPriceMovement : 0.0021,
-        maxPriceMovement : 0.05
-    };
+    #config;
 
     #globalAccuracy = {
         trainingSteps : 0,
@@ -38,7 +30,7 @@ class HiveMindController {
     #ensembleSize;
     #type;
 
-    constructor ( id, dp, cs, es, type ) {
+    constructor ( id, dp, cs, es, type, priceObj ) {
         this.#controllerID = id;
 
         try {
@@ -53,6 +45,8 @@ class HiveMindController {
         this.#cacheSize = cs;
         this.#ensembleSize = es;
         this.#chooseDimension(this.#ensembleSize);
+
+        this.#config = priceObj;
 
         this.#indicators = new IndicatorProcessor();
         this.#db = new Database(path.join(this.#directoryPath, `${this.#type}-hivemind_controller_${this.#controllerID}.db`), { fileMustExist: false });
