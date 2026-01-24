@@ -6,9 +6,7 @@ import { performance } from 'node:perf_hooks';
 
 const trainingFile = path.join(import.meta.dirname, 'candles.jsonl');
 
-const cache = [];
-
-const trainingCutoff = 198;
+const trainingCutoff = null;
 
 const NUM_CONTROLLERS_PER_LAYER = [2, 2, 2, 2];
 const layerBaseWeights = [5, 6, 7, 8];
@@ -45,6 +43,7 @@ const getLayerParams = (layer) => {
     };
 };
 
+const cache = [];
 const hiveLayers = [];
 let totalPop = 0;
 let totalWeight = 0;
@@ -203,18 +202,12 @@ const processCandles = async () => {
                 const controllers = hiveLayers[layer];
 
                 for (const cluster of controllers) {
-                    const contribution = (cluster.weight / totalWeight * 100).toFixed(3);
                     const clusterId = `L${layer}C${cluster.id}P${cluster.pop}`;
-                    const color = cluster.type === 'positive' ? G : R;
-                    console.log(`Cluster ${color}${clusterId}${X} [ Prob ${C}${cluster.lastSignal.prob}${X} % - cont ${Y}${contribution}${X} %] => Speed(s) : ${M}${(cluster.signalSpeed / 1000).toFixed(3)}${X} | Steps : ${Y}${cluster.lastSignal.lastTrainingStep}${X} | Skipped : ${Y}${cluster.lastSignal.skippedTraining}${X} | Simulations : ${Y}${cluster.lastSignal.openSimulations}${X} | Pending : ${Y}${cluster.lastSignal.pendingClosedTrades}${X}`);
+                    const color = cluster.type === 'positive' ? `(${G}+${X})` : `(${R}-${X})`;
+                    console.log(`Cluster ${Y}${clusterId}${X}${color} => Prob ${M}${cluster.lastSignal.prob}${X} % | Speed(s) : ${C}${(cluster.signalSpeed / 1000).toFixed(3)}${X} | Steps : ${Y}${cluster.lastSignal.lastTrainingStep}${X} | Skipped : ${Y}${cluster.lastSignal.skippedTraining}${X} | Simulations : ${Y}${cluster.lastSignal.openSimulations}${X} | Pending : ${Y}${cluster.lastSignal.pendingClosedTrades}${X}`);
                 }
-
-                const { cacheSize, atrFactor, stopFactor, minPriceMovement, maxPriceMovement } = getLayerParams(layer);
-                console.log(`Cache : ${Y}${cacheSize}${X} | ATR : ${Y}${atrFactor}${X} | Stop : ${Y}${stopFactor}${X} | Min price move : ${Y}${(minPriceMovement * 100).toFixed(3)}${X}% | Max price move : ${Y}${(maxPriceMovement * 100).toFixed(3)}${X}%`);
                 console.log('--');
             }
-
-            console.log('Overall Stats:');
 
             let buyStrength = 0;
             let sellStrength = 0;
@@ -243,16 +236,14 @@ const processCandles = async () => {
             const weightedAvgBuyProb = posWeight > 0 ? (buyStrength / posWeight) : 0;
             const weightedAvgSellProb = negWeight > 0 ? (sellStrength / negWeight) : 0;
 
-            console.log(`Weighted Average Buy / Sell Signal Probabilities: ${G}${weightedAvgBuyProb.toFixed(3)}${X}% - ${R}${weightedAvgSellProb.toFixed(3)}${X}%`);
-
             const netDiff = weightedAvgBuyProb - weightedAvgSellProb;
             const finalBuyProb = 50 + (netDiff / 2);
             const finalSellProb = 100 - finalBuyProb;
 
-            console.log(`Final Buy / Sell Probabilities: ${G}${finalBuyProb.toFixed(3)}${X}% - ${R}${finalSellProb.toFixed(3)}${X}%`);
+            const predictDiff = Number((finalBuyProb > 50 ? finalBuyProb - 50 : 50 - finalSellProb).toFixed(3));
+            const predictDiffColored = predictDiff > 0 ? `${G}${predictDiff}${X}` : predictDiff < 0 ? `${R}${predictDiff}${X}` : `${Y}${predictDiff}${X}`;
 
-            const finalSignal = finalBuyProb > 50 ? `${G}BUY${X}` : finalBuyProb < 50 ? `${R}SELL${X}` : `${Y}HOLD${X}`;
-            console.log(`Final Signal: ${finalSignal}`);
+            console.log(`Final Buy / Sell Probabilities: ${Y}${finalBuyProb.toFixed(3)}${X}% - ${Y}${finalSellProb.toFixed(3)}${X}% (${predictDiffColored} %)`);
 
             console.log('--------------------------------------------------');
 

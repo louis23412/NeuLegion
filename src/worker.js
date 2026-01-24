@@ -9,7 +9,7 @@ try {
     const controller = new HiveMindController(id, directoryPath, cacheSize, populationPerController, type, priceObj);
 
     const start = performance.now();
-    const signal = controller.getSignal(cache);
+    const signal = controller.getSignal(cache, 1);
     const end = performance.now();
     const duration = end - start;
 

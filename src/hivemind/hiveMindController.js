@@ -49,7 +49,7 @@ class HiveMindController {
         this.#config = priceObj;
 
         this.#indicators = new IndicatorProcessor();
-        this.#db = new Database(path.join(this.#directoryPath, `${this.#type}-hivemind_controller_${this.#controllerID}.db`), { fileMustExist: false });
+        this.#db = new Database(path.join(this.#directoryPath, `hivemind_controller-${this.#type}-${this.#controllerID}.db`), { fileMustExist: false });
 
         this.#initDatabase();
         this.#loadGlobalAccuracy();
@@ -471,7 +471,7 @@ class HiveMindController {
         this.#saveGlobalAccuracy();
     }
 
-    getSignal (candles) {
+    getSignal (candles, processCount) {
         const { error, recentCandles, fullCandles } = this.#getRecentCandles(candles);
 
         if (error) return { error };
@@ -516,13 +516,13 @@ class HiveMindController {
             -1
         );
 
+        this.#processClosedTrades(processCount);
+
         const tradesStmt = this.#db.prepare(`SELECT timestamp FROM open_trades`);
         const openSimulations = tradesStmt.all().length;
 
         const closedTradesStmt = this.#db.prepare(`SELECT timestamp FROM closed_trades`);
         const pendingClosedTrades = closedTradesStmt.all().length;
-
-        this.#processClosedTrades(1);
 
         return {
             prob : truncateToDecimals(this.#globalAccuracy.prob * 100, 3),
