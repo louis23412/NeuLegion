@@ -594,7 +594,12 @@ class HiveMind {
                     set = new Set();
                     map.set(key, set);
                 }
-                set.add(proto_idx);
+
+                const protoArray = this.#semanticProtos[transformer_idx];
+                if (proto_idx >= 0 && proto_idx < protoArray.length) {
+                    const proto = protoArray[proto_idx];
+                    set.add(proto);
+                }
             });
 
             this.#normalizeEnsembleWeights();
@@ -607,7 +612,7 @@ class HiveMind {
         }
     }
 
-    #saveState () {
+    #saveState() {
         const dbPath = path.join(this.#directoryPath, this.#fileName);
         let db;
 
@@ -618,100 +623,102 @@ class HiveMind {
 
             db.exec('BEGIN TRANSACTION');
 
-            db.exec(`
-                DROP TABLE IF EXISTS metadata;
-                DROP TABLE IF EXISTS ensemble_weights;
-                DROP TABLE IF EXISTS performance_scores;
-                DROP TABLE IF EXISTS agreement_scores;
-                DROP TABLE IF EXISTS specialization_scores;
-                DROP TABLE IF EXISTS historical_performance;
-                DROP TABLE IF EXISTS trust_scores_history;
-                DROP TABLE IF EXISTS adaptive_learning_rate;
-                DROP TABLE IF EXISTS attention_weight_matrix;
-                DROP TABLE IF EXISTS attention_bias;
-                DROP TABLE IF EXISTS specialization_weights;
-                DROP TABLE IF EXISTS attention_memory_protos;
-                DROP TABLE IF EXISTS attention_memory_means;
-                DROP TABLE IF EXISTS attention_memory_variances;
-                DROP TABLE IF EXISTS attention_memory_rep_mean;
-                DROP TABLE IF EXISTS attention_memory_projnorms;
-                DROP TABLE IF EXISTS attention_memory_rep_proj;
-                DROP TABLE IF EXISTS adaptive_context_protos;
-                DROP TABLE IF EXISTS adaptive_context_means;
-                DROP TABLE IF EXISTS adaptive_context_variances;
-                DROP TABLE IF EXISTS adaptive_context_rep_mean;
-                DROP TABLE IF EXISTS adaptive_context_projnorms;
-                DROP TABLE IF EXISTS adaptive_context_rep_proj;
-                DROP TABLE IF EXISTS semantic_protos;
-                DROP TABLE IF EXISTS semantic_means;
-                DROP TABLE IF EXISTS semantic_variances;
-                DROP TABLE IF EXISTS semantic_projnorms;
-                DROP TABLE IF EXISTS core_episodic_protos;
-                DROP TABLE IF EXISTS core_episodic_means;
-                DROP TABLE IF EXISTS core_episodic_variances;
-                DROP TABLE IF EXISTS core_episodic_rep_mean;
-                DROP TABLE IF EXISTS core_episodic_projnorms;
-                DROP TABLE IF EXISTS core_episodic_rep_proj;
-                DROP TABLE IF EXISTS projection_matrices;
-                DROP TABLE IF EXISTS lsh_hyperplanes;
-                DROP TABLE IF EXISTS transformers;
-                DROP TABLE IF EXISTS transformer_biases;
-                DROP TABLE IF EXISTS transformer_layer_norm;
-                DROP TABLE IF EXISTS gradient_accumulation;
-                DROP TABLE IF EXISTS priority_indices;
-                DROP TABLE IF EXISTS semantic_lsh_buckets;
-            `);
+            const tableNames = [
+                'metadata',
+                'ensemble_weights',
+                'performance_scores',
+                'agreement_scores',
+                'specialization_scores',
+                'historical_performance',
+                'trust_scores_history',
+                'adaptive_learning_rate',
+                'attention_weight_matrix',
+                'attention_bias',
+                'specialization_weights',
+                'attention_memory_protos',
+                'attention_memory_means',
+                'attention_memory_variances',
+                'attention_memory_rep_mean',
+                'attention_memory_projnorms',
+                'attention_memory_rep_proj',
+                'adaptive_context_protos',
+                'adaptive_context_means',
+                'adaptive_context_variances',
+                'adaptive_context_rep_mean',
+                'adaptive_context_projnorms',
+                'adaptive_context_rep_proj',
+                'semantic_protos',
+                'semantic_means',
+                'semantic_variances',
+                'semantic_projnorms',
+                'core_episodic_protos',
+                'core_episodic_means',
+                'core_episodic_variances',
+                'core_episodic_rep_mean',
+                'core_episodic_projnorms',
+                'core_episodic_rep_proj',
+                'projection_matrices',
+                'lsh_hyperplanes',
+                'transformers',
+                'transformer_biases',
+                'transformer_layer_norm',
+                'gradient_accumulation',
+                'priority_indices',
+                'semantic_lsh_buckets'
+            ];
+            const dropSql = tableNames.map(name => `DROP TABLE IF EXISTS ${name};`).join('\n');
+            db.exec(dropSql);
 
             db.exec(`
-                CREATE TABLE metadata (
+                CREATE TABLE IF NOT EXISTS metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT
                 );
-                CREATE TABLE ensemble_weights (
+                CREATE TABLE IF NOT EXISTS ensemble_weights (
                     idx INTEGER PRIMARY KEY,
                     value REAL
                 );
-                CREATE TABLE performance_scores (
+                CREATE TABLE IF NOT EXISTS performance_scores (
                     idx INTEGER PRIMARY KEY,
                     value REAL
                 );
-                CREATE TABLE agreement_scores (
+                CREATE TABLE IF NOT EXISTS agreement_scores (
                     idx INTEGER PRIMARY KEY,
                     value REAL
                 );
-                CREATE TABLE specialization_scores (
+                CREATE TABLE IF NOT EXISTS specialization_scores (
                     idx INTEGER PRIMARY KEY,
                     value REAL
                 );
-                CREATE TABLE historical_performance (
+                CREATE TABLE IF NOT EXISTS historical_performance (
                     idx INTEGER,
                     step INTEGER,
                     score REAL,
                     PRIMARY KEY (idx, step)
                 );
-                CREATE TABLE trust_scores_history (
+                CREATE TABLE IF NOT EXISTS trust_scores_history (
                     idx INTEGER,
                     step INTEGER,
                     score REAL,
                     PRIMARY KEY (idx, step)
                 );
-                CREATE TABLE adaptive_learning_rate (
+                CREATE TABLE IF NOT EXISTS adaptive_learning_rate (
                     idx INTEGER PRIMARY KEY,
                     value REAL
                 );
-                CREATE TABLE attention_weight_matrix (
+                CREATE TABLE IF NOT EXISTS attention_weight_matrix (
                     idx INTEGER,
                     row INTEGER,
                     value REAL,
                     PRIMARY KEY (idx, row)
                 );
-                CREATE TABLE attention_bias (
+                CREATE TABLE IF NOT EXISTS attention_bias (
                     idx INTEGER,
                     row INTEGER,
                     value REAL,
                     PRIMARY KEY (idx, row)
                 );
-                CREATE TABLE specialization_weights (
+                CREATE TABLE IF NOT EXISTS specialization_weights (
                     idx INTEGER,
                     row INTEGER,
                     col INTEGER,
@@ -719,7 +726,7 @@ class HiveMind {
                     PRIMARY KEY (idx, row, col)
                 );
 
-                CREATE TABLE attention_memory_protos (
+                CREATE TABLE IF NOT EXISTS attention_memory_protos (
                     idx INTEGER,
                     window INTEGER,
                     proto_idx INTEGER,
@@ -729,7 +736,7 @@ class HiveMind {
                     importance REAL DEFAULT 0,
                     PRIMARY KEY (idx, window, proto_idx)
                 );
-                CREATE TABLE attention_memory_means (
+                CREATE TABLE IF NOT EXISTS attention_memory_means (
                     idx INTEGER,
                     window INTEGER,
                     proto_idx INTEGER,
@@ -737,7 +744,7 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, window, proto_idx, dim)
                 );
-                CREATE TABLE attention_memory_variances (
+                CREATE TABLE IF NOT EXISTS attention_memory_variances (
                     idx INTEGER,
                     window INTEGER,
                     proto_idx INTEGER,
@@ -745,14 +752,14 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, window, proto_idx, dim)
                 );
-                CREATE TABLE attention_memory_rep_mean (
+                CREATE TABLE IF NOT EXISTS attention_memory_rep_mean (
                     idx INTEGER,
                     window INTEGER,
                     dim INTEGER,
                     value REAL,
                     PRIMARY KEY (idx, window, dim)
                 );
-                CREATE TABLE attention_memory_projnorms (
+                CREATE TABLE IF NOT EXISTS attention_memory_projnorms (
                     idx INTEGER,
                     window INTEGER,
                     proto_idx INTEGER,
@@ -761,7 +768,7 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, window, proto_idx, proj_idx, dim)
                 );
-                CREATE TABLE attention_memory_rep_proj (
+                CREATE TABLE IF NOT EXISTS attention_memory_rep_proj (
                     idx INTEGER,
                     window INTEGER,
                     proj_idx INTEGER,
@@ -770,7 +777,7 @@ class HiveMind {
                     PRIMARY KEY (idx, window, proj_idx, dim)
                 );
 
-                CREATE TABLE adaptive_context_protos (
+                CREATE TABLE IF NOT EXISTS adaptive_context_protos (
                     idx INTEGER,
                     window INTEGER,
                     proto_idx INTEGER,
@@ -780,7 +787,7 @@ class HiveMind {
                     importance REAL DEFAULT 0,
                     PRIMARY KEY (idx, window, proto_idx)
                 );
-                CREATE TABLE adaptive_context_means (
+                CREATE TABLE IF NOT EXISTS adaptive_context_means (
                     idx INTEGER,
                     window INTEGER,
                     proto_idx INTEGER,
@@ -788,7 +795,7 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, window, proto_idx, dim)
                 );
-                CREATE TABLE adaptive_context_variances (
+                CREATE TABLE IF NOT EXISTS adaptive_context_variances (
                     idx INTEGER,
                     window INTEGER,
                     proto_idx INTEGER,
@@ -796,14 +803,14 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, window, proto_idx, dim)
                 );
-                CREATE TABLE adaptive_context_rep_mean (
+                CREATE TABLE IF NOT EXISTS adaptive_context_rep_mean (
                     idx INTEGER,
                     window INTEGER,
                     dim INTEGER,
                     value REAL,
                     PRIMARY KEY (idx, window, dim)
                 );
-                CREATE TABLE adaptive_context_projnorms (
+                CREATE TABLE IF NOT EXISTS adaptive_context_projnorms (
                     idx INTEGER,
                     window INTEGER,
                     proto_idx INTEGER,
@@ -812,7 +819,7 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, window, proto_idx, proj_idx, dim)
                 );
-                CREATE TABLE adaptive_context_rep_proj (
+                CREATE TABLE IF NOT EXISTS adaptive_context_rep_proj (
                     idx INTEGER,
                     window INTEGER,
                     proj_idx INTEGER,
@@ -821,7 +828,7 @@ class HiveMind {
                     PRIMARY KEY (idx, window, proj_idx, dim)
                 );
 
-                CREATE TABLE semantic_protos (
+                CREATE TABLE IF NOT EXISTS semantic_protos (
                     idx INTEGER,
                     proto_idx INTEGER,
                     proto_size REAL,
@@ -830,21 +837,21 @@ class HiveMind {
                     importance REAL DEFAULT 0,
                     PRIMARY KEY (idx, proto_idx)
                 );
-                CREATE TABLE semantic_means (
+                CREATE TABLE IF NOT EXISTS semantic_means (
                     idx INTEGER,
                     proto_idx INTEGER,
                     dim INTEGER,
                     value REAL,
                     PRIMARY KEY (idx, proto_idx, dim)
                 );
-                CREATE TABLE semantic_variances (
+                CREATE TABLE IF NOT EXISTS semantic_variances (
                     idx INTEGER,
                     proto_idx INTEGER,
                     dim INTEGER,
                     value REAL,
                     PRIMARY KEY (idx, proto_idx, dim)
                 );
-                CREATE TABLE semantic_projnorms (
+                CREATE TABLE IF NOT EXISTS semantic_projnorms (
                     idx INTEGER,
                     proto_idx INTEGER,
                     proj_idx INTEGER,
@@ -853,7 +860,7 @@ class HiveMind {
                     PRIMARY KEY (idx, proto_idx, proj_idx, dim)
                 );
 
-                CREATE TABLE core_episodic_protos (
+                CREATE TABLE IF NOT EXISTS core_episodic_protos (
                     idx INTEGER,
                     entry_idx INTEGER,
                     proto_idx INTEGER,
@@ -863,7 +870,7 @@ class HiveMind {
                     importance REAL DEFAULT 0,
                     PRIMARY KEY (idx, entry_idx, proto_idx)
                 );
-                CREATE TABLE core_episodic_means (
+                CREATE TABLE IF NOT EXISTS core_episodic_means (
                     idx INTEGER,
                     entry_idx INTEGER,
                     proto_idx INTEGER,
@@ -871,7 +878,7 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, entry_idx, proto_idx, dim)
                 );
-                CREATE TABLE core_episodic_variances (
+                CREATE TABLE IF NOT EXISTS core_episodic_variances (
                     idx INTEGER,
                     entry_idx INTEGER,
                     proto_idx INTEGER,
@@ -879,14 +886,14 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, entry_idx, proto_idx, dim)
                 );
-                CREATE TABLE core_episodic_rep_mean (
+                CREATE TABLE IF NOT EXISTS core_episodic_rep_mean (
                     idx INTEGER,
                     entry_idx INTEGER,
                     dim INTEGER,
                     value REAL,
                     PRIMARY KEY (idx, entry_idx, dim)
                 );
-                CREATE TABLE core_episodic_projnorms (
+                CREATE TABLE IF NOT EXISTS core_episodic_projnorms (
                     idx INTEGER,
                     entry_idx INTEGER,
                     proto_idx INTEGER,
@@ -895,7 +902,7 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, entry_idx, proto_idx, proj_idx, dim)
                 );
-                CREATE TABLE core_episodic_rep_proj (
+                CREATE TABLE IF NOT EXISTS core_episodic_rep_proj (
                     idx INTEGER,
                     entry_idx INTEGER,
                     proj_idx INTEGER,
@@ -904,7 +911,7 @@ class HiveMind {
                     PRIMARY KEY (idx, entry_idx, proj_idx, dim)
                 );
 
-                CREATE TABLE projection_matrices (
+                CREATE TABLE IF NOT EXISTS projection_matrices (
                     proj_idx INTEGER,
                     row INTEGER,
                     col INTEGER,
@@ -912,7 +919,7 @@ class HiveMind {
                     PRIMARY KEY (proj_idx, row, col)
                 );
 
-                CREATE TABLE lsh_hyperplanes (
+                CREATE TABLE IF NOT EXISTS lsh_hyperplanes (
                     set_idx INTEGER,
                     table_idx INTEGER,
                     bit_idx INTEGER,
@@ -921,7 +928,7 @@ class HiveMind {
                     PRIMARY KEY (set_idx, table_idx, bit_idx, dim)
                 );
 
-                CREATE TABLE transformers (
+                CREATE TABLE IF NOT EXISTS transformers (
                     idx INTEGER,
                     layer INTEGER,
                     weight_type TEXT,
@@ -930,7 +937,7 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, layer, weight_type, row, col)
                 );
-                CREATE TABLE transformer_biases (
+                CREATE TABLE IF NOT EXISTS transformer_biases (
                     idx INTEGER,
                     layer INTEGER,
                     bias_type TEXT,
@@ -938,7 +945,7 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, layer, bias_type, row)
                 );
-                CREATE TABLE transformer_layer_norm (
+                CREATE TABLE IF NOT EXISTS transformer_layer_norm (
                     idx INTEGER,
                     layer INTEGER,
                     norm_type TEXT,
@@ -946,7 +953,7 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, layer, norm_type, row)
                 );
-                CREATE TABLE gradient_accumulation (
+                CREATE TABLE IF NOT EXISTS gradient_accumulation (
                     idx INTEGER,
                     layer INTEGER,
                     weight_type TEXT,
@@ -956,14 +963,14 @@ class HiveMind {
                     PRIMARY KEY (idx, layer, weight_type, row, col)
                 );
 
-                CREATE TABLE priority_indices (
+                CREATE TABLE IF NOT EXISTS priority_indices (
                     transformer_idx INTEGER,
                     rank INTEGER,
                     proto_idx INTEGER,
                     PRIMARY KEY (transformer_idx, rank)
                 );
 
-                CREATE TABLE semantic_lsh_buckets (
+                CREATE TABLE IF NOT EXISTS semantic_lsh_buckets (
                     transformer_idx INTEGER,
                     set_idx INTEGER,
                     table_idx INTEGER,
@@ -1016,8 +1023,8 @@ class HiveMind {
                 memoryFactor: this.#memoryFactor,
                 maxVariancePerDim: this.#maxVariancePerDim,
                 tempOverloadFactor: this.#tempOverloadFactor,
-                mergeTrimFactor : this.#mergeTrimFactor,
-                kernelGamma : this.#kernelGamma,
+                mergeTrimFactor: this.#mergeTrimFactor,
+                kernelGamma: this.#kernelGamma,
                 trainingStepCount: this.#trainingStepCount ?? 0
             };
 
@@ -1026,448 +1033,499 @@ class HiveMind {
                 insertMetadata.run(key, strValue);
             }
 
-            const insertEnsembleWeights = db.prepare('INSERT INTO ensemble_weights (idx, value) VALUES (?, ?)');
-            this.#ensembleWeights.forEach((value, idx) => {
-                if (isValidNumber(value)) insertEnsembleWeights.run(idx, value);
-            });
+            const batchInsert = (table, columns, data, batchSize = 2000) => {
+                if (data.length === 0) return;
+                const rowPlaceholder = `(${columns.map(() => '?').join(',')})`;
+                let offset = 0;
+                while (offset < data.length) {
+                    const chunkSize = Math.min(batchSize, data.length - offset);
+                    const placeholders = Array(chunkSize).fill(rowPlaceholder).join(',');
+                    const sql = `INSERT INTO ${table} (${columns.join(',')}) VALUES ${placeholders}`;
+                    const flatParams = data.slice(offset, offset + chunkSize).flat();
+                    const stmt = db.prepare(sql);
+                    stmt.run(...flatParams);
+                    offset += chunkSize;
+                }
+            };
 
-            const insertPerformanceScores = db.prepare('INSERT INTO performance_scores (idx, value) VALUES (?, ?)');
-            this.#performanceScores.forEach((value, idx) => {
-                if (isValidNumber(value)) insertPerformanceScores.run(idx, value);
-            });
+            const ensembleSize = this.#ensembleSize;
 
-            const insertAgreementScores = db.prepare('INSERT INTO agreement_scores (idx, value) VALUES (?, ?)');
-            this.#agreementScores.forEach((value, idx) => {
-                if (isValidNumber(value)) insertAgreementScores.run(idx, value);
-            });
+            let rows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const value = this.#ensembleWeights[idx];
+                if (isValidNumber(value)) rows.push([idx, value]);
+            }
+            batchInsert('ensemble_weights', ['idx', 'value'], rows);
 
-            const insertSpecializationScores = db.prepare('INSERT INTO specialization_scores (idx, value) VALUES (?, ?)');
-            this.#specializationScores.forEach((value, idx) => {
-                if (isValidNumber(value)) insertSpecializationScores.run(idx, value);
-            });
+            rows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const value = this.#performanceScores[idx];
+                if (isValidNumber(value)) rows.push([idx, value]);
+            }
+            batchInsert('performance_scores', ['idx', 'value'], rows);
 
-            const insertHistoricalPerformance = db.prepare('INSERT INTO historical_performance (idx, step, score) VALUES (?, ?, ?)');
-            this.#historicalPerformance.forEach((history, idx) => {
-                history.forEach((score, step) => {
-                    if (isValidNumber(score)) insertHistoricalPerformance.run(idx, step, score);
-                });
-            });
+            rows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const value = this.#agreementScores[idx];
+                if (isValidNumber(value)) rows.push([idx, value]);
+            }
+            batchInsert('agreement_scores', ['idx', 'value'], rows);
 
-            const insertTrustScoresHistory = db.prepare('INSERT INTO trust_scores_history (idx, step, score) VALUES (?, ?, ?)');
-            this.#trustScoresHistory.forEach((history, idx) => {
-                history.forEach((score, step) => {
-                    if (isValidNumber(score)) insertTrustScoresHistory.run(idx, step, score);
-                });
-            });
+            rows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const value = this.#specializationScores[idx];
+                if (isValidNumber(value)) rows.push([idx, value]);
+            }
+            batchInsert('specialization_scores', ['idx', 'value'], rows);
 
-            const insertAdaptiveLearningRate = db.prepare('INSERT INTO adaptive_learning_rate (idx, value) VALUES (?, ?)');
-            this.#adaptiveLearningRate.forEach((value, idx) => {
-                if (isValidNumber(value)) insertAdaptiveLearningRate.run(idx, value);
-            });
+            rows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const value = this.#adaptiveLearningRate[idx];
+                if (isValidNumber(value)) rows.push([idx, value]);
+            }
+            batchInsert('adaptive_learning_rate', ['idx', 'value'], rows);
 
-            const insertAttentionWeightMatrix = db.prepare('INSERT INTO attention_weight_matrix (idx, row, value) VALUES (?, ?, ?)');
-            this.#attentionWeightMatrix.forEach((weights, idx) => {
-                weights.forEach((value, row) => {
-                    if (isValidNumber(value)) insertAttentionWeightMatrix.run(idx, row, value);
-                });
-            });
+            rows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const history = this.#historicalPerformance[idx];
+                for (let step = 0; step < history.length; step++) {
+                    const score = history[step];
+                    if (isValidNumber(score)) rows.push([idx, step, score]);
+                }
+            }
+            batchInsert('historical_performance', ['idx', 'step', 'score'], rows);
 
-            const insertAttentionBias = db.prepare('INSERT INTO attention_bias (idx, row, value) VALUES (?, ?, ?)');
-            this.#attentionBias.forEach((biases, idx) => {
-                biases.forEach((value, row) => {
-                    if (isValidNumber(value)) insertAttentionBias.run(idx, row, value);
-                });
-            });
+            rows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const history = this.#trustScoresHistory[idx];
+                for (let step = 0; step < history.length; step++) {
+                    const score = history[step];
+                    if (isValidNumber(score)) rows.push([idx, step, score]);
+                }
+            }
+            batchInsert('trust_scores_history', ['idx', 'step', 'score'], rows);
 
-            const insertSpecializationWeights = db.prepare('INSERT INTO specialization_weights (idx, row, col, value) VALUES (?, ?, ?, ?)');
-            this.#specializationWeights.forEach((matrix, idx) => {
-                matrix.forEach((rowArr, r) => {
-                    rowArr.forEach((value, c) => {
-                        if (isValidNumber(value)) insertSpecializationWeights.run(idx, r, c, value);
-                    });
-                });
-            });
+            rows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const vec = this.#attentionWeightMatrix[idx];
+                for (let row = 0; row < vec.length; row++) {
+                    const value = vec[row];
+                    if (isValidNumber(value)) rows.push([idx, row, value]);
+                }
+            }
+            batchInsert('attention_weight_matrix', ['idx', 'row', 'value'], rows);
 
-            const insertProjection = db.prepare('INSERT INTO projection_matrices (proj_idx, row, col, value) VALUES (?, ?, ?, ?)');
-            this.#projectionMatrices.forEach((matrix, proj_idx) => {
-                matrix.forEach((rowArr, r) => {
-                    rowArr.forEach((value, c) => {
-                        if (isValidNumber(value)) insertProjection.run(proj_idx, r, c, value);
-                    });
-                });
-            });
+            rows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const vec = this.#attentionBias[idx];
+                for (let row = 0; row < vec.length; row++) {
+                    const value = vec[row];
+                    if (isValidNumber(value)) rows.push([idx, row, value]);
+                }
+            }
+            batchInsert('attention_bias', ['idx', 'row', 'value'], rows);
 
-            const insertLsh = db.prepare('INSERT INTO lsh_hyperplanes (set_idx, table_idx, bit_idx, dim, value) VALUES (?, ?, ?, ?, ?)');
-            this.#lshHyperplanes.forEach((setArr, set_idx) => {
-                setArr.forEach((tableArr, table_idx) => {
-                    tableArr.forEach((vec, bit_idx) => {
-                        vec.forEach((value, dim) => {
-                            if (isValidNumber(value)) insertLsh.run(set_idx, table_idx, bit_idx, dim, value);
-                        });
-                    });
-                });
-            });
-
-            const insertAttentionProto = db.prepare('INSERT INTO attention_memory_protos (idx, window, proto_idx, proto_size, access_count, is_core, importance) VALUES (?, ?, ?, ?, ?, ?, ?)');
-            const insertAttentionMean = db.prepare('INSERT INTO attention_memory_means (idx, window, proto_idx, dim, value) VALUES (?, ?, ?, ?, ?)');
-            const insertAttentionVariance = db.prepare('INSERT INTO attention_memory_variances (idx, window, proto_idx, dim, value) VALUES (?, ?, ?, ?, ?)');
-            const insertAttentionRepMean = db.prepare('INSERT INTO attention_memory_rep_mean (idx, window, dim, value) VALUES (?, ?, ?, ?)');
-            const insertAttentionProjNorm = db.prepare('INSERT INTO attention_memory_projnorms (idx, window, proto_idx, proj_idx, dim, value) VALUES (?, ?, ?, ?, ?, ?)');
-            const insertAttentionRepProj = db.prepare('INSERT INTO attention_memory_rep_proj (idx, window, proj_idx, dim, value) VALUES (?, ?, ?, ?, ?)');
-
-            this.#attentionMemory.forEach((memoryWindows, idx) => {
-                memoryWindows.forEach((entry, window) => {
-                    if (entry.repMean) {
-                        entry.repMean.forEach((value, dim) => {
-                            if (isValidNumber(value)) insertAttentionRepMean.run(idx, window, dim, value);
-                        });
+            rows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const matrix = this.#specializationWeights[idx];
+                for (let r = 0; r < matrix.length; r++) {
+                    const rowArr = matrix[r];
+                    for (let c = 0; c < rowArr.length; c++) {
+                        const value = rowArr[c];
+                        if (isValidNumber(value)) rows.push([idx, r, c, value]);
                     }
-                    if (entry.repProj && Array.isArray(entry.repProj)) {
-                        entry.repProj.forEach((projVec, proj_idx) => {
-                            if (projVec && projVec.forEach) {
-                                projVec.forEach((value, dim) => {
-                                    if (isValidNumber(value)) insertAttentionRepProj.run(idx, window, proj_idx, dim, value);
-                                });
+                }
+            }
+            batchInsert('specialization_weights', ['idx', 'row', 'col', 'value'], rows, 5000);
+
+            rows = [];
+            for (let proj_idx = 0; proj_idx < this.#numProjections; proj_idx++) {
+                const matrix = this.#projectionMatrices[proj_idx];
+                for (let r = 0; r < matrix.length; r++) {
+                    const rowArr = matrix[r];
+                    for (let c = 0; c < rowArr.length; c++) {
+                        const value = rowArr[c];
+                        if (isValidNumber(value)) rows.push([proj_idx, r, c, value]);
+                    }
+                }
+            }
+            batchInsert('projection_matrices', ['proj_idx', 'row', 'col', 'value'], rows);
+
+            rows = [];
+            for (let set_idx = 0; set_idx < this.#numLshSets; set_idx++) {
+                const setArr = this.#lshHyperplanes[set_idx];
+                for (let table_idx = 0; table_idx < setArr.length; table_idx++) {
+                    const tableArr = setArr[table_idx];
+                    for (let bit_idx = 0; bit_idx < tableArr.length; bit_idx++) {
+                        const vec = tableArr[bit_idx];
+                        for (let dim = 0; dim < vec.length; dim++) {
+                            const value = vec[dim];
+                            if (isValidNumber(value)) rows.push([set_idx, table_idx, bit_idx, dim, value]);
+                        }
+                    }
+                }
+            }
+            batchInsert('lsh_hyperplanes', ['set_idx', 'table_idx', 'bit_idx', 'dim', 'value'], rows);
+
+            let transWeightRows = [];
+            let transBiasRows = [];
+            let transNormRows = [];
+
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const t = this.#transformers[idx];
+                const numLayers = t.attentionWeights.length;
+
+                for (let layer = 0; layer < numLayers; layer++) {
+                    const aw = t.attentionWeights[layer];
+                    for (const type of ['Wq', 'Wk', 'Wv', 'Wo']) {
+                        const m = aw[type];
+                        for (let r = 0; r < m.length; r++) {
+                            for (let c = 0; c < m[r].length; c++) {
+                                const v = m[r][c];
+                                if (isValidNumber(v)) transWeightRows.push([idx, layer, type, r, c, v]);
                             }
-                        });
+                        }
                     }
+                }
 
-                    entry.protos.forEach((proto, proto_idx) => {
-                        insertAttentionProto.run(
-                            idx, window, proto_idx,
-                            proto.size ?? 0,
-                            proto.accessCount ?? 0,
-                            proto.isCore ? 1 : 0,
-                            proto.importance ?? 0
-                        );
-
-                        if (proto.mean && proto.mean.forEach) {
-                            proto.mean.forEach((value, dim) => {
-                                if (isValidNumber(value)) insertAttentionMean.run(idx, window, proto_idx, dim, value);
-                            });
-                        }
-                        if (proto.variance && proto.variance.forEach) {
-                            proto.variance.forEach((value, dim) => {
-                                if (isValidNumber(value)) insertAttentionVariance.run(idx, window, proto_idx, dim, value);
-                            });
-                        }
-                        if (proto.projNorms && Array.isArray(proto.projNorms)) {
-                            proto.projNorms.forEach((projVec, proj_idx) => {
-                                if (projVec && projVec.forEach) {
-                                    projVec.forEach((value, dim) => {
-                                        if (isValidNumber(value)) insertAttentionProjNorm.run(idx, window, proto_idx, proj_idx, dim, value);
-                                    });
-                                }
-                            });
-                        }
-                    });
-                });
-            });
-
-            const insertAdaptiveProto = db.prepare('INSERT INTO adaptive_context_protos (idx, window, proto_idx, proto_size, access_count, is_core, importance) VALUES (?, ?, ?, ?, ?, ?, ?)');
-            const insertAdaptiveMean = db.prepare('INSERT INTO adaptive_context_means (idx, window, proto_idx, dim, value) VALUES (?, ?, ?, ?, ?)');
-            const insertAdaptiveVariance = db.prepare('INSERT INTO adaptive_context_variances (idx, window, proto_idx, dim, value) VALUES (?, ?, ?, ?, ?)');
-            const insertAdaptiveRepMean = db.prepare('INSERT INTO adaptive_context_rep_mean (idx, window, dim, value) VALUES (?, ?, ?, ?)');
-            const insertAdaptiveProjNorm = db.prepare('INSERT INTO adaptive_context_projnorms (idx, window, proto_idx, proj_idx, dim, value) VALUES (?, ?, ?, ?, ?, ?)');
-            const insertAdaptiveRepProj = db.prepare('INSERT INTO adaptive_context_rep_proj (idx, window, proj_idx, dim, value) VALUES (?, ?, ?, ?, ?)');
-
-            this.#adaptiveContext.forEach((memoryWindows, idx) => {
-                memoryWindows.forEach((entry, window) => {
-                    if (entry.repMean) {
-                        entry.repMean.forEach((value, dim) => {
-                            if (isValidNumber(value)) insertAdaptiveRepMean.run(idx, window, dim, value);
-                        });
-                    }
-                    if (entry.repProj && Array.isArray(entry.repProj)) {
-                        entry.repProj.forEach((projVec, proj_idx) => {
-                            if (projVec && projVec.forEach) {
-                                projVec.forEach((value, dim) => {
-                                    if (isValidNumber(value)) insertAdaptiveRepProj.run(idx, window, proj_idx, dim, value);
-                                });
+                for (let layer = 0; layer < numLayers; layer++) {
+                    const fw = t.ffnWeights[layer];
+                    for (const type of ['gate_proj', 'up_proj', 'down_proj']) {
+                        const m = fw[type];
+                        for (let r = 0; r < m.length; r++) {
+                            for (let c = 0; c < m[r].length; c++) {
+                                const v = m[r][c];
+                                if (isValidNumber(v)) transWeightRows.push([idx, layer, type, r, c, v]);
                             }
-                        });
-                    }
-
-                    entry.protos.forEach((proto, proto_idx) => {
-                        insertAdaptiveProto.run(
-                            idx, window, proto_idx,
-                            proto.size ?? 0,
-                            proto.accessCount ?? 0,
-                            proto.isCore ? 1 : 0,
-                            proto.importance ?? 0
-                        );
-
-                        if (proto.mean && proto.mean.forEach) {
-                            proto.mean.forEach((value, dim) => {
-                                if (isValidNumber(value)) insertAdaptiveMean.run(idx, window, proto_idx, dim, value);
-                            });
                         }
-                        if (proto.variance && proto.variance.forEach) {
-                            proto.variance.forEach((value, dim) => {
-                                if (isValidNumber(value)) insertAdaptiveVariance.run(idx, window, proto_idx, dim, value);
-                            });
-                        }
-                        if (proto.projNorms && Array.isArray(proto.projNorms)) {
-                            proto.projNorms.forEach((projVec, proj_idx) => {
-                                if (projVec && projVec.forEach) {
-                                    projVec.forEach((value, dim) => {
-                                        if (isValidNumber(value)) insertAdaptiveProjNorm.run(idx, window, proto_idx, proj_idx, dim, value);
-                                    });
-                                }
-                            });
-                        }
-                    });
-                });
-            });
-
-            const insertSemanticProto = db.prepare('INSERT INTO semantic_protos (idx, proto_idx, proto_size, access_count, is_core, importance) VALUES (?, ?, ?, ?, ?, ?)');
-            const insertSemanticMean = db.prepare('INSERT INTO semantic_means (idx, proto_idx, dim, value) VALUES (?, ?, ?, ?)');
-            const insertSemanticVariance = db.prepare('INSERT INTO semantic_variances (idx, proto_idx, dim, value) VALUES (?, ?, ?, ?)');
-            const insertSemanticProjNorm = db.prepare('INSERT INTO semantic_projnorms (idx, proto_idx, proj_idx, dim, value) VALUES (?, ?, ?, ?, ?)');
-
-            this.#semanticProtos.forEach((protos, idx) => {
-                protos.forEach((proto, proto_idx) => {
-                    insertSemanticProto.run(
-                        idx, proto_idx,
-                        proto.size ?? 0,
-                        proto.accessCount ?? 0,
-                        proto.isCore ? 1 : 0,
-                        proto.importance ?? 0
-                    );
-
-                    if (proto.mean && proto.mean.forEach) {
-                        proto.mean.forEach((value, dim) => {
-                            if (isValidNumber(value)) insertSemanticMean.run(idx, proto_idx, dim, value);
-                        });
                     }
-                    if (proto.variance && proto.variance.forEach) {
-                        proto.variance.forEach((value, dim) => {
-                            if (isValidNumber(value)) insertSemanticVariance.run(idx, proto_idx, dim, value);
-                        });
+                }
+
+                for (let layer = 0; layer < numLayers; layer++) {
+                    const ln = t.layerNormWeights[layer];
+                    for (const type of ['gamma1', 'gamma2']) {
+                        const vec = ln[type];
+                        for (let r = 0; r < vec.length; r++) {
+                            const v = vec[r];
+                            if (isValidNumber(v)) transNormRows.push([idx, layer, type, r, v]);
+                        }
                     }
-                    if (proto.projNorms && Array.isArray(proto.projNorms)) {
-                        proto.projNorms.forEach((projVec, proj_idx) => {
-                            if (projVec && projVec.forEach) {
-                                projVec.forEach((value, dim) => {
-                                    if (isValidNumber(value)) insertSemanticProjNorm.run(idx, proto_idx, proj_idx, dim, value);
-                                });
+                }
+
+                const ow = t.outputWeights;
+                for (let r = 0; r < ow.length; r++) {
+                    for (let c = 0; c < ow[r].length; c++) {
+                        const v = ow[r][c];
+                        if (isValidNumber(v)) transWeightRows.push([idx, -1, 'outputWeights', r, c, v]);
+                    }
+                }
+
+                const ob = t.outputBias;
+                for (let r = 0; r < ob.length; r++) {
+                    const v = ob[r];
+                    if (isValidNumber(v)) transBiasRows.push([idx, -1, 'outputBias', r, v]);
+                }
+            }
+
+            batchInsert('transformers', ['idx', 'layer', 'weight_type', 'row', 'col', 'value'], transWeightRows, 5000);
+            batchInsert('transformer_biases', ['idx', 'layer', 'bias_type', 'row', 'value'], transBiasRows);
+            batchInsert('transformer_layer_norm', ['idx', 'layer', 'norm_type', 'row', 'value'], transNormRows);
+
+            let gradRows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const g = this.#gradientAccumulation[idx];
+
+                for (let r = 0; r < g.outputWeights.length; r++) {
+                    for (let c = 0; c < g.outputWeights[r].length; c++) {
+                        const v = g.outputWeights[r][c];
+                        if (isValidNumber(v)) gradRows.push([idx, -1, 'outputWeights', r, c, v]);
+                    }
+                }
+                for (let r = 0; r < g.outputBias.length; r++) {
+                    const v = g.outputBias[r];
+                    if (isValidNumber(v)) gradRows.push([idx, -1, 'outputBias', r, 0, v]);
+                }
+
+                const numLayers = g.attentionWeights.length;
+
+                for (let layer = 0; layer < numLayers; layer++) {
+                    const ag = g.attentionWeights[layer];
+                    for (const type of ['Wq', 'Wk', 'Wv', 'Wo']) {
+                        const m = ag[type];
+                        for (let r = 0; r < m.length; r++) {
+                            for (let c = 0; c < m[r].length; c++) {
+                                const v = m[r][c];
+                                if (isValidNumber(v)) gradRows.push([idx, layer, type, r, c, v]);
                             }
-                        });
+                        }
                     }
-                });
-            });
+                }
 
-            const insertCoreProto = db.prepare('INSERT INTO core_episodic_protos (idx, entry_idx, proto_idx, proto_size, access_count, is_core, importance) VALUES (?, ?, ?, ?, ?, ?, ?)');
-            const insertCoreMean = db.prepare('INSERT INTO core_episodic_means (idx, entry_idx, proto_idx, dim, value) VALUES (?, ?, ?, ?, ?)');
-            const insertCoreVariance = db.prepare('INSERT INTO core_episodic_variances (idx, entry_idx, proto_idx, dim, value) VALUES (?, ?, ?, ?, ?)');
-            const insertCoreRepMean = db.prepare('INSERT INTO core_episodic_rep_mean (idx, entry_idx, dim, value) VALUES (?, ?, ?, ?)');
-            const insertCoreProjNorm = db.prepare('INSERT INTO core_episodic_projnorms (idx, entry_idx, proto_idx, proj_idx, dim, value) VALUES (?, ?, ?, ?, ?, ?)');
-            const insertCoreRepProj = db.prepare('INSERT INTO core_episodic_rep_proj (idx, entry_idx, proj_idx, dim, value) VALUES (?, ?, ?, ?, ?)');
-
-            this.#coreEpisodic.forEach((entries, idx) => {
-                entries.forEach((entry, entry_idx) => {
-                    if (entry.repMean) {
-                        entry.repMean.forEach((value, dim) => {
-                            if (isValidNumber(value)) insertCoreRepMean.run(idx, entry_idx, dim, value);
-                        });
-                    }
-                    if (entry.repProj && Array.isArray(entry.repProj)) {
-                        entry.repProj.forEach((projVec, proj_idx) => {
-                            if (projVec && projVec.forEach) {
-                                projVec.forEach((value, dim) => {
-                                    if (isValidNumber(value)) insertCoreRepProj.run(idx, entry_idx, proj_idx, dim, value);
-                                });
+                for (let layer = 0; layer < numLayers; layer++) {
+                    const fg = g.ffnWeights[layer];
+                    for (const type of ['gate_proj', 'up_proj', 'down_proj']) {
+                        const m = fg[type];
+                        for (let r = 0; r < m.length; r++) {
+                            for (let c = 0; c < m[r].length; c++) {
+                                const v = m[r][c];
+                                if (isValidNumber(v)) gradRows.push([idx, layer, type, r, c, v]);
                             }
-                        });
+                        }
                     }
+                }
 
-                    entry.protos.forEach((proto, proto_idx) => {
-                        insertCoreProto.run(
-                            idx, entry_idx, proto_idx,
-                            proto.size ?? 0,
-                            proto.accessCount ?? 0,
-                            proto.isCore ? 1 : 0,
-                            proto.importance ?? 0
-                        );
-
-                        if (proto.mean && proto.mean.forEach) {
-                            proto.mean.forEach((value, dim) => {
-                                if (isValidNumber(value)) insertCoreMean.run(idx, entry_idx, proto_idx, dim, value);
-                            });
+                for (let layer = 0; layer < numLayers; layer++) {
+                    const lg = g.layerNormWeights[layer];
+                    for (const type of ['gamma1', 'gamma2']) {
+                        const vec = lg[type];
+                        for (let r = 0; r < vec.length; r++) {
+                            const v = vec[r];
+                            if (isValidNumber(v)) gradRows.push([idx, layer, type, r, 0, v]);
                         }
-                        if (proto.variance && proto.variance.forEach) {
-                            proto.variance.forEach((value, dim) => {
-                                if (isValidNumber(value)) insertCoreVariance.run(idx, entry_idx, proto_idx, dim, value);
-                            });
+                    }
+                }
+
+                for (let r = 0; r < g.attentionBias.length; r++) {
+                    const v = g.attentionBias[r];
+                    if (isValidNumber(v)) gradRows.push([idx, -1, 'attentionBias', r, 0, v]);
+                }
+                for (let r = 0; r < g.attentionWeightMatrix.length; r++) {
+                    const v = g.attentionWeightMatrix[r];
+                    if (isValidNumber(v)) gradRows.push([idx, -1, 'attentionWeightMatrix', r, 0, v]);
+                }
+                for (let r = 0; r < g.specializationWeights.length; r++) {
+                    for (let c = 0; c < g.specializationWeights[r].length; c++) {
+                        const v = g.specializationWeights[r][c];
+                        if (isValidNumber(v)) gradRows.push([idx, -1, 'specializationWeights', r, c, v]);
+                    }
+                }
+            }
+            batchInsert('gradient_accumulation', ['idx', 'layer', 'weight_type', 'row', 'col', 'value'], gradRows, 5000);
+
+            let attProtoRows = [], attMeanRows = [], attVarRows = [], attRepMeanRows = [], attProjRows = [], attRepProjRows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const windows = this.#attentionMemory[idx];
+                for (let window = 0; window < windows.length; window++) {
+                    const entry = windows[window];
+
+                    if (entry.repMean?.length) {
+                        for (let dim = 0; dim < entry.repMean.length; dim++) {
+                            const v = entry.repMean[dim];
+                            if (isValidNumber(v)) attRepMeanRows.push([idx, window, dim, v]);
                         }
-                        if (proto.projNorms && Array.isArray(proto.projNorms)) {
-                            proto.projNorms.forEach((projVec, proj_idx) => {
-                                if (projVec && projVec.forEach) {
-                                    projVec.forEach((value, dim) => {
-                                        if (isValidNumber(value)) insertCoreProjNorm.run(idx, entry_idx, proto_idx, proj_idx, dim, value);
-                                    });
-                                }
-                            });
-                        }
-                    });
-                });
-            });
-
-            const insertTransformerWeights = db.prepare('INSERT INTO transformers (idx, layer, weight_type, row, col, value) VALUES (?, ?, ?, ?, ?, ?)');
-            const insertTransformerLayerNorm = db.prepare('INSERT INTO transformer_layer_norm (idx, layer, norm_type, row, value) VALUES (?, ?, ?, ?, ?)');
-            const insertTransformerBiases = db.prepare('INSERT INTO transformer_biases (idx, layer, bias_type, row, value) VALUES (?, ?, ?, ?, ?)');
-
-            this.#transformers.forEach((transformer, idx) => {
-                transformer.attentionWeights.forEach((layerWeights, layer) => {
-                    ['Wq', 'Wk', 'Wv', 'Wo'].forEach(weightType => {
-                        const matrix = layerWeights[weightType];
-                        matrix.forEach((rowArr, r) => {
-                            rowArr.forEach((value, c) => {
-                                if (isValidNumber(value)) {
-                                    insertTransformerWeights.run(idx, layer, weightType, r, c, value);
-                                }
-                            });
-                        });
-                    });
-                });
-
-                transformer.ffnWeights.forEach((layerFFN, layer) => {
-                    ['gate_proj', 'up_proj', 'down_proj'].forEach(weightType => {
-                        const matrix = layerFFN[weightType];
-                        matrix.forEach((rowArr, r) => {
-                            rowArr.forEach((value, c) => {
-                                if (isValidNumber(value)) {
-                                    insertTransformerWeights.run(idx, layer, weightType, r, c, value);
-                                }
-                            });
-                        });
-                    });
-                });
-
-                transformer.layerNormWeights.forEach((layerNorm, layer) => {
-                    ['gamma1', 'gamma2'].forEach(normType => {
-                        layerNorm[normType].forEach((value, r) => {
-                            if (isValidNumber(value)) {
-                                insertTransformerLayerNorm.run(idx, layer, normType, r, value);
+                    }
+                    if (Array.isArray(entry.repProj)) {
+                        for (let pidx = 0; pidx < entry.repProj.length; pidx++) {
+                            const vec = entry.repProj[pidx];
+                            if (vec?.length) for (let dim = 0; dim < vec.length; dim++) {
+                                const v = vec[dim];
+                                if (isValidNumber(v)) attRepProjRows.push([idx, window, pidx, dim, v]);
                             }
-                        });
-                    });
-                });
-
-                transformer.outputWeights.forEach((rowArr, r) => {
-                    rowArr.forEach((value, c) => {
-                        if (isValidNumber(value)) {
-                            insertTransformerWeights.run(idx, -1, 'outputWeights', r, c, value);
                         }
-                    });
-                });
-
-                transformer.outputBias.forEach((value, r) => {
-                    if (isValidNumber(value)) {
-                        insertTransformerBiases.run(idx, -1, 'outputBias', r, value);
                     }
-                });
-            });
 
-            const insertGradientAccumulation = db.prepare('INSERT INTO gradient_accumulation (idx, layer, weight_type, row, col, value) VALUES (?, ?, ?, ?, ?, ?)');
+                    for (let pidx = 0; pidx < entry.protos.length; pidx++) {
+                        const proto = entry.protos[pidx];
+                        attProtoRows.push([idx, window, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0]);
 
-            this.#gradientAccumulation.forEach((grad, idx) => {
-                grad.outputWeights.forEach((rowArr, r) => {
-                    rowArr.forEach((value, c) => {
-                        if (isValidNumber(value)) {
-                            insertGradientAccumulation.run(idx, -1, 'outputWeights', r, c, value);
+                        if (proto.mean?.length) for (let dim = 0; dim < proto.mean.length; dim++) {
+                            const v = proto.mean[dim];
+                            if (isValidNumber(v)) attMeanRows.push([idx, window, pidx, dim, v]);
                         }
-                    });
-                });
-                grad.outputBias.forEach((value, r) => {
-                    if (isValidNumber(value)) {
-                        insertGradientAccumulation.run(idx, -1, 'outputBias', r, 0, value);
-                    }
-                });
-
-                grad.attentionWeights.forEach((layerGrad, layer) => {
-                    ['Wq', 'Wk', 'Wv', 'Wo'].forEach(weightType => {
-                        const matrix = layerGrad[weightType];
-                        matrix.forEach((rowArr, r) => {
-                            rowArr.forEach((value, c) => {
-                                if (isValidNumber(value)) {
-                                    insertGradientAccumulation.run(idx, layer, weightType, r, c, value);
-                                }
-                            });
-                        });
-                    });
-                });
-
-                grad.ffnWeights.forEach((layerGrad, layer) => {
-                    ['gate_proj', 'up_proj', 'down_proj'].forEach(weightType => {
-                        const matrix = layerGrad[weightType];
-                        matrix.forEach((rowArr, r) => {
-                            rowArr.forEach((value, c) => {
-                                if (isValidNumber(value)) {
-                                    insertGradientAccumulation.run(idx, layer, weightType, r, c, value);
-                                }
-                            });
-                        });
-                    });
-                });
-
-                grad.layerNormWeights.forEach((layerGrad, layer) => {
-                    ['gamma1', 'gamma2'].forEach(normType => {
-                        layerGrad[normType].forEach((value, r) => {
-                            if (isValidNumber(value)) {
-                                insertGradientAccumulation.run(idx, layer, normType, r, 0, value);
+                        if (proto.variance?.length) for (let dim = 0; dim < proto.variance.length; dim++) {
+                            const v = proto.variance[dim];
+                            if (isValidNumber(v)) attVarRows.push([idx, window, pidx, dim, v]);
+                        }
+                        if (Array.isArray(proto.projNorms)) for (let pidx2 = 0; pidx2 < proto.projNorms.length; pidx2++) {
+                            const vec = proto.projNorms[pidx2];
+                            if (vec?.length) for (let dim = 0; dim < vec.length; dim++) {
+                                const v = vec[dim];
+                                if (isValidNumber(v)) attProjRows.push([idx, window, pidx, pidx2, dim, v]);
                             }
-                        });
-                    });
-                });
-
-                grad.attentionBias.forEach((value, r) => {
-                    if (isValidNumber(value)) {
-                        insertGradientAccumulation.run(idx, -1, 'attentionBias', r, 0, value);
-                    }
-                });
-                grad.attentionWeightMatrix.forEach((value, r) => {
-                    if (isValidNumber(value)) {
-                        insertGradientAccumulation.run(idx, -1, 'attentionWeightMatrix', r, 0, value);
-                    }
-                });
-                grad.specializationWeights.forEach((rowArr, r) => {
-                    rowArr.forEach((value, c) => {
-                        if (isValidNumber(value)) {
-                            insertGradientAccumulation.run(idx, -1, 'specializationWeights', r, c, value);
                         }
-                    });
-                });
-            });
-
-            const insertPriority = db.prepare('INSERT INTO priority_indices (transformer_idx, rank, proto_idx) VALUES (?, ?, ?)');
-            this.#priorityIndices.forEach((indices, transformer_idx) => {
-                indices.forEach((proto_idx, rank) => {
-                    if (Number.isInteger(proto_idx)) {
-                        insertPriority.run(transformer_idx, rank, proto_idx);
                     }
-                });
-            });
+                }
+            }
+            batchInsert('attention_memory_protos', ['idx', 'window', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance'], attProtoRows);
+            batchInsert('attention_memory_means', ['idx', 'window', 'proto_idx', 'dim', 'value'], attMeanRows);
+            batchInsert('attention_memory_variances', ['idx', 'window', 'proto_idx', 'dim', 'value'], attVarRows);
+            batchInsert('attention_memory_rep_mean', ['idx', 'window', 'dim', 'value'], attRepMeanRows);
+            batchInsert('attention_memory_projnorms', ['idx', 'window', 'proto_idx', 'proj_idx', 'dim', 'value'], attProjRows);
+            batchInsert('attention_memory_rep_proj', ['idx', 'window', 'proj_idx', 'dim', 'value'], attRepProjRows);
 
-            const insertLshBucket = db.prepare('INSERT INTO semantic_lsh_buckets (transformer_idx, set_idx, table_idx, hash_value, proto_idx) VALUES (?, ?, ?, ?, ?)');
-            this.#semanticLSHBuckets.forEach((sets, transformer_idx) => {
-                sets.forEach((tables, set_idx) => {
-                    tables.forEach((bucketMap, table_idx) => {
-                        bucketMap.forEach((protoSet, hashKey) => {
+            let adaptProtoRows = [], adaptMeanRows = [], adaptVarRows = [], adaptRepMeanRows = [], adaptProjRows = [], adaptRepProjRows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const windows = this.#adaptiveContext[idx];
+                for (let window = 0; window < windows.length; window++) {
+                    const entry = windows[window];
+
+                    if (entry.repMean?.length) {
+                        for (let dim = 0; dim < entry.repMean.length; dim++) {
+                            const v = entry.repMean[dim];
+                            if (isValidNumber(v)) adaptRepMeanRows.push([idx, window, dim, v]);
+                        }
+                    }
+                    if (Array.isArray(entry.repProj)) {
+                        for (let pidx = 0; pidx < entry.repProj.length; pidx++) {
+                            const vec = entry.repProj[pidx];
+                            if (vec?.length) for (let dim = 0; dim < vec.length; dim++) {
+                                const v = vec[dim];
+                                if (isValidNumber(v)) adaptRepProjRows.push([idx, window, pidx, dim, v]);
+                            }
+                        }
+                    }
+
+                    for (let pidx = 0; pidx < entry.protos.length; pidx++) {
+                        const proto = entry.protos[pidx];
+                        adaptProtoRows.push([idx, window, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0]);
+
+                        if (proto.mean?.length) for (let dim = 0; dim < proto.mean.length; dim++) {
+                            const v = proto.mean[dim];
+                            if (isValidNumber(v)) adaptMeanRows.push([idx, window, pidx, dim, v]);
+                        }
+                        if (proto.variance?.length) for (let dim = 0; dim < proto.variance.length; dim++) {
+                            const v = proto.variance[dim];
+                            if (isValidNumber(v)) adaptVarRows.push([idx, window, pidx, dim, v]);
+                        }
+                        if (Array.isArray(proto.projNorms)) for (let pidx2 = 0; pidx2 < proto.projNorms.length; pidx2++) {
+                            const vec = proto.projNorms[pidx2];
+                            if (vec?.length) for (let dim = 0; dim < vec.length; dim++) {
+                                const v = vec[dim];
+                                if (isValidNumber(v)) adaptProjRows.push([idx, window, pidx, pidx2, dim, v]);
+                            }
+                        }
+                    }
+                }
+            }
+            batchInsert('adaptive_context_protos', ['idx', 'window', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance'], adaptProtoRows);
+            batchInsert('adaptive_context_means', ['idx', 'window', 'proto_idx', 'dim', 'value'], adaptMeanRows);
+            batchInsert('adaptive_context_variances', ['idx', 'window', 'proto_idx', 'dim', 'value'], adaptVarRows);
+            batchInsert('adaptive_context_rep_mean', ['idx', 'window', 'dim', 'value'], adaptRepMeanRows);
+            batchInsert('adaptive_context_projnorms', ['idx', 'window', 'proto_idx', 'proj_idx', 'dim', 'value'], adaptProjRows);
+            batchInsert('adaptive_context_rep_proj', ['idx', 'window', 'proj_idx', 'dim', 'value'], adaptRepProjRows);
+
+            let semProtoRows = [], semMeanRows = [], semVarRows = [], semProjRows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const protos = this.#semanticProtos[idx];
+                for (let pidx = 0; pidx < protos.length; pidx++) {
+                    const proto = protos[pidx];
+                    semProtoRows.push([idx, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0]);
+
+                    if (proto.mean?.length) for (let dim = 0; dim < proto.mean.length; dim++) {
+                        const v = proto.mean[dim];
+                        if (isValidNumber(v)) semMeanRows.push([idx, pidx, dim, v]);
+                    }
+                    if (proto.variance?.length) for (let dim = 0; dim < proto.variance.length; dim++) {
+                        const v = proto.variance[dim];
+                        if (isValidNumber(v)) semVarRows.push([idx, pidx, dim, v]);
+                    }
+                    if (Array.isArray(proto.projNorms)) for (let pidx2 = 0; pidx2 < proto.projNorms.length; pidx2++) {
+                        const vec = proto.projNorms[pidx2];
+                        if (vec?.length) for (let dim = 0; dim < vec.length; dim++) {
+                            const v = vec[dim];
+                            if (isValidNumber(v)) semProjRows.push([idx, pidx, pidx2, dim, v]);
+                        }
+                    }
+                }
+            }
+            batchInsert('semantic_protos', ['idx', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance'], semProtoRows);
+            batchInsert('semantic_means', ['idx', 'proto_idx', 'dim', 'value'], semMeanRows);
+            batchInsert('semantic_variances', ['idx', 'proto_idx', 'dim', 'value'], semVarRows);
+            batchInsert('semantic_projnorms', ['idx', 'proto_idx', 'proj_idx', 'dim', 'value'], semProjRows);
+
+            let coreProtoRows = [], coreMeanRows = [], coreVarRows = [], coreRepMeanRows = [], coreProjRows = [], coreRepProjRows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const entries = this.#coreEpisodic[idx];
+                for (let eidx = 0; eidx < entries.length; eidx++) {
+                    const entry = entries[eidx];
+
+                    if (entry.repMean?.length) {
+                        for (let dim = 0; dim < entry.repMean.length; dim++) {
+                            const v = entry.repMean[dim];
+                            if (isValidNumber(v)) coreRepMeanRows.push([idx, eidx, dim, v]);
+                        }
+                    }
+                    if (Array.isArray(entry.repProj)) {
+                        for (let pidx = 0; pidx < entry.repProj.length; pidx++) {
+                            const vec = entry.repProj[pidx];
+                            if (vec?.length) for (let dim = 0; dim < vec.length; dim++) {
+                                const v = vec[dim];
+                                if (isValidNumber(v)) coreRepProjRows.push([idx, eidx, pidx, dim, v]);
+                            }
+                        }
+                    }
+
+                    for (let pidx = 0; pidx < entry.protos.length; pidx++) {
+                        const proto = entry.protos[pidx];
+                        coreProtoRows.push([idx, eidx, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0]);
+
+                        if (proto.mean?.length) for (let dim = 0; dim < proto.mean.length; dim++) {
+                            const v = proto.mean[dim];
+                            if (isValidNumber(v)) coreMeanRows.push([idx, eidx, pidx, dim, v]);
+                        }
+                        if (proto.variance?.length) for (let dim = 0; dim < proto.variance.length; dim++) {
+                            const v = proto.variance[dim];
+                            if (isValidNumber(v)) coreVarRows.push([idx, eidx, pidx, dim, v]);
+                        }
+                        if (Array.isArray(proto.projNorms)) for (let pidx2 = 0; pidx2 < proto.projNorms.length; pidx2++) {
+                            const vec = proto.projNorms[pidx2];
+                            if (vec?.length) for (let dim = 0; dim < vec.length; dim++) {
+                                const v = vec[dim];
+                                if (isValidNumber(v)) coreProjRows.push([idx, eidx, pidx, pidx2, dim, v]);
+                            }
+                        }
+                    }
+                }
+            }
+            batchInsert('core_episodic_protos', ['idx', 'entry_idx', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance'], coreProtoRows);
+            batchInsert('core_episodic_means', ['idx', 'entry_idx', 'proto_idx', 'dim', 'value'], coreMeanRows);
+            batchInsert('core_episodic_variances', ['idx', 'entry_idx', 'proto_idx', 'dim', 'value'], coreVarRows);
+            batchInsert('core_episodic_rep_mean', ['idx', 'entry_idx', 'dim', 'value'], coreRepMeanRows);
+            batchInsert('core_episodic_projnorms', ['idx', 'entry_idx', 'proto_idx', 'proj_idx', 'dim', 'value'], coreProjRows);
+            batchInsert('core_episodic_rep_proj', ['idx', 'entry_idx', 'proj_idx', 'dim', 'value'], coreRepProjRows);
+
+            rows = [];
+            for (let idx = 0; idx < ensembleSize; idx++) {
+                const indices = this.#priorityIndices[idx];
+                for (let rank = 0; rank < indices.length; rank++) {
+                    const pidx = indices[rank];
+                    if (Number.isInteger(pidx)) rows.push([idx, rank, pidx]);
+                }
+            }
+            batchInsert('priority_indices', ['transformer_idx', 'rank', 'proto_idx'], rows);
+
+            rows = [];
+            for (let idx = 0; idx < this.#ensembleSize; idx++) {
+                const semProtos = this.#semanticProtos[idx];
+                if (semProtos.length === 0) continue;
+
+                const protoToIdx = new Map();
+                for (let pidx = 0; pidx < semProtos.length; pidx++) {
+                    protoToIdx.set(semProtos[pidx], pidx);
+                }
+
+                const sets = this.#semanticLSHBuckets[idx];
+                for (let sidx = 0; sidx < sets.length; sidx++) {
+                    const tables = sets[sidx];
+                    for (let tidx = 0; tidx < tables.length; tidx++) {
+                        const map = tables[tidx];
+                        for (const [hashKey, protoSet] of map.entries()) {
                             const hashStr = hashKey.toString();
-                            protoSet.forEach(proto_idx => {
-                                if (Number.isInteger(proto_idx)) {
-                                    insertLshBucket.run(transformer_idx, set_idx, table_idx, hashStr, proto_idx);
+                            for (const proto of protoSet) {
+                                const pidx = protoToIdx.get(proto);
+                                if (typeof pidx === 'number') {
+                                    rows.push([idx, sidx, tidx, hashStr, pidx]);
                                 }
-                            });
-                        });
-                    });
-                });
-            });
+                            }
+                        }
+                    }
+                }
+            }
+            batchInsert('semantic_lsh_buckets', ['transformer_idx', 'set_idx', 'table_idx', 'hash_value', 'proto_idx'], rows);
 
             db.exec('COMMIT');
 
-            return { status: true, message : 'State saved successfully!' };
+            return { status: true, message: 'State saved successfully!' };
         } catch (error) {
             if (db) db.exec('ROLLBACK');
             return {
