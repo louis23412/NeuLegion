@@ -32,11 +32,11 @@ class HiveMind {
     #tempOverloadFactor; #mergeTrimFactor;
     #trainingStepCount = 0;
 
-    constructor (dp, es, is, id) {
+    constructor (dp, es, is, id, forceMin = false) {
         this.#directoryPath = dp;
         this.#fileName = `hivemind_state-ID=${id}-es=${es}-is=${is}.db`;
 
-        const loadStatus = this.#loadState(es, is);
+        const loadStatus = this.#loadState(es, is, forceMin);
 
         if (!loadStatus.status) {
             console.log(`Load state failed! Error: ${loadStatus.error}. Trace: ${loadStatus.trace}`);
@@ -44,13 +44,13 @@ class HiveMind {
         }
     }
 
-    #loadState (ensembleSize, inputSize) {
+    #loadState (ensembleSize, inputSize, forceMin) {
         const dbPath = path.join(this.#directoryPath, this.#fileName);
         let db;
 
         try {
             if (!fs.existsSync(dbPath)) {
-                this.#scaleAndSetDimensions(ensembleSize, inputSize);
+                this.#scaleAndSetDimensions(ensembleSize, inputSize, forceMin);
                 return { status : true , message : 'Started with new state!'};
             }
 
@@ -606,6 +606,9 @@ class HiveMind {
 
             return { status: true, message : 'State loaded successfully!' };
         } catch (error) {
+            console.log(error.message, error.stack)
+            process.exit();
+
             return { status: false, error: error.message, trace: error.stack };
         } finally {
             if (db) db.close();
@@ -1528,6 +1531,10 @@ class HiveMind {
             return { status: true, message: 'State saved successfully!' };
         } catch (error) {
             if (db) db.exec('ROLLBACK');
+
+            console.log(error.message, error.stack)
+            process.exit();
+
             return {
                 status: false,
                 error: error.message,
@@ -1538,7 +1545,7 @@ class HiveMind {
         }
     }
 
-    #scaleAndSetDimensions (es, is) {
+    #scaleAndSetDimensions (es, is, forceMin) {
         this.#ensembleSize = es;
         this.#inputSize = is;
 
@@ -1548,30 +1555,30 @@ class HiveMind {
         const log2SqrtEs = Math.log2(sqrtEs);
 
         const numLayersRaw = 6.0 - 4.0 * normalized;
-        this.#numLayers = Math.max(2, Math.round(numLayersRaw));
+        this.#numLayers = forceMin ? 2 : Math.max(2, Math.round(numLayersRaw));
 
         const numHeadsRaw = 8.0 - 6.0 * normalized;
-        this.#numHeads = Math.max(2, Math.round(numHeadsRaw));
+        this.#numHeads = forceMin ? 2 : Math.max(2, Math.round(numHeadsRaw));
 
         const hsExponent = Math.max(2, Math.min(4, 4 - log2SqrtEs));
         const hs = Math.pow(2, Math.floor(hsExponent));
-        this.#headDim = hs * Math.ceil(this.#numHeads / 4);
-        this.#hiddenSize = this.#numHeads * this.#headDim;
+        this.#headDim = forceMin ? 4 : hs * Math.ceil(this.#numHeads / 4);
+        this.#hiddenSize = forceMin ? 8 : this.#numHeads * this.#headDim;
 
         const ffnMultiplier = 8.0 - 4.0 * normalized;
-        this.#feedForwardSize = Math.round(this.#hiddenSize * ffnMultiplier);
+        this.#feedForwardSize = forceMin ? 32 : Math.round(this.#hiddenSize * ffnMultiplier);
 
-        this.#protoCapacityFactor = 1 - 0.5 * normalized;
-        this.#memoryFactor = 1 + 1.5 * normalized;
+        this.#protoCapacityFactor = forceMin ? 0.5 : 1 - 0.5 * normalized;
+        this.#memoryFactor = forceMin ? 2.5 : 1 + 1.5 * normalized;
 
         const rawBase = Math.round(this.#hiddenSize * 0.188 * this.#protoCapacityFactor);
         const minBase = Math.max(4, Math.round(this.#hiddenSize / 32));
-        this.#baseProtoCapacity = Math.max(minBase, rawBase);
+        this.#baseProtoCapacity = forceMin ? 4 : Math.max(minBase, rawBase);
 
-        this.#maxVariancePerDim = Number((8 + 25 * this.#protoCapacityFactor + 0.05 * this.#hiddenSize).toFixed(4));
+        this.#maxVariancePerDim = forceMin ? 20.9 : Number((8 + 25 * this.#protoCapacityFactor + 0.05 * this.#hiddenSize).toFixed(4));
 
-        this.#semanticLR = Number((0.02 + 0.04 * this.#protoCapacityFactor).toFixed(4));
-        this.#semanticBoost = Math.round(5 + 15 * this.#protoCapacityFactor);
+        this.#semanticLR = forceMin ? 0.04 : Number((0.02 + 0.04 * this.#protoCapacityFactor).toFixed(4));
+        this.#semanticBoost = forceMin ? 13 : Math.round(5 + 15 * this.#protoCapacityFactor);
 
         const longTermMultiplier = 0.4 + 0.6 * this.#protoCapacityFactor;
         const shortTermMultiplier = 0.8 + 0.7 * this.#protoCapacityFactor;
@@ -1582,51 +1589,51 @@ class HiveMind {
         const retrievalMultiplier = semanticMultiplier;
         const candidatesMultiplier = 2 * semanticMultiplier;
 
-        this.#longTermMaxProtos = Math.round(this.#baseProtoCapacity * longTermMultiplier);
-        this.#shortTermMaxProtos = Math.round(this.#baseProtoCapacity * shortTermMultiplier);
-        this.#rawMaxProtos = Math.round(this.#baseProtoCapacity * rawMultiplier);
-        this.#semanticMaxProtos = Math.round(this.#baseProtoCapacity * semanticMultiplier);
-        this.#effectiveSemanticMax = Math.round(this.#semanticMaxProtos * (1.1 + 0.15 * this.#protoCapacityFactor));
+        this.#longTermMaxProtos = forceMin ? 3 : Math.round(this.#baseProtoCapacity * longTermMultiplier);
+        this.#shortTermMaxProtos = forceMin ? 5 : Math.round(this.#baseProtoCapacity * shortTermMultiplier);
+        this.#rawMaxProtos = forceMin ? 4 : Math.round(this.#baseProtoCapacity * rawMultiplier);
+        this.#semanticMaxProtos = forceMin ? 16 : Math.round(this.#baseProtoCapacity * semanticMultiplier);
+        this.#effectiveSemanticMax = forceMin ? 19 : Math.round(this.#semanticMaxProtos * (1.1 + 0.15 * this.#protoCapacityFactor));
 
-        this.#coreMaxProtos = Math.round(this.#baseProtoCapacity * coreMultiplier);
-        this.#coreEpisodicMaxEntries = Math.round(this.#baseProtoCapacity * coreEpisodicMultiplier);
+        this.#coreMaxProtos = forceMin ? 7 : Math.round(this.#baseProtoCapacity * coreMultiplier);
+        this.#coreEpisodicMaxEntries = forceMin ? 6 : Math.round(this.#baseProtoCapacity * coreEpisodicMultiplier);
 
-        this.#contextWindow = Math.round(this.#hiddenSize * 2.5 * this.#memoryFactor);
-        this.#adaptiveWindow = Math.max(1, Math.round(this.#contextWindow * 0.25));
+        this.#contextWindow = forceMin ? 50 : Math.round(this.#hiddenSize * 2.5 * this.#memoryFactor);
+        this.#adaptiveWindow = forceMin ? 13 : Math.max(1, Math.round(this.#contextWindow * 0.25));
         
-        this.#maxTrustHistory = Math.round(this.#contextWindow * 2);
-        this.#maxPerformanceHistory = Math.round(this.#contextWindow * 4);
+        this.#maxTrustHistory = forceMin ? 100 : Math.round(this.#contextWindow * 2);
+        this.#maxPerformanceHistory = forceMin ? 200 : Math.round(this.#contextWindow * 4);
 
         const targetProportion = 0.35 + 0.3 * this.#protoCapacityFactor;
         const minLowDim = Math.max(4, Math.round(this.#hiddenSize * 0.18));
         const maxLowDim = Math.round(this.#hiddenSize * 0.78);
         const candidate = Math.round(this.#hiddenSize * targetProportion);
-        this.#lowDim = Math.max(minLowDim, Math.min(maxLowDim, candidate));
+        this.#lowDim = forceMin ? 4 : Math.max(minLowDim, Math.min(maxLowDim, candidate));
 
         const numProjectionsRaw = 16.0 - 10.0 * normalized;
-        this.#numProjections = Math.max(6, Math.round(numProjectionsRaw));
+        this.#numProjections = forceMin ? 6 : Math.max(6, Math.round(numProjectionsRaw));
 
         const baseLrUnscaled = 0.12 / Math.max(this.#inputSize, 1);
         const sizeScale = Math.pow(this.#hiddenSize, -0.18);
         this.#learningRate = Number(Math.min(0.0025, baseLrUnscaled * sizeScale).toPrecision(6));
         this.#learningRateDecay = Number((this.#learningRate / 10).toPrecision(6));
 
-        this.#swarmIntelligenceFactor = Number((0.05 + 0.90 * normalized).toFixed(6));
+        this.#swarmIntelligenceFactor = forceMin ? 0.95 : Number((0.05 + 0.90 * normalized).toFixed(6));
 
         const baseFreq = 10 + Math.ceil(this.#ensembleSize / 8);
-        this.#gradientResetFrequency = baseFreq + Math.round(50 * this.#swarmIntelligenceFactor);
+        this.#gradientResetFrequency = forceMin ? 30 : baseFreq + Math.round(50 * this.#swarmIntelligenceFactor);
 
-        this.#maxRetrievedProtos = Math.round(this.#baseProtoCapacity * retrievalMultiplier);
-        this.#numRetrievalCandidates = Math.round(this.#baseProtoCapacity * candidatesMultiplier);
+        this.#maxRetrievedProtos = forceMin ? 16 : Math.round(this.#baseProtoCapacity * retrievalMultiplier);
+        this.#numRetrievalCandidates = forceMin ? 32 : Math.round(this.#baseProtoCapacity * candidatesMultiplier);
         
-        this.#semanticMergeEvery  = Math.round(8 + 24 * this.#protoCapacityFactor);
+        this.#semanticMergeEvery  = forceMin ? 20 : Math.round(8 + 24 * this.#protoCapacityFactor);
 
-        this.#maxEpisodicConsider = Math.round(this.#contextWindow * (0.4 + 0.2 * this.#memoryFactor));
-        this.#replaySamples = Math.round(this.#baseProtoCapacity * (0.5 + 0.5 * this.#protoCapacityFactor));
+        this.#maxEpisodicConsider = forceMin ? 45 : Math.round(this.#contextWindow * (0.4 + 0.2 * this.#memoryFactor));
+        this.#replaySamples = forceMin ? 3 : Math.round(this.#baseProtoCapacity * (0.5 + 0.5 * this.#protoCapacityFactor));
 
-        this.#priorityMax = this.#maxRetrievedProtos;
+        this.#priorityMax = forceMin ? 16 : this.#maxRetrievedProtos;
 
-        this.#numLshSets = Math.max(1, Math.floor(this.#numProjections / 3));
+        this.#numLshSets = forceMin ? 2 : Math.max(1, Math.floor(this.#numProjections / 3));
 
         const dimScale = Math.max(1, Math.log2(this.#lowDim / 4));
         const capacityScale = Math.max(0.5, this.#protoCapacityFactor);
@@ -1636,13 +1643,13 @@ class HiveMind {
         const maxTablesCap = Math.round(this.#lowDim * 6 * capacityScale);
         const maxBitsCap = Math.round(this.#lowDim * 3 * capacityScale);
 
-        this.#lshNumTables = Math.max(Math.round(4 * capacityScale * dimFactor), Math.min(maxTablesCap, rawTables));
-        this.#lshHashBits = Math.max(Math.round(12 * capacityScale * dimFactor), Math.min(maxBitsCap, rawBits));
+        this.#lshNumTables = forceMin ? 2 : Math.max(Math.round(4 * capacityScale * dimFactor), Math.min(maxTablesCap, rawTables));
+        this.#lshHashBits = forceMin ? 6 : Math.max(Math.round(12 * capacityScale * dimFactor), Math.min(maxBitsCap, rawBits));
 
-        this.#tempOverloadFactor = 2.0 + 1.0 * (1 - this.#protoCapacityFactor);
-        this.#mergeTrimFactor = 1.5 + 0.5 * (1 - this.#protoCapacityFactor);
+        this.#tempOverloadFactor = forceMin ? 2.5 : 2.0 + 1.0 * (1 - this.#protoCapacityFactor);
+        this.#mergeTrimFactor = forceMin ? 1.75 : 1.5 + 0.5 * (1 - this.#protoCapacityFactor);
 
-        this.#kernelGamma = Number((16 + 32 * this.#protoCapacityFactor).toFixed(1));
+        this.#kernelGamma = forceMin ? 32.0 : Number((16 + 32 * this.#protoCapacityFactor).toFixed(1));
 
         this.#projectionMatrices = Array.from({length: this.#numProjections}, () => this.#generateProjectionMatrix());
 

@@ -29,8 +29,9 @@ class HiveMindController {
     #directoryPath;
     #ensembleSize;
     #type;
+    #forceMin;
 
-    constructor ( id, dp, cs, es, type, priceObj ) {
+    constructor ( id, dp, cs, es, type, priceObj, inputMult, forceMin = false ) {
         this.#controllerID = id;
 
         try {
@@ -44,9 +45,10 @@ class HiveMindController {
         this.#type = type;
         this.#cacheSize = cs;
         this.#ensembleSize = es;
-        this.#chooseDimension(this.#ensembleSize);
+        this.#chooseDimension(this.#ensembleSize, inputMult);
 
         this.#config = priceObj;
+        this.#forceMin = forceMin;
 
         this.#indicators = new IndicatorProcessor();
         this.#db = new Database(path.join(this.#directoryPath, `hivemind_controller-${this.#type}-${this.#controllerID}.db`), { fileMustExist: false });
@@ -275,9 +277,9 @@ class HiveMindController {
         return result;
     }
 
-    #chooseDimension (es) {
-        const MIN_SIZE = 10;
-        const MAX_SIZE = 100;
+    #chooseDimension (es, mult) {
+        const MIN_SIZE = Math.floor(10 + 10 * mult);
+        const MAX_SIZE = Math.floor(100 + 100 * mult);
         let desiredSize = Math.max(MIN_SIZE, MAX_SIZE - Math.floor((es - 1) / 10));
 
         const searchRange = 1;
@@ -454,7 +456,7 @@ class HiveMindController {
                 }
 
                 if (!this.#hivemind) {
-                    this.#hivemind = new HiveMind(this.#directoryPath, this.#ensembleSize, this.#inputSize, this.#controllerID);
+                    this.#hivemind = new HiveMind(this.#directoryPath, this.#ensembleSize, this.#inputSize, this.#controllerID, this.#forceMin);
                 }
 
                 const result = this.#hivemind.train(flatFeatures, trade.outcome);
