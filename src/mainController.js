@@ -13,11 +13,7 @@ const BASE_PROCESS_COUNT = 1;
 const FORCE_MINIMAL_DIMENSIONS = true;
 const MAX_CONCURRENT_WORKERS = Math.max(1, Math.floor(availableParallelism() * 0.25));
 
-const LAYER_DIMENSIONS = [16, 2];
-const NUM_CONTROLLERS_PER_LAYER = new Array(LAYER_DIMENSIONS[0]).fill(LAYER_DIMENSIONS[1]);
-const MIN_LAYER_WEIGHT = 3;
-const MAX_LAYER_WEIGHT = 7;
-const SIZE_BONUS_FACTOR = 0.15;
+const NUM_CONTROLLERS_PER_LAYER = [8, 8, 8, 8, 8, 8, 8, 8];
 
 const INPUT_LAYER_BOOST = 0.15;
 
@@ -35,10 +31,9 @@ const PRICE_LAYER_BOOST = 0.10;
 
 const Y = '\x1b[33m';
 const X = '\x1b[0m';
-const G = '\x1b[32m';
-const R = '\x1b[31m';
-const M = '\x1b[35m';
 const C = '\x1b[36m';
+const BG = `\x1b[42m`;
+const BR = `\x1b[41m`;
 
 const cache = [];
 const hiveLayers = [];
@@ -47,25 +42,8 @@ const NUM_LAYERS = NUM_CONTROLLERS_PER_LAYER.length;
 const MAX_LAYER = NUM_LAYERS - 1;
 const MAX_CACHE_SIZE = Math.round(BASE_CACHE_SIZE * (1 + CACHE_LAYER_BOOST * MAX_LAYER));
 
-let tempBaseWeights = [];
-if (NUM_LAYERS === 1) {
-    tempBaseWeights = [MIN_LAYER_WEIGHT];
-} else {
-    const increment = (MAX_LAYER_WEIGHT - MIN_LAYER_WEIGHT) / (NUM_LAYERS - 1);
-    const avgControllers = NUM_CONTROLLERS_PER_LAYER.reduce((a, b) => a + b, 0) / NUM_LAYERS;
-
-    for (let layer = 0; layer < NUM_LAYERS; layer++) {
-        const rawWeight = MIN_LAYER_WEIGHT + layer * increment;
-        const sizeFactor = 1 + SIZE_BONUS_FACTOR * (NUM_CONTROLLERS_PER_LAYER[layer] / avgControllers - 1);
-        tempBaseWeights.push(Number((rawWeight * sizeFactor).toFixed(3)));
-    }
-}
-
-const LAYER_BASE_WEIGHTS = tempBaseWeights;
-
 for (let layer = 0; layer < NUM_LAYERS; layer++) {
     const numControllers = NUM_CONTROLLERS_PER_LAYER[layer];
-    const baseWeight = LAYER_BASE_WEIGHTS[layer];
     const controllers = [];
     const half = Math.floor(numControllers / 2);
 
@@ -79,8 +57,7 @@ for (let layer = 0; layer < NUM_LAYERS; layer++) {
             directoryPath,
             layer,
             signalSpeed: 0,
-            lastSignal: {},
-            weight: baseWeight
+            lastSignal: {}
         });
     }
 
@@ -195,20 +172,6 @@ const processBatch = async (counter) => {
     }
 };
 
-let maxLayerIdLen = 0;
-let maxControllerIdLen = 0;
-
-for (let layer = 0; layer < hiveLayers.length; layer++) {
-    const plainLayerId = `L${layer}`;
-    maxLayerIdLen = Math.max(maxLayerIdLen, plainLayerId.length);
-
-    const controllers = hiveLayers[layer];
-    for (const co of controllers) {
-        const controllerId = `L${layer}C${co.id}`;
-        maxControllerIdLen = Math.max(maxControllerIdLen, controllerId.length);
-    }
-}
-
 let counter = 0;
 const processCandles = async () => {
     const fileStream = fs.createReadStream(TRAINING_FILE);
@@ -237,68 +200,26 @@ const processCandles = async () => {
             counter++;
             await processBatch(counter);
 
-            console.log('--');
             for (let layer = 0; layer < hiveLayers.length; layer++) {
+                console.log('--');
+
                 const controllers = hiveLayers[layer];
 
                 const blocks = [];
                 for (const cluster of controllers) {
-                    const idStr = `L${layer}C${cluster.id}`.padStart(maxControllerIdLen, ' ');
-                    const probNum = cluster.lastSignal.prob ?? 0;
-                    const probStr = probNum.toFixed(3).padStart(7, ' ');
-                    const speedStr = (cluster.signalSpeed / 1000).toFixed(3).padStart(7, ' ');
+                    const idStr = `L${layer}C${cluster.id}`;
+                    const speedStr = (cluster.signalSpeed / 1000).toFixed(3);
 
-                    const colorBracket = (brckt) => cluster.type === 'positive' ? `${G}${brckt}${X}` : `${R}${brckt}${X}`;
-
-                    const inner = `${C}${idStr}${X}: ${M}${probStr}${X}% | ${Y}${speedStr}${X}(s)`;
-                    const block = `${colorBracket('[')}${inner}${colorBracket(']')}`;
+                    const colorType = cluster.type === 'positive' ? `${BG}` : `${BR}`;
+                    const inner = `${idStr} | ${speedStr}(s)`;
+                    const block = `${colorType}${inner}${X}`;
 
                     blocks.push(block);
                 }
 
-                const plainLayerId = `L${layer}`;
-                const paddedLayerId = plainLayerId.padStart(maxLayerIdLen, ' ');
-
-                console.log(`${C}${paddedLayerId}${X} =>  ${blocks.join('  ')}`);
+                console.log(`${Y}L${layer}${X} =>  ${blocks.join('  ')}`);
             }
 
-            console.log('--')
-
-            let buyStrength = 0;
-            let sellStrength = 0;
-            let posWeight = 0;
-            let negWeight = 0;
-
-            allControllers.forEach(co => {
-                const prob = co.lastSignal.prob ?? 0;
-                if (prob < 0 || prob > 100) return;
-
-                const params = getLayerParams(co.layer);
-                const depthFactor = params.atrFactor / BASE_ATR_FACTOR;
-                const confidenceExcess = Math.max(0, (prob - 50) / 50);
-                const boost = confidenceExcess * depthFactor * 2.0;
-                const effectiveWeight = co.weight * (1 + boost);
-
-                if (co.type === 'positive') {
-                    buyStrength += effectiveWeight * prob;
-                    posWeight += effectiveWeight;
-                } else {
-                    sellStrength += effectiveWeight * prob;
-                    negWeight += effectiveWeight;
-                }
-            });
-
-            const weightedAvgBuyProb = posWeight > 0 ? (buyStrength / posWeight) : 0;
-            const weightedAvgSellProb = negWeight > 0 ? (sellStrength / negWeight) : 0;
-
-            const netDiff = weightedAvgBuyProb - weightedAvgSellProb;
-            const finalBuyProb = 50 + (netDiff / 2);
-            const finalSellProb = 100 - finalBuyProb;
-
-            const predictDiff = Number((finalBuyProb > 50 ? finalBuyProb - 50 : 50 - finalSellProb).toFixed(3));
-            const predictDiffColored = predictDiff > 0 ? `${G}${predictDiff}${X}` : predictDiff < 0 ? `${R}${predictDiff}${X}` : `${C}${predictDiff}${X}`;
-
-            console.log(`Final Buy / Sell Probabilities: ${M}${finalBuyProb.toFixed(3)}${X}% - ${M}${finalSellProb.toFixed(3)}${X}% (${predictDiffColored} %)`);
             console.log('--------------------------------------------------');
 
             if (counter === TRAINING_CUTOFF) {

@@ -305,7 +305,6 @@ class HiveMind {
                 specializationWeights: zeroMatrix(hidden, hidden)
             }));
 
-
             const loadVector = (table, target) => {
                 const stmt = db.prepare(`SELECT idx, value FROM ${table} ORDER BY idx`);
                 const rows = stmt.all();
@@ -407,19 +406,24 @@ class HiveMind {
 
                 const groups = {};
                 protoMeta.forEach(meta => {
-                    const w = hasWindow ? meta.window : (hasEntry ? meta.entry_idx : 0);
-                    const key = `${meta.idx}_${w}`;
-                    if (!groups[key]) groups[key] = { meta: [], idx: meta.idx, pos: w };
+                    const pos = hasWindow ? meta.window : (hasEntry ? meta.entry_idx : 0);
+                    const key = `${meta.idx}_${pos}`;
+                    if (!groups[key]) groups[key] = { meta: [], idx: meta.idx, pos };
                     groups[key].meta.push(meta);
                 });
 
                 Object.values(groups).forEach(group => {
                     const { meta, idx, pos } = group;
 
-                    const filteredMeans = means.filter(r => `${r.idx}_${hasWindow ? r.window : (hasEntry ? r.entry_idx : 0)}` === `${idx}_${pos}`);
-                    const filteredVars = variances.filter(r => `${r.idx}_${hasWindow ? r.window : (hasEntry ? r.entry_idx : 0)}` === `${idx}_${pos}`);
+                    const filteredMeans = means.filter(r => {
+                        const rpos = hasWindow ? r.window : (hasEntry ? r.entry_idx : 0);
+                        return `${r.idx}_${rpos}` === `${idx}_${pos}`;
+                    });
+                    const filteredVars = variances.filter(r => {
+                        const rpos = hasWindow ? r.window : (hasEntry ? r.entry_idx : 0);
+                        return `${r.idx}_${rpos}` === `${idx}_${pos}`;
+                    });
 
-                    const protoList = [];
                     const meanMap = {};
                     filteredMeans.forEach(r => {
                         if (!meanMap[r.proto_idx]) meanMap[r.proto_idx] = new Float32Array(hidden).fill(0);
@@ -431,6 +435,7 @@ class HiveMind {
                         varMap[r.proto_idx][r.dim] = r.value;
                     });
 
+                    const protoList = [];
                     meta.forEach(m => {
                         const mean = meanMap[m.proto_idx] || new Float32Array(hidden).fill(0);
                         const variance = varMap[m.proto_idx] || new Float32Array(hidden).fill(1e-6);
@@ -467,43 +472,6 @@ class HiveMind {
                     }
                 });
 
-                if (hasRep) {
-                    const repMeanStmt = db.prepare(`SELECT idx ${hasWindow ? ', window' : ''} ${hasEntry ? ', entry_idx' : ''}, dim, value FROM ${prefix}_rep_mean`);
-                    repMeanStmt.all().forEach(r => {
-                        const pos = hasWindow ? r.window : (hasEntry ? r.entry_idx : 0);
-                        const mem = isAttention ? this.#attentionMemory[r.idx] :
-                                    isAdaptive ? this.#adaptiveContext[r.idx] :
-                                    this.#coreEpisodic[r.idx];
-                        if (mem && mem[pos] && mem[pos].repMean) {
-                            mem[pos].repMean[r.dim] = r.value;
-                        }
-                    });
-
-                    const repProjStmt = db.prepare(`SELECT idx ${hasWindow ? ', window' : ''} ${hasEntry ? ', entry_idx' : ''}, proj_idx, dim, value FROM ${prefix}_rep_proj`);
-                    repProjStmt.all().forEach(r => {
-                        const pos = hasWindow ? r.window : (hasEntry ? r.entry_idx : 0);
-                        const mem = isAttention ? this.#attentionMemory[r.idx] :
-                                    isAdaptive ? this.#adaptiveContext[r.idx] :
-                                    this.#coreEpisodic[r.idx];
-                        if (mem && mem[pos] && mem[pos].repProj) {
-                            mem[pos].repProj[r.proj_idx][r.dim] = r.value;
-                        }
-                    });
-                }
-
-                const projNormStmt = db.prepare(`SELECT idx ${hasWindow ? ', window' : ''} ${hasEntry ? ', entry_idx' : ''}, proto_idx, proj_idx, dim, value FROM ${prefix}_projnorms`);
-                projNormStmt.all().forEach(r => {
-                    const pos = hasWindow ? r.window : (hasEntry ? r.entry_idx : 0);
-                    const mem = isAttention ? this.#attentionMemory[r.idx] :
-                                isAdaptive ? this.#adaptiveContext[r.idx] :
-                                isSemantic ? this.#semanticProtos[r.idx] :
-                                this.#coreEpisodic[r.idx];
-                    const protos = isSemantic ? mem : (mem[pos] ? mem[pos].protos : null);
-                    if (protos && protos[r.proto_idx]) {
-                        protos[r.proto_idx].projNorms[r.proj_idx][r.dim] = r.value;
-                    }
-                });
-
                 if (isAttention || isAdaptive) {
                     for (let i = 0; i < es; i++) {
                         const mem = isAttention ? this.#attentionMemory[i] : this.#adaptiveContext[i];
@@ -518,6 +486,36 @@ class HiveMind {
             loadPrototypeMemory('adaptive');
             loadPrototypeMemory('semantic');
             loadPrototypeMemory('core');
+
+            for (let idx = 0; idx < es; idx++) {
+                [this.#attentionMemory[idx], this.#adaptiveContext[idx], this.#coreEpisodic[idx]].forEach(mem => {
+                    mem.forEach(entry => {
+                        if (entry && entry.protos.length > 0) {
+                            entry.protos.forEach(proto => {
+                                proto.projNorms = this.#computeProjNorms(proto.mean);
+                            });
+                            entry.repMean = this.#weightedMean(entry.protos);
+                            entry.repProj = this.#computeProjNorms(entry.repMean);
+                        }
+                    });
+                });
+
+                const semProtos = this.#semanticProtos[idx];
+                semProtos.forEach(proto => {
+                    proto.projNorms = this.#computeProjNorms(proto.mean);
+                });
+
+                this.#semanticLSHBuckets[idx] = Array(this.#numLshSets).fill().map(() =>
+                    Array(this.#lshNumTables).fill().map(() => new Map())
+                );
+                semProtos.forEach(proto => {
+                    this.#insertProtoToLSH(idx, proto);
+                });
+
+                const indexed = semProtos.map((proto, i) => ({ i, util: this.#computeProtoUtility(proto) }));
+                indexed.sort((a, b) => b.util - a.util);
+                this.#priorityIndices[idx] = indexed.slice(0, this.#priorityMax).map(o => o.i);
+            }
 
             const transWeightStmt = db.prepare('SELECT idx, layer, weight_type, row, col, value FROM transformers');
             transWeightStmt.all().forEach(({ idx, layer, weight_type, row, col, value }) => {
@@ -575,40 +573,11 @@ class HiveMind {
                 }
             });
 
-            const priorityStmt = db.prepare('SELECT transformer_idx, rank, proto_idx FROM priority_indices ORDER BY transformer_idx, rank');
-            let currentTransformer = -1;
-            priorityStmt.all().forEach(({ transformer_idx, proto_idx }) => {
-                if (transformer_idx !== currentTransformer) {
-                    currentTransformer = transformer_idx;
-                    this.#priorityIndices[currentTransformer] = [];
-                }
-                this.#priorityIndices[currentTransformer].push(proto_idx);
-            });
-
-            const bucketStmt = db.prepare('SELECT transformer_idx, set_idx, table_idx, hash_value, proto_idx FROM semantic_lsh_buckets');
-            bucketStmt.all().forEach(({ transformer_idx, set_idx, table_idx, hash_value, proto_idx }) => {
-                const map = this.#semanticLSHBuckets[transformer_idx][set_idx][table_idx];
-                const key = BigInt(hash_value);
-                let set = map.get(key);
-                if (!set) {
-                    set = new Set();
-                    map.set(key, set);
-                }
-
-                const protoArray = this.#semanticProtos[transformer_idx];
-                if (proto_idx >= 0 && proto_idx < protoArray.length) {
-                    const proto = protoArray[proto_idx];
-                    set.add(proto);
-                }
-            });
-
             this.#normalizeEnsembleWeights();
 
             return { status: true, message : 'State loaded successfully!' };
         } catch (error) {
             console.log(error.message, error.stack)
-            process.exit();
-
             return { status: false, error: error.message, trace: error.stack };
         } finally {
             if (db) db.close();
@@ -620,57 +589,11 @@ class HiveMind {
         let db;
 
         try {
-            db = new Database(dbPath, { fileMustExist: false });
+            db = new Database(dbPath);
             db.pragma('journal_mode = WAL');
             db.pragma('synchronous = NORMAL');
 
             db.exec('BEGIN TRANSACTION');
-
-            const tableNames = [
-                'metadata',
-                'ensemble_weights',
-                'performance_scores',
-                'agreement_scores',
-                'specialization_scores',
-                'historical_performance',
-                'trust_scores_history',
-                'adaptive_learning_rate',
-                'attention_weight_matrix',
-                'attention_bias',
-                'specialization_weights',
-                'attention_memory_protos',
-                'attention_memory_means',
-                'attention_memory_variances',
-                'attention_memory_rep_mean',
-                'attention_memory_projnorms',
-                'attention_memory_rep_proj',
-                'adaptive_context_protos',
-                'adaptive_context_means',
-                'adaptive_context_variances',
-                'adaptive_context_rep_mean',
-                'adaptive_context_projnorms',
-                'adaptive_context_rep_proj',
-                'semantic_protos',
-                'semantic_means',
-                'semantic_variances',
-                'semantic_projnorms',
-                'core_episodic_protos',
-                'core_episodic_means',
-                'core_episodic_variances',
-                'core_episodic_rep_mean',
-                'core_episodic_projnorms',
-                'core_episodic_rep_proj',
-                'projection_matrices',
-                'lsh_hyperplanes',
-                'transformers',
-                'transformer_biases',
-                'transformer_layer_norm',
-                'gradient_accumulation',
-                'priority_indices',
-                'semantic_lsh_buckets'
-            ];
-            const dropSql = tableNames.map(name => `DROP TABLE IF EXISTS ${name};`).join('\n');
-            db.exec(dropSql);
 
             db.exec(`
                 CREATE TABLE IF NOT EXISTS metadata (
@@ -755,30 +678,6 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, window, proto_idx, dim)
                 );
-                CREATE TABLE IF NOT EXISTS attention_memory_rep_mean (
-                    idx INTEGER,
-                    window INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, window, dim)
-                );
-                CREATE TABLE IF NOT EXISTS attention_memory_projnorms (
-                    idx INTEGER,
-                    window INTEGER,
-                    proto_idx INTEGER,
-                    proj_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, window, proto_idx, proj_idx, dim)
-                );
-                CREATE TABLE IF NOT EXISTS attention_memory_rep_proj (
-                    idx INTEGER,
-                    window INTEGER,
-                    proj_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, window, proj_idx, dim)
-                );
 
                 CREATE TABLE IF NOT EXISTS adaptive_context_protos (
                     idx INTEGER,
@@ -806,30 +705,6 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, window, proto_idx, dim)
                 );
-                CREATE TABLE IF NOT EXISTS adaptive_context_rep_mean (
-                    idx INTEGER,
-                    window INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, window, dim)
-                );
-                CREATE TABLE IF NOT EXISTS adaptive_context_projnorms (
-                    idx INTEGER,
-                    window INTEGER,
-                    proto_idx INTEGER,
-                    proj_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, window, proto_idx, proj_idx, dim)
-                );
-                CREATE TABLE IF NOT EXISTS adaptive_context_rep_proj (
-                    idx INTEGER,
-                    window INTEGER,
-                    proj_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, window, proj_idx, dim)
-                );
 
                 CREATE TABLE IF NOT EXISTS semantic_protos (
                     idx INTEGER,
@@ -853,14 +728,6 @@ class HiveMind {
                     dim INTEGER,
                     value REAL,
                     PRIMARY KEY (idx, proto_idx, dim)
-                );
-                CREATE TABLE IF NOT EXISTS semantic_projnorms (
-                    idx INTEGER,
-                    proto_idx INTEGER,
-                    proj_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, proto_idx, proj_idx, dim)
                 );
 
                 CREATE TABLE IF NOT EXISTS core_episodic_protos (
@@ -888,30 +755,6 @@ class HiveMind {
                     dim INTEGER,
                     value REAL,
                     PRIMARY KEY (idx, entry_idx, proto_idx, dim)
-                );
-                CREATE TABLE IF NOT EXISTS core_episodic_rep_mean (
-                    idx INTEGER,
-                    entry_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, entry_idx, dim)
-                );
-                CREATE TABLE IF NOT EXISTS core_episodic_projnorms (
-                    idx INTEGER,
-                    entry_idx INTEGER,
-                    proto_idx INTEGER,
-                    proj_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, entry_idx, proto_idx, proj_idx, dim)
-                );
-                CREATE TABLE IF NOT EXISTS core_episodic_rep_proj (
-                    idx INTEGER,
-                    entry_idx INTEGER,
-                    proj_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, entry_idx, proj_idx, dim)
                 );
 
                 CREATE TABLE IF NOT EXISTS projection_matrices (
@@ -965,23 +808,21 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, layer, weight_type, row, col)
                 );
-
-                CREATE TABLE IF NOT EXISTS priority_indices (
-                    transformer_idx INTEGER,
-                    rank INTEGER,
-                    proto_idx INTEGER,
-                    PRIMARY KEY (transformer_idx, rank)
-                );
-
-                CREATE TABLE IF NOT EXISTS semantic_lsh_buckets (
-                    transformer_idx INTEGER,
-                    set_idx INTEGER,
-                    table_idx INTEGER,
-                    hash_value TEXT,
-                    proto_idx INTEGER,
-                    PRIMARY KEY (transformer_idx, set_idx, table_idx, hash_value, proto_idx)
-                );
             `);
+
+            const tablesToClear = [
+                'metadata', 'ensemble_weights', 'performance_scores', 'agreement_scores', 'specialization_scores',
+                'historical_performance', 'trust_scores_history', 'adaptive_learning_rate',
+                'attention_weight_matrix', 'attention_bias', 'specialization_weights',
+                'attention_memory_protos', 'attention_memory_means', 'attention_memory_variances',
+                'adaptive_context_protos', 'adaptive_context_means', 'adaptive_context_variances',
+                'semantic_protos', 'semantic_means', 'semantic_variances',
+                'core_episodic_protos', 'core_episodic_means', 'core_episodic_variances',
+                'projection_matrices', 'lsh_hyperplanes',
+                'transformers', 'transformer_biases', 'transformer_layer_norm', 'gradient_accumulation'
+            ];
+
+            tablesToClear.forEach(table => db.exec(`DELETE FROM ${table};`));
 
             const insertMetadata = db.prepare('INSERT INTO metadata (key, value) VALUES (?, ?)');
 
@@ -1032,8 +873,7 @@ class HiveMind {
             };
 
             for (const [key, value] of Object.entries(scalarFields)) {
-                const strValue = (typeof value === 'string') ? value : value.toString();
-                insertMetadata.run(key, strValue);
+                insertMetadata.run(key, value.toString());
             }
 
             const batchInsert = (table, columns, data, batchSize = 2000) => {
@@ -1132,9 +972,8 @@ class HiveMind {
             for (let idx = 0; idx < ensembleSize; idx++) {
                 const matrix = this.#specializationWeights[idx];
                 for (let r = 0; r < matrix.length; r++) {
-                    const rowArr = matrix[r];
-                    for (let c = 0; c < rowArr.length; c++) {
-                        const value = rowArr[c];
+                    for (let c = 0; c < matrix[r].length; c++) {
+                        const value = matrix[r][c];
                         if (isValidNumber(value)) rows.push([idx, r, c, value]);
                     }
                 }
@@ -1145,9 +984,8 @@ class HiveMind {
             for (let proj_idx = 0; proj_idx < this.#numProjections; proj_idx++) {
                 const matrix = this.#projectionMatrices[proj_idx];
                 for (let r = 0; r < matrix.length; r++) {
-                    const rowArr = matrix[r];
-                    for (let c = 0; c < rowArr.length; c++) {
-                        const value = rowArr[c];
+                    for (let c = 0; c < matrix[r].length; c++) {
+                        const value = matrix[r][c];
                         if (isValidNumber(value)) rows.push([proj_idx, r, c, value]);
                     }
                 }
@@ -1305,46 +1143,24 @@ class HiveMind {
             }
             batchInsert('gradient_accumulation', ['idx', 'layer', 'weight_type', 'row', 'col', 'value'], gradRows, 5000);
 
-            let attProtoRows = [], attMeanRows = [], attVarRows = [], attRepMeanRows = [], attProjRows = [], attRepProjRows = [];
+            let attProtoRows = [], attMeanRows = [], attVarRows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
                 const windows = this.#attentionMemory[idx];
                 for (let window = 0; window < windows.length; window++) {
                     const entry = windows[window];
-
-                    if (entry.repMean?.length) {
-                        for (let dim = 0; dim < entry.repMean.length; dim++) {
-                            const v = entry.repMean[dim];
-                            if (isValidNumber(v)) attRepMeanRows.push([idx, window, dim, v]);
-                        }
-                    }
-                    if (Array.isArray(entry.repProj)) {
-                        for (let pidx = 0; pidx < entry.repProj.length; pidx++) {
-                            const vec = entry.repProj[pidx];
-                            if (vec?.length) for (let dim = 0; dim < vec.length; dim++) {
-                                const v = vec[dim];
-                                if (isValidNumber(v)) attRepProjRows.push([idx, window, pidx, dim, v]);
-                            }
-                        }
-                    }
+                    if (!entry) continue;
 
                     for (let pidx = 0; pidx < entry.protos.length; pidx++) {
                         const proto = entry.protos[pidx];
                         attProtoRows.push([idx, window, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0]);
 
-                        if (proto.mean?.length) for (let dim = 0; dim < proto.mean.length; dim++) {
+                        for (let dim = 0; dim < proto.mean.length; dim++) {
                             const v = proto.mean[dim];
                             if (isValidNumber(v)) attMeanRows.push([idx, window, pidx, dim, v]);
                         }
-                        if (proto.variance?.length) for (let dim = 0; dim < proto.variance.length; dim++) {
+                        for (let dim = 0; dim < proto.variance.length; dim++) {
                             const v = proto.variance[dim];
                             if (isValidNumber(v)) attVarRows.push([idx, window, pidx, dim, v]);
-                        }
-                        if (Array.isArray(proto.projNorms)) for (let pidx2 = 0; pidx2 < proto.projNorms.length; pidx2++) {
-                            const vec = proto.projNorms[pidx2];
-                            if (vec?.length) for (let dim = 0; dim < vec.length; dim++) {
-                                const v = vec[dim];
-                                if (isValidNumber(v)) attProjRows.push([idx, window, pidx, pidx2, dim, v]);
-                            }
                         }
                     }
                 }
@@ -1352,50 +1168,25 @@ class HiveMind {
             batchInsert('attention_memory_protos', ['idx', 'window', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance'], attProtoRows);
             batchInsert('attention_memory_means', ['idx', 'window', 'proto_idx', 'dim', 'value'], attMeanRows);
             batchInsert('attention_memory_variances', ['idx', 'window', 'proto_idx', 'dim', 'value'], attVarRows);
-            batchInsert('attention_memory_rep_mean', ['idx', 'window', 'dim', 'value'], attRepMeanRows);
-            batchInsert('attention_memory_projnorms', ['idx', 'window', 'proto_idx', 'proj_idx', 'dim', 'value'], attProjRows);
-            batchInsert('attention_memory_rep_proj', ['idx', 'window', 'proj_idx', 'dim', 'value'], attRepProjRows);
 
-            let adaptProtoRows = [], adaptMeanRows = [], adaptVarRows = [], adaptRepMeanRows = [], adaptProjRows = [], adaptRepProjRows = [];
+            let adaptProtoRows = [], adaptMeanRows = [], adaptVarRows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
                 const windows = this.#adaptiveContext[idx];
                 for (let window = 0; window < windows.length; window++) {
                     const entry = windows[window];
-
-                    if (entry.repMean?.length) {
-                        for (let dim = 0; dim < entry.repMean.length; dim++) {
-                            const v = entry.repMean[dim];
-                            if (isValidNumber(v)) adaptRepMeanRows.push([idx, window, dim, v]);
-                        }
-                    }
-                    if (Array.isArray(entry.repProj)) {
-                        for (let pidx = 0; pidx < entry.repProj.length; pidx++) {
-                            const vec = entry.repProj[pidx];
-                            if (vec?.length) for (let dim = 0; dim < vec.length; dim++) {
-                                const v = vec[dim];
-                                if (isValidNumber(v)) adaptRepProjRows.push([idx, window, pidx, dim, v]);
-                            }
-                        }
-                    }
+                    if (!entry) continue;
 
                     for (let pidx = 0; pidx < entry.protos.length; pidx++) {
                         const proto = entry.protos[pidx];
                         adaptProtoRows.push([idx, window, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0]);
 
-                        if (proto.mean?.length) for (let dim = 0; dim < proto.mean.length; dim++) {
+                        for (let dim = 0; dim < proto.mean.length; dim++) {
                             const v = proto.mean[dim];
                             if (isValidNumber(v)) adaptMeanRows.push([idx, window, pidx, dim, v]);
                         }
-                        if (proto.variance?.length) for (let dim = 0; dim < proto.variance.length; dim++) {
+                        for (let dim = 0; dim < proto.variance.length; dim++) {
                             const v = proto.variance[dim];
                             if (isValidNumber(v)) adaptVarRows.push([idx, window, pidx, dim, v]);
-                        }
-                        if (Array.isArray(proto.projNorms)) for (let pidx2 = 0; pidx2 < proto.projNorms.length; pidx2++) {
-                            const vec = proto.projNorms[pidx2];
-                            if (vec?.length) for (let dim = 0; dim < vec.length; dim++) {
-                                const v = vec[dim];
-                                if (isValidNumber(v)) adaptProjRows.push([idx, window, pidx, pidx2, dim, v]);
-                            }
                         }
                     }
                 }
@@ -1403,79 +1194,46 @@ class HiveMind {
             batchInsert('adaptive_context_protos', ['idx', 'window', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance'], adaptProtoRows);
             batchInsert('adaptive_context_means', ['idx', 'window', 'proto_idx', 'dim', 'value'], adaptMeanRows);
             batchInsert('adaptive_context_variances', ['idx', 'window', 'proto_idx', 'dim', 'value'], adaptVarRows);
-            batchInsert('adaptive_context_rep_mean', ['idx', 'window', 'dim', 'value'], adaptRepMeanRows);
-            batchInsert('adaptive_context_projnorms', ['idx', 'window', 'proto_idx', 'proj_idx', 'dim', 'value'], adaptProjRows);
-            batchInsert('adaptive_context_rep_proj', ['idx', 'window', 'proj_idx', 'dim', 'value'], adaptRepProjRows);
 
-            let semProtoRows = [], semMeanRows = [], semVarRows = [], semProjRows = [];
+            let semProtoRows = [], semMeanRows = [], semVarRows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
                 const protos = this.#semanticProtos[idx];
                 for (let pidx = 0; pidx < protos.length; pidx++) {
                     const proto = protos[pidx];
                     semProtoRows.push([idx, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0]);
 
-                    if (proto.mean?.length) for (let dim = 0; dim < proto.mean.length; dim++) {
+                    for (let dim = 0; dim < proto.mean.length; dim++) {
                         const v = proto.mean[dim];
                         if (isValidNumber(v)) semMeanRows.push([idx, pidx, dim, v]);
                     }
-                    if (proto.variance?.length) for (let dim = 0; dim < proto.variance.length; dim++) {
+                    for (let dim = 0; dim < proto.variance.length; dim++) {
                         const v = proto.variance[dim];
                         if (isValidNumber(v)) semVarRows.push([idx, pidx, dim, v]);
-                    }
-                    if (Array.isArray(proto.projNorms)) for (let pidx2 = 0; pidx2 < proto.projNorms.length; pidx2++) {
-                        const vec = proto.projNorms[pidx2];
-                        if (vec?.length) for (let dim = 0; dim < vec.length; dim++) {
-                            const v = vec[dim];
-                            if (isValidNumber(v)) semProjRows.push([idx, pidx, pidx2, dim, v]);
-                        }
                     }
                 }
             }
             batchInsert('semantic_protos', ['idx', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance'], semProtoRows);
             batchInsert('semantic_means', ['idx', 'proto_idx', 'dim', 'value'], semMeanRows);
             batchInsert('semantic_variances', ['idx', 'proto_idx', 'dim', 'value'], semVarRows);
-            batchInsert('semantic_projnorms', ['idx', 'proto_idx', 'proj_idx', 'dim', 'value'], semProjRows);
 
-            let coreProtoRows = [], coreMeanRows = [], coreVarRows = [], coreRepMeanRows = [], coreProjRows = [], coreRepProjRows = [];
+            let coreProtoRows = [], coreMeanRows = [], coreVarRows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
                 const entries = this.#coreEpisodic[idx];
                 for (let eidx = 0; eidx < entries.length; eidx++) {
                     const entry = entries[eidx];
-
-                    if (entry.repMean?.length) {
-                        for (let dim = 0; dim < entry.repMean.length; dim++) {
-                            const v = entry.repMean[dim];
-                            if (isValidNumber(v)) coreRepMeanRows.push([idx, eidx, dim, v]);
-                        }
-                    }
-                    if (Array.isArray(entry.repProj)) {
-                        for (let pidx = 0; pidx < entry.repProj.length; pidx++) {
-                            const vec = entry.repProj[pidx];
-                            if (vec?.length) for (let dim = 0; dim < vec.length; dim++) {
-                                const v = vec[dim];
-                                if (isValidNumber(v)) coreRepProjRows.push([idx, eidx, pidx, dim, v]);
-                            }
-                        }
-                    }
+                    if (!entry) continue;
 
                     for (let pidx = 0; pidx < entry.protos.length; pidx++) {
                         const proto = entry.protos[pidx];
                         coreProtoRows.push([idx, eidx, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0]);
 
-                        if (proto.mean?.length) for (let dim = 0; dim < proto.mean.length; dim++) {
+                        for (let dim = 0; dim < proto.mean.length; dim++) {
                             const v = proto.mean[dim];
                             if (isValidNumber(v)) coreMeanRows.push([idx, eidx, pidx, dim, v]);
                         }
-                        if (proto.variance?.length) for (let dim = 0; dim < proto.variance.length; dim++) {
+                        for (let dim = 0; dim < proto.variance.length; dim++) {
                             const v = proto.variance[dim];
                             if (isValidNumber(v)) coreVarRows.push([idx, eidx, pidx, dim, v]);
-                        }
-                        if (Array.isArray(proto.projNorms)) for (let pidx2 = 0; pidx2 < proto.projNorms.length; pidx2++) {
-                            const vec = proto.projNorms[pidx2];
-                            if (vec?.length) for (let dim = 0; dim < vec.length; dim++) {
-                                const v = vec[dim];
-                                if (isValidNumber(v)) coreProjRows.push([idx, eidx, pidx, pidx2, dim, v]);
-                            }
                         }
                     }
                 }
@@ -1483,63 +1241,14 @@ class HiveMind {
             batchInsert('core_episodic_protos', ['idx', 'entry_idx', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance'], coreProtoRows);
             batchInsert('core_episodic_means', ['idx', 'entry_idx', 'proto_idx', 'dim', 'value'], coreMeanRows);
             batchInsert('core_episodic_variances', ['idx', 'entry_idx', 'proto_idx', 'dim', 'value'], coreVarRows);
-            batchInsert('core_episodic_rep_mean', ['idx', 'entry_idx', 'dim', 'value'], coreRepMeanRows);
-            batchInsert('core_episodic_projnorms', ['idx', 'entry_idx', 'proto_idx', 'proj_idx', 'dim', 'value'], coreProjRows);
-            batchInsert('core_episodic_rep_proj', ['idx', 'entry_idx', 'proj_idx', 'dim', 'value'], coreRepProjRows);
-
-            rows = [];
-            for (let idx = 0; idx < ensembleSize; idx++) {
-                const indices = this.#priorityIndices[idx];
-                for (let rank = 0; rank < indices.length; rank++) {
-                    const pidx = indices[rank];
-                    if (Number.isInteger(pidx)) rows.push([idx, rank, pidx]);
-                }
-            }
-            batchInsert('priority_indices', ['transformer_idx', 'rank', 'proto_idx'], rows);
-
-            rows = [];
-            for (let idx = 0; idx < this.#ensembleSize; idx++) {
-                const semProtos = this.#semanticProtos[idx];
-                if (semProtos.length === 0) continue;
-
-                const protoToIdx = new Map();
-                for (let pidx = 0; pidx < semProtos.length; pidx++) {
-                    protoToIdx.set(semProtos[pidx], pidx);
-                }
-
-                const sets = this.#semanticLSHBuckets[idx];
-                for (let sidx = 0; sidx < sets.length; sidx++) {
-                    const tables = sets[sidx];
-                    for (let tidx = 0; tidx < tables.length; tidx++) {
-                        const map = tables[tidx];
-                        for (const [hashKey, protoSet] of map.entries()) {
-                            const hashStr = hashKey.toString();
-                            for (const proto of protoSet) {
-                                const pidx = protoToIdx.get(proto);
-                                if (typeof pidx === 'number') {
-                                    rows.push([idx, sidx, tidx, hashStr, pidx]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            batchInsert('semantic_lsh_buckets', ['transformer_idx', 'set_idx', 'table_idx', 'hash_value', 'proto_idx'], rows);
 
             db.exec('COMMIT');
 
             return { status: true, message: 'State saved successfully!' };
         } catch (error) {
             if (db) db.exec('ROLLBACK');
-
-            console.log(error.message, error.stack)
-            process.exit();
-
-            return {
-                status: false,
-                error: error.message,
-                trace: error.stack
-            };
+            console.log(error.message, error.stack);
+            return { status: false, error: error.message, trace: error.stack };
         } finally {
             if (db) db.close();
         }
@@ -6438,8 +6147,6 @@ class HiveMind {
 
         this.#trainingStepCount++;
 
-        let finalProb;
-
         const trainingResults = this.#updateHiveState(inputs, target, true, true, true, true);
 
         this.#accumulateGradients(
@@ -6463,20 +6170,14 @@ class HiveMind {
 
             this.#applyGradients(false, false, 1);
 
-            const finalResults = this.#updateHiveState(inputs, target, false, false, true, true);
-            finalProb = finalResults.probability;
+            this.#updateHiveState(inputs, target, false, false, true, false);
 
             this.#hiveMemorySharing();
 
             this.#gradientAccumulation = this.#setGradientStructure();
         }
 
-        else finalProb = trainingResults.probability;
-
-        return {
-            step : this.#trainingStepCount,
-            prob : finalProb
-        }
+        return this.#trainingStepCount
     }
 
     dumpState () {

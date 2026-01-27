@@ -14,11 +14,7 @@ class HiveMindController {
     #db;
     #config;
 
-    #globalAccuracy = {
-        trainingSteps : 0,
-        skippedDuplicate : 0,
-        prob : 0
-    }
+    #globalAccuracy = { trainingSteps : 0, skippedDuplicate : 0 }
 
     #cacheSize;
     #inputSize;
@@ -104,16 +100,12 @@ class HiveMindController {
 
         const trainingStepsRaw = selectStmt.get('training_steps');
         const skippedRaw = selectStmt.get('skipped_duplicate');
-        const probRaw = selectStmt.get('prob');
 
         if (trainingStepsRaw) {
             this.#globalAccuracy.trainingSteps = trainingStepsRaw.value;
         }
         if (skippedRaw) {
             this.#globalAccuracy.skippedDuplicate = skippedRaw.value;
-        }
-        if (probRaw) {
-            this.#globalAccuracy.prob = probRaw.value;
         }
     }
 
@@ -127,7 +119,6 @@ class HiveMindController {
         const transaction = this.#db.transaction(() => {
             upsertStmt.run('training_steps', this.#globalAccuracy.trainingSteps);
             upsertStmt.run('skipped_duplicate', this.#globalAccuracy.skippedDuplicate);
-            upsertStmt.run('prob', this.#globalAccuracy.prob);
         });
         transaction();
     }
@@ -460,8 +451,7 @@ class HiveMindController {
                 }
 
                 const result = this.#hivemind.train(flatFeatures, trade.outcome);
-                this.#globalAccuracy.trainingSteps = result.step;
-                this.#globalAccuracy.prob = result.prob;
+                this.#globalAccuracy.trainingSteps = result;
 
                 this.#hivemind.dumpState();
 
@@ -527,7 +517,6 @@ class HiveMindController {
         const pendingClosedTrades = closedTradesStmt.all().length;
 
         return {
-            prob : truncateToDecimals(this.#globalAccuracy.prob * 100, 3),
             lastTrainingStep : this.#globalAccuracy.trainingSteps,
             skippedTraining : this.#globalAccuracy.skippedDuplicate,
             openSimulations,
