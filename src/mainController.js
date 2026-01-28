@@ -13,7 +13,7 @@ const BASE_PROCESS_COUNT = 1;
 const FORCE_MINIMAL_DIMENSIONS = true;
 const MAX_CONCURRENT_WORKERS = Math.max(1, Math.floor(availableParallelism() * 0.25));
 
-const NUM_CONTROLLERS_PER_LAYER = [8, 8, 8, 8, 8, 8, 8, 8];
+const NUM_CONTROLLERS_PER_LAYER = [4, 4, 4, 4];
 
 const INPUT_LAYER_BOOST = 0.15;
 
@@ -21,7 +21,7 @@ const BASE_POPULATION = 64;
 const POP_LAYER_BOOST = 0.15;
 
 const BASE_CACHE_SIZE = 250;
-const CACHE_LAYER_BOOST = 0.5;
+const CACHE_LAYER_BOOST = 1;
 
 const BASE_ATR_FACTOR = 2.5;
 const BASE_STOP_FACTOR = 1;
@@ -29,11 +29,16 @@ const MIN_PRICE_MOVE = 0.0021;
 const MAX_PRICE_MOVE = 0.05;
 const PRICE_LAYER_BOOST = 0.10;
 
-const Y = '\x1b[33m';
+const Y = '\x1b[93m';
+const C = '\x1b[96m';
 const X = '\x1b[0m';
-const C = '\x1b[36m';
-const BG = `\x1b[42m`;
-const BR = `\x1b[41m`;
+const BRIGHT_GREEN = '\x1b[92m';
+const BRIGHT_RED = '\x1b[91m';
+const BOLD = '\x1b[1m';
+const RESET = '\x1b[0m';
+const UP = '▲';
+const DOWN = '▼';
+const VBAR = '┃';
 
 const cache = [];
 const hiveLayers = [];
@@ -63,8 +68,6 @@ for (let layer = 0; layer < NUM_LAYERS; layer++) {
 
     hiveLayers.push(controllers);
 }
-
-console.log('--------------------------------------------------');
 
 const allControllers = hiveLayers.flat();
 
@@ -204,20 +207,24 @@ const processCandles = async () => {
                 console.log('--');
 
                 const controllers = hiveLayers[layer];
+                const rankedControllers = controllers.toSorted((a, b) => a.signalSpeed - b.signalSpeed);
 
                 const blocks = [];
-                for (const cluster of controllers) {
+                for (const cluster of rankedControllers) {
+                    const color = cluster.type === 'positive' ? BRIGHT_GREEN : BRIGHT_RED;
+                    const arrow = cluster.type === 'positive' ? UP : DOWN;
                     const idStr = `L${layer}C${cluster.id}`;
-                    const speedStr = (cluster.signalSpeed / 1000).toFixed(3);
 
-                    const colorType = cluster.type === 'positive' ? `${BG}` : `${BR}`;
-                    const inner = `${idStr} | ${speedStr}(s)`;
-                    const block = `${colorType}${inner}${X}`;
+                    const speedStr = (cluster.signalSpeed / 1000).toFixed(3) + 's';
+                    const scoreDisplay = cluster.lastSignal.score;
+
+                    const inner = `${arrow} ${idStr} ${speedStr} ${scoreDisplay}`;
+                    const block = `${color}${BOLD}${VBAR} ${inner} ${VBAR}${RESET}`;
 
                     blocks.push(block);
                 }
 
-                console.log(`${Y}L${layer}${X} =>  ${blocks.join('  ')}`);
+                console.log(`${Y}L${layer}${X} => ${blocks.join('   ')}`);
             }
 
             console.log('--------------------------------------------------');

@@ -14,7 +14,15 @@ class HiveMindController {
     #db;
     #config;
 
-    #globalAccuracy = { trainingSteps : 0, skippedDuplicate : 0 }
+    #globalAccuracy = { 
+        trainingSteps : 0, 
+        skippedDuplicate : 0,
+        wins : 0,
+        losses : 0,
+        total : 0,
+        totalPoints : 0,
+        realPoints : 0
+    }
 
     #cacheSize;
     #inputSize;
@@ -26,6 +34,7 @@ class HiveMindController {
     #ensembleSize;
     #type;
     #forceMin;
+    #shouldDumpState;
 
     constructor ( id, dp, cs, es, type, priceObj, inputMult, forceMin = false ) {
         this.#controllerID = id;
@@ -99,13 +108,38 @@ class HiveMindController {
         `);
 
         const trainingStepsRaw = selectStmt.get('training_steps');
-        const skippedRaw = selectStmt.get('skipped_duplicate');
-
         if (trainingStepsRaw) {
             this.#globalAccuracy.trainingSteps = trainingStepsRaw.value;
         }
+
+        const skippedRaw = selectStmt.get('skipped_duplicate');
         if (skippedRaw) {
             this.#globalAccuracy.skippedDuplicate = skippedRaw.value;
+        }
+
+        const winsRaw = selectStmt.get('trade_wins');
+        if (winsRaw) {
+            this.#globalAccuracy.wins = winsRaw.value;
+        }
+
+        const lossesRaw = selectStmt.get('trade_losses');
+        if (lossesRaw) {
+            this.#globalAccuracy.losses = lossesRaw.value;
+        }
+
+        const totalRaw = selectStmt.get('total_trades');
+        if (totalRaw) {
+            this.#globalAccuracy.total = totalRaw.value;
+        }
+
+        const totalPointsRaw = selectStmt.get('total_points');
+        if (totalPointsRaw) {
+            this.#globalAccuracy.totalPoints = totalPointsRaw.value;
+        }
+
+        const realPointsRaw = selectStmt.get('real_points');
+        if(realPointsRaw) {
+            this.#globalAccuracy.realPoints = realPointsRaw.value;
         }
     }
 
@@ -119,6 +153,11 @@ class HiveMindController {
         const transaction = this.#db.transaction(() => {
             upsertStmt.run('training_steps', this.#globalAccuracy.trainingSteps);
             upsertStmt.run('skipped_duplicate', this.#globalAccuracy.skippedDuplicate);
+            upsertStmt.run('trade_wins', this.#globalAccuracy.wins);
+            upsertStmt.run('trade_losses', this.#globalAccuracy.losses);
+            upsertStmt.run('total_trades', this.#globalAccuracy.total);
+            upsertStmt.run('total_points', this.#globalAccuracy.totalPoints);
+            upsertStmt.run('real_points', this.#globalAccuracy.realPoints);
         });
         transaction();
     }
@@ -439,6 +478,31 @@ class HiveMindController {
             const encodingHash = crypto.createHash('sha256').update(encodingString).digest('hex');
 
             this.#db.transaction(() => {
+                if (trade.confidence >= 0) {
+                    this.#globalAccuracy.total++;
+                    this.#globalAccuracy.totalPoints += 100;
+
+                    if (trade.confidence >= 50 && trade.outcome === 1) {
+                        this.#globalAccuracy.wins++;
+                        this.#globalAccuracy.realPoints += trade.confidence;
+                    }
+
+                    else if (trade.confidence < 50 && trade.outcome === 1) {
+                        this.#globalAccuracy.losses++;
+                        this.#globalAccuracy.realPoints += trade.confidence;
+                    } 
+
+                    else if (trade.confidence < 50 && trade.outcome === 0) {
+                        this.#globalAccuracy.wins++;
+                        this.#globalAccuracy.realPoints += 100 - trade.confidence
+                    }
+
+                    else if (trade.confidence >= 50 && trade.outcome === 0) {
+                        this.#globalAccuracy.losses++;
+                        this.#globalAccuracy.realPoints += 100 - trade.confidence
+                    }
+                }
+
                 const existingEncoding = checkEncodingStmt.get(encodingHash);
                 if (existingEncoding) {
                     this.#globalAccuracy.skippedDuplicate++;
@@ -451,9 +515,8 @@ class HiveMindController {
                 }
 
                 const result = this.#hivemind.train(flatFeatures, trade.outcome);
+                this.#shouldDumpState = true;
                 this.#globalAccuracy.trainingSteps = result;
-
-                this.#hivemind.dumpState();
 
                 insertEncodingStmt.run(encodingHash);
                 deleteTradeStmt.run(trade.timestamp);
@@ -498,6 +561,17 @@ class HiveMindController {
             INSERT INTO open_trades (timestamp, sellPrice, stopLoss, entryPrice, features, confidence)
             VALUES (?, ?, ?, ?, ?, ?)
         `);
+
+        let prediction = -1;
+        this.#shouldDumpState = false;
+        if (!this.#hivemind && this.#globalAccuracy.trainingSteps > 0) {
+            this.#hivemind = new HiveMind(this.#directoryPath, this.#ensembleSize, this.#inputSize, this.#controllerID, this.#forceMin);
+
+            const predictionVal = this.#hivemind.predict(features.flat());
+            prediction = Number((predictionVal * 100).toFixed(3));
+
+            this.#shouldDumpState = true;
+        }
         
         insertTradeStmt.run(
             recentCandles.at(-1).timestamp,
@@ -505,10 +579,14 @@ class HiveMindController {
             stopLoss,
             entryPrice,
             JSON.stringify(features),
-            -1
+            prediction
         );
 
         this.#processClosedTrades(processCount);
+
+        if (this.#shouldDumpState && this.#hivemind) {
+            this.#hivemind.dumpState();
+        }
 
         const tradesStmt = this.#db.prepare(`SELECT timestamp FROM open_trades`);
         const openSimulations = tradesStmt.all().length;
@@ -516,7 +594,17 @@ class HiveMindController {
         const closedTradesStmt = this.#db.prepare(`SELECT timestamp FROM closed_trades`);
         const pendingClosedTrades = closedTradesStmt.all().length;
 
+        let tradeWinAcc = 0;
+        let trueAcc = 0;
+        let finalScore = 0;
+        if (this.#globalAccuracy.total > 0) {
+            tradeWinAcc = Number(((this.#globalAccuracy.wins / this.#globalAccuracy.total) * 100).toFixed(3));
+            trueAcc = Number(((this.#globalAccuracy.realPoints / this.#globalAccuracy.totalPoints) * 100).toFixed(3));
+            finalScore = this.#globalAccuracy.trainingSteps > 0 ? Number(((tradeWinAcc + trueAcc) / 2).toFixed(3)) : 0;
+        }
+
         return {
+            score : finalScore,
             lastTrainingStep : this.#globalAccuracy.trainingSteps,
             skippedTraining : this.#globalAccuracy.skippedDuplicate,
             openSimulations,

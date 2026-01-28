@@ -51,7 +51,7 @@ class HiveMind {
         try {
             if (!fs.existsSync(dbPath)) {
                 this.#scaleAndSetDimensions(ensembleSize, inputSize, forceMin);
-                return { status : true , message : 'Started with new state!'};
+                return { status: true, message: 'Started with new state!' };
             }
 
             db = new Database(dbPath, { readonly: true });
@@ -215,11 +215,11 @@ class HiveMind {
             });
 
             const hidden = this.#hiddenSize;
+            const ff = this.#feedForwardSize;
             const low = this.#lowDim;
             const projCount = this.#numProjections;
             const es = this.#ensembleSize;
             const layers = this.#numLayers;
-            const ff = this.#feedForwardSize;
 
             this.#projectionMatrices = Array.from({ length: projCount }, () => {
                 const mat = new Array(hidden);
@@ -334,18 +334,6 @@ class HiveMind {
             load1DPerIdx('attention_weight_matrix', this.#attentionWeightMatrix);
             load1DPerIdx('attention_bias', this.#attentionBias);
 
-            const load3D = (table, target) => {
-                const stmt = db.prepare(`SELECT idx, row, col, value FROM ${table}`);
-                const rows = stmt.all();
-                rows.forEach(({ idx, row, col, value }) => {
-                    if (idx >= 0 && idx < es && row >= 0 && row < hidden && col >= 0 && col < hidden && isValidNumber(value)) {
-                        target[idx][row][col] = value;
-                    }
-                });
-            };
-
-            load3D('specialization_weights', this.#specializationWeights);
-
             const loadHistory = (table, target) => {
                 const stmt = db.prepare(`SELECT idx, step, score FROM ${table} ORDER BY idx, step`);
                 const rows = stmt.all();
@@ -360,22 +348,48 @@ class HiveMind {
             loadHistory('historical_performance', this.#historicalPerformance);
             loadHistory('trust_scores_history', this.#trustScoresHistory);
 
-            const projStmt = db.prepare('SELECT proj_idx, row, col, value FROM projection_matrices');
-            projStmt.all().forEach(({ proj_idx, row, col, value }) => {
-                if (proj_idx >= 0 && proj_idx < projCount && row >= 0 && row < hidden && col >= 0 && col < low && isValidNumber(value)) {
-                    this.#projectionMatrices[proj_idx][row][col] = value;
+            const specStmt = db.prepare('SELECT idx, data FROM specialization_weights');
+            for (const row of specStmt.iterate()) {
+                if (row.idx >= 0 && row.idx < es && row.data) {
+                    const flat = new Float32Array(row.data.buffer, row.data.byteOffset, hidden * hidden);
+                    if (flat.length === hidden * hidden) {
+                        const mat = this.#specializationWeights[row.idx];
+                        for (let r = 0; r < hidden; r++) {
+                            for (let c = 0; c < hidden; c++) {
+                                mat[r][c] = flat[r * hidden + c];
+                            }
+                        }
+                    }
                 }
-            });
+            }
 
-            const lshStmt = db.prepare('SELECT set_idx, table_idx, bit_idx, dim, value FROM lsh_hyperplanes');
-            lshStmt.all().forEach(({ set_idx, table_idx, bit_idx, dim, value }) => {
-                if (set_idx >= 0 && set_idx < this.#numLshSets &&
-                    table_idx >= 0 && table_idx < this.#lshNumTables &&
-                    bit_idx >= 0 && bit_idx < this.#lshHashBits &&
-                    dim >= 0 && dim < low && isValidNumber(value)) {
-                    this.#lshHyperplanes[set_idx][table_idx][bit_idx][dim] = value;
+            const projStmt = db.prepare('SELECT proj_idx, data FROM projection_matrices');
+            for (const row of projStmt.iterate()) {
+                if (row.proj_idx >= 0 && row.proj_idx < projCount && row.data) {
+                    const flat = new Float32Array(row.data.buffer, row.data.byteOffset, hidden * low);
+                    if (flat.length === hidden * low) {
+                        const mat = this.#projectionMatrices[row.proj_idx];
+                        for (let r = 0; r < hidden; r++) {
+                            for (let c = 0; c < low; c++) {
+                                mat[r][c] = flat[r * low + c];
+                            }
+                        }
+                    }
                 }
-            });
+            }
+
+            const lshStmt = db.prepare('SELECT set_idx, table_idx, bit_idx, data FROM lsh_hyperplanes');
+            for (const row of lshStmt.iterate()) {
+                if (row.set_idx >= 0 && row.set_idx < this.#numLshSets &&
+                    row.table_idx >= 0 && row.table_idx < this.#lshNumTables &&
+                    row.bit_idx >= 0 && row.bit_idx < this.#lshHashBits && row.data) {
+                    const flat = new Float32Array(row.data.buffer, row.data.byteOffset, low);
+                    if (flat.length === low) {
+                        const vec = this.#lshHyperplanes[row.set_idx][row.table_idx][row.bit_idx];
+                        vec.set(flat);
+                    }
+                }
+            }
 
             const loadPrototypeMemory = (type) => {
                 const isAttention = type === 'attention';
@@ -392,66 +406,43 @@ class HiveMind {
                                isSemantic ? 'semantic' :
                                'core_episodic';
 
-                const protoStmt = db.prepare(`
-                    SELECT idx ${hasWindow ? ', window' : ''} ${hasEntry ? ', entry_idx' : ''}, proto_idx, proto_size, access_count, is_core, importance
-                    FROM ${prefix}_protos
-                    ORDER BY idx ${hasWindow ? ', window' : ''} ${hasEntry ? ', entry_idx' : ''}, proto_idx
-                `);
-                const meanStmt = db.prepare(`SELECT idx ${hasWindow ? ', window' : ''} ${hasEntry ? ', entry_idx' : ''}, proto_idx, dim, value FROM ${prefix}_means`);
-                const varStmt = db.prepare(`SELECT idx ${hasWindow ? ', window' : ''} ${hasEntry ? ', entry_idx' : ''}, proto_idx, dim, value FROM ${prefix}_variances`);
+                let sql = `SELECT idx`;
+                if (hasWindow) sql += ', window';
+                if (hasEntry) sql += ', entry_idx';
+                sql += ', proto_idx, proto_size, access_count, is_core, importance, mean_blob, variance_blob';
+                sql += ` FROM ${prefix}_protos`;
+                sql += ` ORDER BY idx`;
+                if (hasWindow) sql += ', window';
+                if (hasEntry) sql += ', entry_idx';
+                sql += ', proto_idx';
 
-                const protoMeta = protoStmt.all();
-                const means = meanStmt.all();
-                const variances = varStmt.all();
+                const stmt = db.prepare(sql);
+                const rows = stmt.all();
 
                 const groups = {};
-                protoMeta.forEach(meta => {
-                    const pos = hasWindow ? meta.window : (hasEntry ? meta.entry_idx : 0);
-                    const key = `${meta.idx}_${pos}`;
-                    if (!groups[key]) groups[key] = { meta: [], idx: meta.idx, pos };
-                    groups[key].meta.push(meta);
+                rows.forEach(row => {
+                    const pos = hasWindow ? row.window : (hasEntry ? row.entry_idx : 0);
+                    const key = `${row.idx}_${pos}`;
+                    if (!groups[key]) groups[key] = { protos: [], idx: row.idx, pos };
+                    if (row.mean_blob && row.variance_blob) {
+                        const mean = new Float32Array(row.mean_blob.buffer, row.mean_blob.byteOffset, hidden);
+                        const variance = new Float32Array(row.variance_blob.buffer, row.variance_blob.byteOffset, hidden);
+                        if (mean.length === hidden && variance.length === hidden) {
+                            groups[key].protos[row.proto_idx] = {
+                                mean,
+                                variance,
+                                size: row.proto_size || 0,
+                                accessCount: row.access_count || 0,
+                                isCore: !!row.is_core,
+                                importance: row.importance || 0,
+                                projNorms: Array(projCount).fill().map(() => new Float32Array(low).fill(0))
+                            };
+                        }
+                    }
                 });
 
                 Object.values(groups).forEach(group => {
-                    const { meta, idx, pos } = group;
-
-                    const filteredMeans = means.filter(r => {
-                        const rpos = hasWindow ? r.window : (hasEntry ? r.entry_idx : 0);
-                        return `${r.idx}_${rpos}` === `${idx}_${pos}`;
-                    });
-                    const filteredVars = variances.filter(r => {
-                        const rpos = hasWindow ? r.window : (hasEntry ? r.entry_idx : 0);
-                        return `${r.idx}_${rpos}` === `${idx}_${pos}`;
-                    });
-
-                    const meanMap = {};
-                    filteredMeans.forEach(r => {
-                        if (!meanMap[r.proto_idx]) meanMap[r.proto_idx] = new Float32Array(hidden).fill(0);
-                        meanMap[r.proto_idx][r.dim] = r.value;
-                    });
-                    const varMap = {};
-                    filteredVars.forEach(r => {
-                        if (!varMap[r.proto_idx]) varMap[r.proto_idx] = new Float32Array(hidden).fill(1e-6);
-                        varMap[r.proto_idx][r.dim] = r.value;
-                    });
-
-                    const protoList = [];
-                    meta.forEach(m => {
-                        const mean = meanMap[m.proto_idx] || new Float32Array(hidden).fill(0);
-                        const variance = varMap[m.proto_idx] || new Float32Array(hidden).fill(1e-6);
-                        protoList[m.proto_idx] = {
-                            mean,
-                            variance,
-                            size: m.proto_size || 0,
-                            accessCount: m.access_count || 0,
-                            isCore: !!m.is_core,
-                            importance: m.importance || 0,
-                            projNorms: Array(projCount).fill().map(() => new Float32Array(low).fill(0))
-                        };
-                    });
-
-                    const denseProtos = protoList.filter(p => p !== undefined);
-
+                    const denseProtos = group.protos.filter(p => p !== undefined);
                     const entry = { protos: denseProtos };
                     if (hasRep) {
                         entry.repMean = new Float32Array(hidden).fill(0);
@@ -459,16 +450,16 @@ class HiveMind {
                     }
 
                     let memoryArray;
-                    if (isAttention) memoryArray = this.#attentionMemory[idx];
-                    else if (isAdaptive) memoryArray = this.#adaptiveContext[idx];
-                    else if (isSemantic) memoryArray = this.#semanticProtos[idx];
-                    else if (isCore) memoryArray = this.#coreEpisodic[idx];
+                    if (isAttention) memoryArray = this.#attentionMemory[group.idx];
+                    else if (isAdaptive) memoryArray = this.#adaptiveContext[group.idx];
+                    else if (isSemantic) memoryArray = this.#semanticProtos[group.idx];
+                    else if (isCore) memoryArray = this.#coreEpisodic[group.idx];
 
                     if (isSemantic) {
-                        this.#semanticProtos[idx] = denseProtos;
+                        this.#semanticProtos[group.idx] = denseProtos;
                     } else {
-                        while (memoryArray.length <= pos) memoryArray.push(null);
-                        memoryArray[pos] = entry;
+                        while (memoryArray.length <= group.pos) memoryArray.push(null);
+                        memoryArray[group.pos] = entry;
                     }
                 });
 
@@ -517,67 +508,206 @@ class HiveMind {
                 this.#priorityIndices[idx] = indexed.slice(0, this.#priorityMax).map(o => o.i);
             }
 
-            const transWeightStmt = db.prepare('SELECT idx, layer, weight_type, row, col, value FROM transformers');
-            transWeightStmt.all().forEach(({ idx, layer, weight_type, row, col, value }) => {
-                if (idx < 0 || idx >= es || !isValidNumber(value)) return;
-                const trans = this.#transformers[idx];
-                if (layer === -1 && weight_type === 'outputWeights') {
-                    if (row < hidden && col === 0) trans.outputWeights[row][0] = value;
-                } else if (layer >= 0 && layer < layers) {
-                    const att = trans.attentionWeights[layer];
-                    const ffn = trans.ffnWeights[layer];
-                    if (['Wq', 'Wk', 'Wv', 'Wo'].includes(weight_type)) {
-                        att[weight_type][row][col] = value;
-                    } else if (['gate_proj', 'up_proj'].includes(weight_type)) {
-                        ffn[weight_type][row][col] = value;
-                    } else if (weight_type === 'down_proj') {
-                        ffn.down_proj[row][col] = value;
+            const weightTypes = ['Wq', 'Wk', 'Wv', 'Wo'];
+            const ffnTypes = ['gate_proj', 'up_proj', 'down_proj'];
+            const normTypes = ['gamma1', 'gamma2'];
+
+            weightTypes.forEach(type => {
+                const stmt = db.prepare(`SELECT idx, layer, data FROM transformer_attention_${type}`);
+                for (const row of stmt.iterate()) {
+                    if (row.idx >= 0 && row.idx < es && row.layer >= 0 && row.layer < layers && row.data) {
+                        const flat = new Float32Array(row.data.buffer, row.data.byteOffset, hidden * hidden);
+                        if (flat.length === hidden * hidden) {
+                            const mat = this.#transformers[row.idx].attentionWeights[row.layer][type];
+                            for (let r = 0; r < hidden; r++) {
+                                for (let c = 0; c < hidden; c++) {
+                                    mat[r][c] = flat[r * hidden + c];
+                                }
+                            }
+                        }
                     }
                 }
             });
 
-            const transBiasStmt = db.prepare('SELECT idx, layer, bias_type, row, value FROM transformer_biases');
-            transBiasStmt.all().forEach(({ idx, layer, bias_type, row, value }) => {
-                if (idx < 0 || idx >= es || !isValidNumber(value)) return;
-                if (bias_type === 'outputBias' && layer === -1 && row === 0) {
-                    this.#transformers[idx].outputBias[0] = value;
-                }
-            });
-
-            const transNormStmt = db.prepare('SELECT idx, layer, norm_type, row, value FROM transformer_layer_norm');
-            transNormStmt.all().forEach(({ idx, layer, norm_type, row, value }) => {
-                if (idx < 0 || idx >= es || layer < 0 || layer >= layers || row < 0 || row >= hidden || !isValidNumber(value)) return;
-                this.#transformers[idx].layerNormWeights[layer][norm_type][row] = value;
-            });
-
-            const gradStmt = db.prepare('SELECT idx, layer, weight_type, row, col, value FROM gradient_accumulation');
-            gradStmt.all().forEach(({ idx, layer, weight_type, row, col, value }) => {
-                if (idx < 0 || idx >= es || !isValidNumber(value)) return;
-                const grad = this.#gradientAccumulation[idx];
-                if (layer === -1) {
-                    if (weight_type === 'outputWeights') grad.outputWeights[row][col] = value;
-                    else if (weight_type === 'outputBias') grad.outputBias[row] = value;
-                    else if (weight_type === 'attentionBias') grad.attentionBias[row] = value;
-                    else if (weight_type === 'attentionWeightMatrix') grad.attentionWeightMatrix[row] = value;
-                    else if (weight_type === 'specializationWeights') grad.specializationWeights[row][col] = value;
-                } else if (layer >= 0 && layer < layers) {
-                    if (['Wq', 'Wk', 'Wv', 'Wo'].includes(weight_type)) {
-                        grad.attentionWeights[layer][weight_type][row][col] = value;
-                    } else if (['gate_proj', 'up_proj'].includes(weight_type)) {
-                        grad.ffnWeights[layer][weight_type][row][col] = value;
-                    } else if (weight_type === 'down_proj') {
-                        grad.ffnWeights[layer].down_proj[row][col] = value;
-                    } else if (['gamma1', 'gamma2'].includes(weight_type)) {
-                        grad.layerNormWeights[layer][weight_type][row] = value;
+            ffnTypes.forEach(type => {
+                const rowsDim = type === 'down_proj' ? ff : hidden;
+                const colsDim = type === 'down_proj' ? hidden : ff;
+                const stmt = db.prepare(`SELECT idx, layer, data FROM transformer_ffn_${type}`);
+                for (const row of stmt.iterate()) {
+                    if (row.idx >= 0 && row.idx < es && row.layer >= 0 && row.layer < layers && row.data) {
+                        const flat = new Float32Array(row.data.buffer, row.data.byteOffset, rowsDim * colsDim);
+                        if (flat.length === rowsDim * colsDim) {
+                            const mat = this.#transformers[row.idx].ffnWeights[row.layer][type];
+                            for (let r = 0; r < rowsDim; r++) {
+                                for (let c = 0; c < colsDim; c++) {
+                                    mat[r][c] = flat[r * colsDim + c];
+                                }
+                            }
+                        }
                     }
                 }
             });
+
+            normTypes.forEach(type => {
+                const stmt = db.prepare(`SELECT idx, layer, data FROM transformer_layer_norm_${type}`);
+                for (const row of stmt.iterate()) {
+                    if (row.idx >= 0 && row.idx < es && row.layer >= 0 && row.layer < layers && row.data) {
+                        const flat = new Float32Array(row.data.buffer, row.data.byteOffset, hidden);
+                        if (flat.length === hidden) {
+                            const vec = this.#transformers[row.idx].layerNormWeights[row.layer][type];
+                            for (let i = 0; i < hidden; i++) {
+                                vec[i] = flat[i];
+                            }
+                        }
+                    }
+                }
+            });
+
+            const outWeightStmt = db.prepare('SELECT idx, data FROM transformer_output_weights');
+            for (const row of outWeightStmt.iterate()) {
+                if (row.idx >= 0 && row.idx < es && row.data) {
+                    const flat = new Float32Array(row.data.buffer, row.data.byteOffset, hidden);
+                    if (flat.length === hidden) {
+                        const mat = this.#transformers[row.idx].outputWeights;
+                        for (let r = 0; r < hidden; r++) {
+                            mat[r][0] = flat[r];
+                        }
+                    }
+                }
+            }
+
+            const outBiasStmt = db.prepare('SELECT idx, data FROM transformer_output_bias');
+            for (const row of outBiasStmt.iterate()) {
+                if (row.idx >= 0 && row.idx < es && row.data) {
+                    const flat = new Float32Array(row.data.buffer, row.data.byteOffset, 1);
+                    if (flat.length === 1) {
+                        this.#transformers[row.idx].outputBias[0] = flat[0];
+                    }
+                }
+            }
+
+            weightTypes.forEach(type => {
+                const stmt = db.prepare(`SELECT idx, layer, data FROM gradient_attention_${type}`);
+                for (const row of stmt.iterate()) {
+                    if (row.idx >= 0 && row.idx < es && row.layer >= 0 && row.layer < layers && row.data) {
+                        const flat = new Float32Array(row.data.buffer, row.data.byteOffset, hidden * hidden);
+                        if (flat.length === hidden * hidden) {
+                            const mat = this.#gradientAccumulation[row.idx].attentionWeights[row.layer][type];
+                            for (let r = 0; r < hidden; r++) {
+                                for (let c = 0; c < hidden; c++) {
+                                    mat[r][c] = flat[r * hidden + c];
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            ffnTypes.forEach(type => {
+                const rowsDim = type === 'down_proj' ? ff : hidden;
+                const colsDim = type === 'down_proj' ? hidden : ff;
+                const stmt = db.prepare(`SELECT idx, layer, data FROM gradient_ffn_${type}`);
+                for (const row of stmt.iterate()) {
+                    if (row.idx >= 0 && row.idx < es && row.layer >= 0 && row.layer < layers && row.data) {
+                        const flat = new Float32Array(row.data.buffer, row.data.byteOffset, rowsDim * colsDim);
+                        if (flat.length === rowsDim * colsDim) {
+                            const mat = this.#gradientAccumulation[row.idx].ffnWeights[row.layer][type];
+                            for (let r = 0; r < rowsDim; r++) {
+                                for (let c = 0; c < colsDim; c++) {
+                                    mat[r][c] = flat[r * colsDim + c];
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            normTypes.forEach(type => {
+                const stmt = db.prepare(`SELECT idx, layer, data FROM gradient_layer_norm_${type}`);
+                for (const row of stmt.iterate()) {
+                    if (row.idx >= 0 && row.idx < es && row.layer >= 0 && row.layer < layers && row.data) {
+                        const flat = new Float32Array(row.data.buffer, row.data.byteOffset, hidden);
+                        if (flat.length === hidden) {
+                            const vec = this.#gradientAccumulation[row.idx].layerNormWeights[row.layer][type];
+                            for (let i = 0; i < hidden; i++) {
+                                vec[i] = flat[i];
+                            }
+                        }
+                    }
+                }
+            });
+
+            const gradOutWeightStmt = db.prepare('SELECT idx, data FROM gradient_output_weights');
+            for (const row of gradOutWeightStmt.iterate()) {
+                if (row.idx >= 0 && row.idx < es && row.data) {
+                    const flat = new Float32Array(row.data.buffer, row.data.byteOffset, hidden);
+                    if (flat.length === hidden) {
+                        const mat = this.#gradientAccumulation[row.idx].outputWeights;
+                        for (let r = 0; r < hidden; r++) {
+                            mat[r][0] = flat[r];
+                        }
+                    }
+                }
+            }
+
+            const gradOutBiasStmt = db.prepare('SELECT idx, data FROM gradient_output_bias');
+            for (const row of gradOutBiasStmt.iterate()) {
+                if (row.idx >= 0 && row.idx < es && row.data) {
+                    const flat = new Float32Array(row.data.buffer, row.data.byteOffset, 1);
+                    if (flat.length === 1) {
+                        this.#gradientAccumulation[row.idx].outputBias[0] = flat[0];
+                    }
+                }
+            }
+
+            const gradAttBiasStmt = db.prepare('SELECT idx, data FROM gradient_attention_bias');
+            for (const row of gradAttBiasStmt.iterate()) {
+                if (row.idx >= 0 && row.idx < es && row.data) {
+                    const flat = new Float32Array(row.data.buffer, row.data.byteOffset, hidden);
+                    if (flat.length === hidden) {
+                        const vec = this.#gradientAccumulation[row.idx].attentionBias;
+                        for (let i = 0; i < hidden; i++) {
+                            vec[i] = flat[i];
+                        }
+                    }
+                }
+            }
+
+            const gradAttMatStmt = db.prepare('SELECT idx, data FROM gradient_attention_weight_matrix');
+            for (const row of gradAttMatStmt.iterate()) {
+                if (row.idx >= 0 && row.idx < es && row.data) {
+                    const flat = new Float32Array(row.data.buffer, row.data.byteOffset, hidden);
+                    if (flat.length === hidden) {
+                        const vec = this.#gradientAccumulation[row.idx].attentionWeightMatrix;
+                        for (let i = 0; i < hidden; i++) {
+                            vec[i] = flat[i];
+                        }
+                    }
+                }
+            }
+
+            const gradSpecStmt = db.prepare('SELECT idx, data FROM gradient_specialization_weights');
+            for (const row of gradSpecStmt.iterate()) {
+                if (row.idx >= 0 && row.idx < es && row.data) {
+                    const flat = new Float32Array(row.data.buffer, row.data.byteOffset, hidden * hidden);
+                    if (flat.length === hidden * hidden) {
+                        const mat = this.#gradientAccumulation[row.idx].specializationWeights;
+                        for (let r = 0; r < hidden; r++) {
+                            for (let c = 0; c < hidden; c++) {
+                                mat[r][c] = flat[r * hidden + c];
+                            }
+                        }
+                    }
+                }
+            }
 
             this.#normalizeEnsembleWeights();
 
-            return { status: true, message : 'State loaded successfully!' };
+            return { status: true, message: 'State loaded successfully!' };
         } catch (error) {
-            console.log(error.message, error.stack)
+            console.log(error.message, error.stack);
+            process.exit();
+
             return { status: false, error: error.message, trace: error.stack };
         } finally {
             if (db) db.close();
@@ -644,13 +774,6 @@ class HiveMind {
                     value REAL,
                     PRIMARY KEY (idx, row)
                 );
-                CREATE TABLE IF NOT EXISTS specialization_weights (
-                    idx INTEGER,
-                    row INTEGER,
-                    col INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, row, col)
-                );
 
                 CREATE TABLE IF NOT EXISTS attention_memory_protos (
                     idx INTEGER,
@@ -660,25 +783,10 @@ class HiveMind {
                     access_count REAL,
                     is_core INTEGER DEFAULT 0,
                     importance REAL DEFAULT 0,
+                    mean_blob BLOB,
+                    variance_blob BLOB,
                     PRIMARY KEY (idx, window, proto_idx)
                 );
-                CREATE TABLE IF NOT EXISTS attention_memory_means (
-                    idx INTEGER,
-                    window INTEGER,
-                    proto_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, window, proto_idx, dim)
-                );
-                CREATE TABLE IF NOT EXISTS attention_memory_variances (
-                    idx INTEGER,
-                    window INTEGER,
-                    proto_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, window, proto_idx, dim)
-                );
-
                 CREATE TABLE IF NOT EXISTS adaptive_context_protos (
                     idx INTEGER,
                     window INTEGER,
@@ -687,25 +795,10 @@ class HiveMind {
                     access_count REAL,
                     is_core INTEGER DEFAULT 0,
                     importance REAL DEFAULT 0,
+                    mean_blob BLOB,
+                    variance_blob BLOB,
                     PRIMARY KEY (idx, window, proto_idx)
                 );
-                CREATE TABLE IF NOT EXISTS adaptive_context_means (
-                    idx INTEGER,
-                    window INTEGER,
-                    proto_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, window, proto_idx, dim)
-                );
-                CREATE TABLE IF NOT EXISTS adaptive_context_variances (
-                    idx INTEGER,
-                    window INTEGER,
-                    proto_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, window, proto_idx, dim)
-                );
-
                 CREATE TABLE IF NOT EXISTS semantic_protos (
                     idx INTEGER,
                     proto_idx INTEGER,
@@ -713,23 +806,10 @@ class HiveMind {
                     access_count REAL,
                     is_core INTEGER DEFAULT 0,
                     importance REAL DEFAULT 0,
+                    mean_blob BLOB,
+                    variance_blob BLOB,
                     PRIMARY KEY (idx, proto_idx)
                 );
-                CREATE TABLE IF NOT EXISTS semantic_means (
-                    idx INTEGER,
-                    proto_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, proto_idx, dim)
-                );
-                CREATE TABLE IF NOT EXISTS semantic_variances (
-                    idx INTEGER,
-                    proto_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, proto_idx, dim)
-                );
-
                 CREATE TABLE IF NOT EXISTS core_episodic_protos (
                     idx INTEGER,
                     entry_idx INTEGER,
@@ -738,94 +818,76 @@ class HiveMind {
                     access_count REAL,
                     is_core INTEGER DEFAULT 0,
                     importance REAL DEFAULT 0,
+                    mean_blob BLOB,
+                    variance_blob BLOB,
                     PRIMARY KEY (idx, entry_idx, proto_idx)
                 );
-                CREATE TABLE IF NOT EXISTS core_episodic_means (
-                    idx INTEGER,
-                    entry_idx INTEGER,
-                    proto_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, entry_idx, proto_idx, dim)
-                );
-                CREATE TABLE IF NOT EXISTS core_episodic_variances (
-                    idx INTEGER,
-                    entry_idx INTEGER,
-                    proto_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, entry_idx, proto_idx, dim)
-                );
 
+                CREATE TABLE IF NOT EXISTS specialization_weights (
+                    idx INTEGER PRIMARY KEY,
+                    data BLOB
+                );
                 CREATE TABLE IF NOT EXISTS projection_matrices (
-                    proj_idx INTEGER,
-                    row INTEGER,
-                    col INTEGER,
-                    value REAL,
-                    PRIMARY KEY (proj_idx, row, col)
+                    proj_idx INTEGER PRIMARY KEY,
+                    data BLOB
                 );
-
                 CREATE TABLE IF NOT EXISTS lsh_hyperplanes (
                     set_idx INTEGER,
                     table_idx INTEGER,
                     bit_idx INTEGER,
-                    dim INTEGER,
-                    value REAL,
-                    PRIMARY KEY (set_idx, table_idx, bit_idx, dim)
+                    data BLOB,
+                    PRIMARY KEY (set_idx, table_idx, bit_idx)
                 );
 
-                CREATE TABLE IF NOT EXISTS transformers (
-                    idx INTEGER,
-                    layer INTEGER,
-                    weight_type TEXT,
-                    row INTEGER,
-                    col INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, layer, weight_type, row, col)
-                );
-                CREATE TABLE IF NOT EXISTS transformer_biases (
-                    idx INTEGER,
-                    layer INTEGER,
-                    bias_type TEXT,
-                    row INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, layer, bias_type, row)
-                );
-                CREATE TABLE IF NOT EXISTS transformer_layer_norm (
-                    idx INTEGER,
-                    layer INTEGER,
-                    norm_type TEXT,
-                    row INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, layer, norm_type, row)
-                );
-                CREATE TABLE IF NOT EXISTS gradient_accumulation (
-                    idx INTEGER,
-                    layer INTEGER,
-                    weight_type TEXT,
-                    row INTEGER,
-                    col INTEGER,
-                    value REAL,
-                    PRIMARY KEY (idx, layer, weight_type, row, col)
-                );
+                CREATE TABLE IF NOT EXISTS transformer_attention_Wq (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS transformer_attention_Wk (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS transformer_attention_Wv (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS transformer_attention_Wo (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS transformer_ffn_gate_proj (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS transformer_ffn_up_proj (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS transformer_ffn_down_proj (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS transformer_layer_norm_gamma1 (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS transformer_layer_norm_gamma2 (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS transformer_output_weights (idx INTEGER PRIMARY KEY, data BLOB);
+                CREATE TABLE IF NOT EXISTS transformer_output_bias (idx INTEGER PRIMARY KEY, data BLOB);
+
+                CREATE TABLE IF NOT EXISTS gradient_attention_Wq (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS gradient_attention_Wk (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS gradient_attention_Wv (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS gradient_attention_Wo (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS gradient_ffn_gate_proj (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS gradient_ffn_up_proj (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS gradient_ffn_down_proj (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS gradient_layer_norm_gamma1 (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS gradient_layer_norm_gamma2 (idx INTEGER, layer INTEGER, data BLOB, PRIMARY KEY (idx, layer));
+                CREATE TABLE IF NOT EXISTS gradient_output_weights (idx INTEGER PRIMARY KEY, data BLOB);
+                CREATE TABLE IF NOT EXISTS gradient_output_bias (idx INTEGER PRIMARY KEY, data BLOB);
+                CREATE TABLE IF NOT EXISTS gradient_attention_bias (idx INTEGER PRIMARY KEY, data BLOB);
+                CREATE TABLE IF NOT EXISTS gradient_attention_weight_matrix (idx INTEGER PRIMARY KEY, data BLOB);
+                CREATE TABLE IF NOT EXISTS gradient_specialization_weights (idx INTEGER PRIMARY KEY, data BLOB);
             `);
 
             const tablesToClear = [
-                'metadata', 'ensemble_weights', 'performance_scores', 'agreement_scores', 'specialization_scores',
+                'metadata',
+                'ensemble_weights', 'performance_scores', 'agreement_scores', 'specialization_scores',
                 'historical_performance', 'trust_scores_history', 'adaptive_learning_rate',
-                'attention_weight_matrix', 'attention_bias', 'specialization_weights',
-                'attention_memory_protos', 'attention_memory_means', 'attention_memory_variances',
-                'adaptive_context_protos', 'adaptive_context_means', 'adaptive_context_variances',
-                'semantic_protos', 'semantic_means', 'semantic_variances',
-                'core_episodic_protos', 'core_episodic_means', 'core_episodic_variances',
-                'projection_matrices', 'lsh_hyperplanes',
-                'transformers', 'transformer_biases', 'transformer_layer_norm', 'gradient_accumulation'
+                'attention_weight_matrix', 'attention_bias',
+                'attention_memory_protos', 'adaptive_context_protos', 'semantic_protos', 'core_episodic_protos',
+                'specialization_weights', 'projection_matrices', 'lsh_hyperplanes',
+                'transformer_attention_Wq', 'transformer_attention_Wk', 'transformer_attention_Wv', 'transformer_attention_Wo',
+                'transformer_ffn_gate_proj', 'transformer_ffn_up_proj', 'transformer_ffn_down_proj',
+                'transformer_layer_norm_gamma1', 'transformer_layer_norm_gamma2',
+                'transformer_output_weights', 'transformer_output_bias',
+                'gradient_attention_Wq', 'gradient_attention_Wk', 'gradient_attention_Wv', 'gradient_attention_Wo',
+                'gradient_ffn_gate_proj', 'gradient_ffn_up_proj', 'gradient_ffn_down_proj',
+                'gradient_layer_norm_gamma1', 'gradient_layer_norm_gamma2',
+                'gradient_output_weights', 'gradient_output_bias',
+                'gradient_attention_bias', 'gradient_attention_weight_matrix', 'gradient_specialization_weights'
             ];
 
             tablesToClear.forEach(table => db.exec(`DELETE FROM ${table};`));
 
             const insertMetadata = db.prepare('INSERT INTO metadata (key, value) VALUES (?, ?)');
-
             const scalarFields = {
                 ensembleSize: this.#ensembleSize,
                 inputSize: this.#inputSize,
@@ -876,55 +938,62 @@ class HiveMind {
                 insertMetadata.run(key, value.toString());
             }
 
-            const batchInsert = (table, columns, data, batchSize = 2000) => {
+            const batchInsert = (table, columns, data, maxVariables = 900) => {
                 if (data.length === 0) return;
-                const rowPlaceholder = `(${columns.map(() => '?').join(',')})`;
+
+                const paramsPerRow = columns.length;
+                const safeBatchSize = Math.max(1, Math.floor(maxVariables / paramsPerRow));
+
+                const placeholder = `(${columns.map(() => '?').join(', ')})`;
+
                 let offset = 0;
                 while (offset < data.length) {
-                    const chunkSize = Math.min(batchSize, data.length - offset);
-                    const placeholders = Array(chunkSize).fill(rowPlaceholder).join(',');
-                    const sql = `INSERT INTO ${table} (${columns.join(',')}) VALUES ${placeholders}`;
-                    const flatParams = data.slice(offset, offset + chunkSize).flat();
-                    const stmt = db.prepare(sql);
-                    stmt.run(...flatParams);
+                    const chunkSize = Math.min(safeBatchSize, data.length - offset);
+                    const chunk = data.slice(offset, offset + chunkSize);
+
+                    const placeholders = Array(chunkSize).fill(placeholder).join(', ');
+                    const sql = `INSERT INTO ${table} (${columns.join(', ')}) VALUES ${placeholders}`;
+
+                    const params = chunk.flat();
+                    db.prepare(sql).run(...params);
+
                     offset += chunkSize;
                 }
             };
 
             const ensembleSize = this.#ensembleSize;
+            const hidden = this.#hiddenSize;
+            const ff = this.#feedForwardSize;
+            const low = this.#lowDim;
+            const layers = this.#numLayers;
 
             let rows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
-                const value = this.#ensembleWeights[idx];
-                if (isValidNumber(value)) rows.push([idx, value]);
+                rows.push([idx, this.#ensembleWeights[idx]]);
             }
             batchInsert('ensemble_weights', ['idx', 'value'], rows);
 
             rows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
-                const value = this.#performanceScores[idx];
-                if (isValidNumber(value)) rows.push([idx, value]);
+                rows.push([idx, this.#performanceScores[idx]]);
             }
             batchInsert('performance_scores', ['idx', 'value'], rows);
 
             rows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
-                const value = this.#agreementScores[idx];
-                if (isValidNumber(value)) rows.push([idx, value]);
+                rows.push([idx, this.#agreementScores[idx]]);
             }
             batchInsert('agreement_scores', ['idx', 'value'], rows);
 
             rows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
-                const value = this.#specializationScores[idx];
-                if (isValidNumber(value)) rows.push([idx, value]);
+                rows.push([idx, this.#specializationScores[idx]]);
             }
             batchInsert('specialization_scores', ['idx', 'value'], rows);
 
             rows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
-                const value = this.#adaptiveLearningRate[idx];
-                if (isValidNumber(value)) rows.push([idx, value]);
+                rows.push([idx, this.#adaptiveLearningRate[idx]]);
             }
             batchInsert('adaptive_learning_rate', ['idx', 'value'], rows);
 
@@ -932,8 +1001,7 @@ class HiveMind {
             for (let idx = 0; idx < ensembleSize; idx++) {
                 const history = this.#historicalPerformance[idx];
                 for (let step = 0; step < history.length; step++) {
-                    const score = history[step];
-                    if (isValidNumber(score)) rows.push([idx, step, score]);
+                    rows.push([idx, step, history[step]]);
                 }
             }
             batchInsert('historical_performance', ['idx', 'step', 'score'], rows);
@@ -942,312 +1010,295 @@ class HiveMind {
             for (let idx = 0; idx < ensembleSize; idx++) {
                 const history = this.#trustScoresHistory[idx];
                 for (let step = 0; step < history.length; step++) {
-                    const score = history[step];
-                    if (isValidNumber(score)) rows.push([idx, step, score]);
+                    rows.push([idx, step, history[step]]);
                 }
             }
             batchInsert('trust_scores_history', ['idx', 'step', 'score'], rows);
 
             rows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
-                const vec = this.#attentionWeightMatrix[idx];
-                for (let row = 0; row < vec.length; row++) {
-                    const value = vec[row];
-                    if (isValidNumber(value)) rows.push([idx, row, value]);
+                for (let row = 0; row < hidden; row++) {
+                    rows.push([idx, row, this.#attentionWeightMatrix[idx][row]]);
                 }
             }
             batchInsert('attention_weight_matrix', ['idx', 'row', 'value'], rows);
 
             rows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
-                const vec = this.#attentionBias[idx];
-                for (let row = 0; row < vec.length; row++) {
-                    const value = vec[row];
-                    if (isValidNumber(value)) rows.push([idx, row, value]);
+                for (let row = 0; row < hidden; row++) {
+                    rows.push([idx, row, this.#attentionBias[idx][row]]);
                 }
             }
             batchInsert('attention_bias', ['idx', 'row', 'value'], rows);
 
             rows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
-                const matrix = this.#specializationWeights[idx];
-                for (let r = 0; r < matrix.length; r++) {
-                    for (let c = 0; c < matrix[r].length; c++) {
-                        const value = matrix[r][c];
-                        if (isValidNumber(value)) rows.push([idx, r, c, value]);
+                const mat = this.#specializationWeights[idx];
+                const flat = new Float32Array(hidden * hidden);
+                for (let r = 0; r < hidden; r++) {
+                    for (let c = 0; c < hidden; c++) {
+                        flat[r * hidden + c] = mat[r][c];
                     }
                 }
+                rows.push([idx, Buffer.from(flat.buffer)]);
             }
-            batchInsert('specialization_weights', ['idx', 'row', 'col', 'value'], rows, 5000);
+            batchInsert('specialization_weights', ['idx', 'data'], rows);
 
             rows = [];
             for (let proj_idx = 0; proj_idx < this.#numProjections; proj_idx++) {
-                const matrix = this.#projectionMatrices[proj_idx];
-                for (let r = 0; r < matrix.length; r++) {
-                    for (let c = 0; c < matrix[r].length; c++) {
-                        const value = matrix[r][c];
-                        if (isValidNumber(value)) rows.push([proj_idx, r, c, value]);
+                const mat = this.#projectionMatrices[proj_idx];
+                const flat = new Float32Array(hidden * low);
+                for (let r = 0; r < hidden; r++) {
+                    for (let c = 0; c < low; c++) {
+                        flat[r * low + c] = mat[r][c];
                     }
                 }
+                rows.push([proj_idx, Buffer.from(flat.buffer)]);
             }
-            batchInsert('projection_matrices', ['proj_idx', 'row', 'col', 'value'], rows);
+            batchInsert('projection_matrices', ['proj_idx', 'data'], rows);
 
             rows = [];
             for (let set_idx = 0; set_idx < this.#numLshSets; set_idx++) {
-                const setArr = this.#lshHyperplanes[set_idx];
-                for (let table_idx = 0; table_idx < setArr.length; table_idx++) {
-                    const tableArr = setArr[table_idx];
-                    for (let bit_idx = 0; bit_idx < tableArr.length; bit_idx++) {
-                        const vec = tableArr[bit_idx];
-                        for (let dim = 0; dim < vec.length; dim++) {
-                            const value = vec[dim];
-                            if (isValidNumber(value)) rows.push([set_idx, table_idx, bit_idx, dim, value]);
-                        }
+                for (let table_idx = 0; table_idx < this.#lshNumTables; table_idx++) {
+                    for (let bit_idx = 0; bit_idx < this.#lshHashBits; bit_idx++) {
+                        const vec = this.#lshHyperplanes[set_idx][table_idx][bit_idx];
+                        const flat = new Float32Array(low);
+                        flat.set(vec);
+                        rows.push([set_idx, table_idx, bit_idx, Buffer.from(flat.buffer)]);
                     }
                 }
             }
-            batchInsert('lsh_hyperplanes', ['set_idx', 'table_idx', 'bit_idx', 'dim', 'value'], rows);
+            batchInsert('lsh_hyperplanes', ['set_idx', 'table_idx', 'bit_idx', 'data'], rows);
 
-            let transWeightRows = [];
-            let transBiasRows = [];
-            let transNormRows = [];
+            const wqRows = [], wkRows = [], wvRows = [], woRows = [];
+            const gateRows = [], upRows = [], downRows = [];
+            const gamma1Rows = [], gamma2Rows = [];
+            const outWeightRows = [], outBiasRows = [];
 
             for (let idx = 0; idx < ensembleSize; idx++) {
                 const t = this.#transformers[idx];
-                const numLayers = t.attentionWeights.length;
+                let flat;
 
-                for (let layer = 0; layer < numLayers; layer++) {
-                    const aw = t.attentionWeights[layer];
-                    for (const type of ['Wq', 'Wk', 'Wv', 'Wo']) {
-                        const m = aw[type];
-                        for (let r = 0; r < m.length; r++) {
-                            for (let c = 0; c < m[r].length; c++) {
-                                const v = m[r][c];
-                                if (isValidNumber(v)) transWeightRows.push([idx, layer, type, r, c, v]);
-                            }
-                        }
-                    }
+                for (let layer = 0; layer < layers; layer++) {
+                    const att = t.attentionWeights[layer];
+
+                    flat = new Float32Array(hidden * hidden);
+                    for (let r = 0; r < hidden; r++) for (let c = 0; c < hidden; c++) flat[r * hidden + c] = att.Wq[r][c];
+                    wqRows.push([idx, layer, Buffer.from(flat.buffer)]);
+
+                    flat = new Float32Array(hidden * hidden);
+                    for (let r = 0; r < hidden; r++) for (let c = 0; c < hidden; c++) flat[r * hidden + c] = att.Wk[r][c];
+                    wkRows.push([idx, layer, Buffer.from(flat.buffer)]);
+
+                    flat = new Float32Array(hidden * hidden);
+                    for (let r = 0; r < hidden; r++) for (let c = 0; c < hidden; c++) flat[r * hidden + c] = att.Wv[r][c];
+                    wvRows.push([idx, layer, Buffer.from(flat.buffer)]);
+
+                    flat = new Float32Array(hidden * hidden);
+                    for (let r = 0; r < hidden; r++) for (let c = 0; c < hidden; c++) flat[r * hidden + c] = att.Wo[r][c];
+                    woRows.push([idx, layer, Buffer.from(flat.buffer)]);
+
+                    const ffn = t.ffnWeights[layer];
+
+                    flat = new Float32Array(hidden * ff);
+                    for (let r = 0; r < hidden; r++) for (let c = 0; c < ff; c++) flat[r * ff + c] = ffn.gate_proj[r][c];
+                    gateRows.push([idx, layer, Buffer.from(flat.buffer)]);
+
+                    flat = new Float32Array(hidden * ff);
+                    for (let r = 0; r < hidden; r++) for (let c = 0; c < ff; c++) flat[r * ff + c] = ffn.up_proj[r][c];
+                    upRows.push([idx, layer, Buffer.from(flat.buffer)]);
+
+                    flat = new Float32Array(ff * hidden);
+                    for (let r = 0; r < ff; r++) for (let c = 0; c < hidden; c++) flat[r * hidden + c] = ffn.down_proj[r][c];
+                    downRows.push([idx, layer, Buffer.from(flat.buffer)]);
+
+                    flat = new Float32Array(hidden);
+                    flat.set(t.layerNormWeights[layer].gamma1);
+                    gamma1Rows.push([idx, layer, Buffer.from(flat.buffer)]);
+
+                    flat = new Float32Array(hidden);
+                    flat.set(t.layerNormWeights[layer].gamma2);
+                    gamma2Rows.push([idx, layer, Buffer.from(flat.buffer)]);
                 }
 
-                for (let layer = 0; layer < numLayers; layer++) {
-                    const fw = t.ffnWeights[layer];
-                    for (const type of ['gate_proj', 'up_proj', 'down_proj']) {
-                        const m = fw[type];
-                        for (let r = 0; r < m.length; r++) {
-                            for (let c = 0; c < m[r].length; c++) {
-                                const v = m[r][c];
-                                if (isValidNumber(v)) transWeightRows.push([idx, layer, type, r, c, v]);
-                            }
-                        }
-                    }
-                }
+                flat = new Float32Array(hidden);
+                for (let r = 0; r < hidden; r++) flat[r] = t.outputWeights[r][0];
+                outWeightRows.push([idx, Buffer.from(flat.buffer)]);
 
-                for (let layer = 0; layer < numLayers; layer++) {
-                    const ln = t.layerNormWeights[layer];
-                    for (const type of ['gamma1', 'gamma2']) {
-                        const vec = ln[type];
-                        for (let r = 0; r < vec.length; r++) {
-                            const v = vec[r];
-                            if (isValidNumber(v)) transNormRows.push([idx, layer, type, r, v]);
-                        }
-                    }
-                }
-
-                const ow = t.outputWeights;
-                for (let r = 0; r < ow.length; r++) {
-                    for (let c = 0; c < ow[r].length; c++) {
-                        const v = ow[r][c];
-                        if (isValidNumber(v)) transWeightRows.push([idx, -1, 'outputWeights', r, c, v]);
-                    }
-                }
-
-                const ob = t.outputBias;
-                for (let r = 0; r < ob.length; r++) {
-                    const v = ob[r];
-                    if (isValidNumber(v)) transBiasRows.push([idx, -1, 'outputBias', r, v]);
-                }
+                flat = new Float32Array(1);
+                flat[0] = t.outputBias[0];
+                outBiasRows.push([idx, Buffer.from(flat.buffer)]);
             }
 
-            batchInsert('transformers', ['idx', 'layer', 'weight_type', 'row', 'col', 'value'], transWeightRows, 5000);
-            batchInsert('transformer_biases', ['idx', 'layer', 'bias_type', 'row', 'value'], transBiasRows);
-            batchInsert('transformer_layer_norm', ['idx', 'layer', 'norm_type', 'row', 'value'], transNormRows);
+            batchInsert('transformer_attention_Wq', ['idx', 'layer', 'data'], wqRows);
+            batchInsert('transformer_attention_Wk', ['idx', 'layer', 'data'], wkRows);
+            batchInsert('transformer_attention_Wv', ['idx', 'layer', 'data'], wvRows);
+            batchInsert('transformer_attention_Wo', ['idx', 'layer', 'data'], woRows);
+            batchInsert('transformer_ffn_gate_proj', ['idx', 'layer', 'data'], gateRows);
+            batchInsert('transformer_ffn_up_proj', ['idx', 'layer', 'data'], upRows);
+            batchInsert('transformer_ffn_down_proj', ['idx', 'layer', 'data'], downRows);
+            batchInsert('transformer_layer_norm_gamma1', ['idx', 'layer', 'data'], gamma1Rows);
+            batchInsert('transformer_layer_norm_gamma2', ['idx', 'layer', 'data'], gamma2Rows);
+            batchInsert('transformer_output_weights', ['idx', 'data'], outWeightRows);
+            batchInsert('transformer_output_bias', ['idx', 'data'], outBiasRows);
 
-            let gradRows = [];
+            const gradWqRows = [], gradWkRows = [], gradWvRows = [], gradWoRows = [];
+            const gradGateRows = [], gradUpRows = [], gradDownRows = [];
+            const gradGamma1Rows = [], gradGamma2Rows = [];
+            const gradOutWeightRows = [], gradOutBiasRows = [];
+            const gradAttBiasRows = [], gradAttMatRows = [], gradSpecRows = [];
+
             for (let idx = 0; idx < ensembleSize; idx++) {
                 const g = this.#gradientAccumulation[idx];
+                let flat;
 
-                for (let r = 0; r < g.outputWeights.length; r++) {
-                    for (let c = 0; c < g.outputWeights[r].length; c++) {
-                        const v = g.outputWeights[r][c];
-                        if (isValidNumber(v)) gradRows.push([idx, -1, 'outputWeights', r, c, v]);
-                    }
-                }
-                for (let r = 0; r < g.outputBias.length; r++) {
-                    const v = g.outputBias[r];
-                    if (isValidNumber(v)) gradRows.push([idx, -1, 'outputBias', r, 0, v]);
-                }
+                for (let layer = 0; layer < layers; layer++) {
+                    const att = g.attentionWeights[layer];
 
-                const numLayers = g.attentionWeights.length;
+                    flat = new Float32Array(hidden * hidden);
+                    for (let r = 0; r < hidden; r++) for (let c = 0; c < hidden; c++) flat[r * hidden + c] = att.Wq[r][c];
+                    gradWqRows.push([idx, layer, Buffer.from(flat.buffer)]);
 
-                for (let layer = 0; layer < numLayers; layer++) {
-                    const ag = g.attentionWeights[layer];
-                    for (const type of ['Wq', 'Wk', 'Wv', 'Wo']) {
-                        const m = ag[type];
-                        for (let r = 0; r < m.length; r++) {
-                            for (let c = 0; c < m[r].length; c++) {
-                                const v = m[r][c];
-                                if (isValidNumber(v)) gradRows.push([idx, layer, type, r, c, v]);
-                            }
-                        }
-                    }
-                }
+                    flat = new Float32Array(hidden * hidden);
+                    for (let r = 0; r < hidden; r++) for (let c = 0; c < hidden; c++) flat[r * hidden + c] = att.Wk[r][c];
+                    gradWkRows.push([idx, layer, Buffer.from(flat.buffer)]);
 
-                for (let layer = 0; layer < numLayers; layer++) {
-                    const fg = g.ffnWeights[layer];
-                    for (const type of ['gate_proj', 'up_proj', 'down_proj']) {
-                        const m = fg[type];
-                        for (let r = 0; r < m.length; r++) {
-                            for (let c = 0; c < m[r].length; c++) {
-                                const v = m[r][c];
-                                if (isValidNumber(v)) gradRows.push([idx, layer, type, r, c, v]);
-                            }
-                        }
-                    }
-                }
+                    flat = new Float32Array(hidden * hidden);
+                    for (let r = 0; r < hidden; r++) for (let c = 0; c < hidden; c++) flat[r * hidden + c] = att.Wv[r][c];
+                    gradWvRows.push([idx, layer, Buffer.from(flat.buffer)]);
 
-                for (let layer = 0; layer < numLayers; layer++) {
-                    const lg = g.layerNormWeights[layer];
-                    for (const type of ['gamma1', 'gamma2']) {
-                        const vec = lg[type];
-                        for (let r = 0; r < vec.length; r++) {
-                            const v = vec[r];
-                            if (isValidNumber(v)) gradRows.push([idx, layer, type, r, 0, v]);
-                        }
-                    }
+                    flat = new Float32Array(hidden * hidden);
+                    for (let r = 0; r < hidden; r++) for (let c = 0; c < hidden; c++) flat[r * hidden + c] = att.Wo[r][c];
+                    gradWoRows.push([idx, layer, Buffer.from(flat.buffer)]);
+
+                    const ffn = g.ffnWeights[layer];
+
+                    flat = new Float32Array(hidden * ff);
+                    for (let r = 0; r < hidden; r++) for (let c = 0; c < ff; c++) flat[r * ff + c] = ffn.gate_proj[r][c];
+                    gradGateRows.push([idx, layer, Buffer.from(flat.buffer)]);
+
+                    flat = new Float32Array(hidden * ff);
+                    for (let r = 0; r < hidden; r++) for (let c = 0; c < ff; c++) flat[r * ff + c] = ffn.up_proj[r][c];
+                    gradUpRows.push([idx, layer, Buffer.from(flat.buffer)]);
+
+                    flat = new Float32Array(ff * hidden);
+                    for (let r = 0; r < ff; r++) for (let c = 0; c < hidden; c++) flat[r * hidden + c] = ffn.down_proj[r][c];
+                    gradDownRows.push([idx, layer, Buffer.from(flat.buffer)]);
+
+                    flat = new Float32Array(hidden);
+                    flat.set(g.layerNormWeights[layer].gamma1);
+                    gradGamma1Rows.push([idx, layer, Buffer.from(flat.buffer)]);
+
+                    flat = new Float32Array(hidden);
+                    flat.set(g.layerNormWeights[layer].gamma2);
+                    gradGamma2Rows.push([idx, layer, Buffer.from(flat.buffer)]);
                 }
 
-                for (let r = 0; r < g.attentionBias.length; r++) {
-                    const v = g.attentionBias[r];
-                    if (isValidNumber(v)) gradRows.push([idx, -1, 'attentionBias', r, 0, v]);
-                }
-                for (let r = 0; r < g.attentionWeightMatrix.length; r++) {
-                    const v = g.attentionWeightMatrix[r];
-                    if (isValidNumber(v)) gradRows.push([idx, -1, 'attentionWeightMatrix', r, 0, v]);
-                }
-                for (let r = 0; r < g.specializationWeights.length; r++) {
-                    for (let c = 0; c < g.specializationWeights[r].length; c++) {
-                        const v = g.specializationWeights[r][c];
-                        if (isValidNumber(v)) gradRows.push([idx, -1, 'specializationWeights', r, c, v]);
-                    }
-                }
+                flat = new Float32Array(hidden);
+                for (let r = 0; r < hidden; r++) flat[r] = g.outputWeights[r][0];
+                gradOutWeightRows.push([idx, Buffer.from(flat.buffer)]);
+
+                flat = new Float32Array(1);
+                flat[0] = g.outputBias[0];
+                gradOutBiasRows.push([idx, Buffer.from(flat.buffer)]);
+
+                flat = new Float32Array(hidden);
+                flat.set(g.attentionBias);
+                gradAttBiasRows.push([idx, Buffer.from(flat.buffer)]);
+
+                flat = new Float32Array(hidden);
+                flat.set(g.attentionWeightMatrix);
+                gradAttMatRows.push([idx, Buffer.from(flat.buffer)]);
+
+                flat = new Float32Array(hidden * hidden);
+                for (let r = 0; r < hidden; r++) for (let c = 0; c < hidden; c++) flat[r * hidden + c] = g.specializationWeights[r][c];
+                gradSpecRows.push([idx, Buffer.from(flat.buffer)]);
             }
-            batchInsert('gradient_accumulation', ['idx', 'layer', 'weight_type', 'row', 'col', 'value'], gradRows, 5000);
 
-            let attProtoRows = [], attMeanRows = [], attVarRows = [];
+            batchInsert('gradient_attention_Wq', ['idx', 'layer', 'data'], gradWqRows);
+            batchInsert('gradient_attention_Wk', ['idx', 'layer', 'data'], gradWkRows);
+            batchInsert('gradient_attention_Wv', ['idx', 'layer', 'data'], gradWvRows);
+            batchInsert('gradient_attention_Wo', ['idx', 'layer', 'data'], gradWoRows);
+            batchInsert('gradient_ffn_gate_proj', ['idx', 'layer', 'data'], gradGateRows);
+            batchInsert('gradient_ffn_up_proj', ['idx', 'layer', 'data'], gradUpRows);
+            batchInsert('gradient_ffn_down_proj', ['idx', 'layer', 'data'], gradDownRows);
+            batchInsert('gradient_layer_norm_gamma1', ['idx', 'layer', 'data'], gradGamma1Rows);
+            batchInsert('gradient_layer_norm_gamma2', ['idx', 'layer', 'data'], gradGamma2Rows);
+            batchInsert('gradient_output_weights', ['idx', 'data'], gradOutWeightRows);
+            batchInsert('gradient_output_bias', ['idx', 'data'], gradOutBiasRows);
+            batchInsert('gradient_attention_bias', ['idx', 'data'], gradAttBiasRows);
+            batchInsert('gradient_attention_weight_matrix', ['idx', 'data'], gradAttMatRows);
+            batchInsert('gradient_specialization_weights', ['idx', 'data'], gradSpecRows);
+
+            let attProtoRows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
                 const windows = this.#attentionMemory[idx];
                 for (let window = 0; window < windows.length; window++) {
                     const entry = windows[window];
                     if (!entry) continue;
-
                     for (let pidx = 0; pidx < entry.protos.length; pidx++) {
                         const proto = entry.protos[pidx];
-                        attProtoRows.push([idx, window, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0]);
-
-                        for (let dim = 0; dim < proto.mean.length; dim++) {
-                            const v = proto.mean[dim];
-                            if (isValidNumber(v)) attMeanRows.push([idx, window, pidx, dim, v]);
-                        }
-                        for (let dim = 0; dim < proto.variance.length; dim++) {
-                            const v = proto.variance[dim];
-                            if (isValidNumber(v)) attVarRows.push([idx, window, pidx, dim, v]);
-                        }
+                        const meanBuf = Buffer.from(proto.mean.buffer);
+                        const varBuf = Buffer.from(proto.variance.buffer);
+                        attProtoRows.push([idx, window, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0, meanBuf, varBuf]);
                     }
                 }
             }
-            batchInsert('attention_memory_protos', ['idx', 'window', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance'], attProtoRows);
-            batchInsert('attention_memory_means', ['idx', 'window', 'proto_idx', 'dim', 'value'], attMeanRows);
-            batchInsert('attention_memory_variances', ['idx', 'window', 'proto_idx', 'dim', 'value'], attVarRows);
+            batchInsert('attention_memory_protos', ['idx', 'window', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance', 'mean_blob', 'variance_blob'], attProtoRows);
 
-            let adaptProtoRows = [], adaptMeanRows = [], adaptVarRows = [];
+            let adaptProtoRows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
                 const windows = this.#adaptiveContext[idx];
                 for (let window = 0; window < windows.length; window++) {
                     const entry = windows[window];
                     if (!entry) continue;
-
                     for (let pidx = 0; pidx < entry.protos.length; pidx++) {
                         const proto = entry.protos[pidx];
-                        adaptProtoRows.push([idx, window, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0]);
-
-                        for (let dim = 0; dim < proto.mean.length; dim++) {
-                            const v = proto.mean[dim];
-                            if (isValidNumber(v)) adaptMeanRows.push([idx, window, pidx, dim, v]);
-                        }
-                        for (let dim = 0; dim < proto.variance.length; dim++) {
-                            const v = proto.variance[dim];
-                            if (isValidNumber(v)) adaptVarRows.push([idx, window, pidx, dim, v]);
-                        }
+                        const meanBuf = Buffer.from(proto.mean.buffer);
+                        const varBuf = Buffer.from(proto.variance.buffer);
+                        adaptProtoRows.push([idx, window, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0, meanBuf, varBuf]);
                     }
                 }
             }
-            batchInsert('adaptive_context_protos', ['idx', 'window', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance'], adaptProtoRows);
-            batchInsert('adaptive_context_means', ['idx', 'window', 'proto_idx', 'dim', 'value'], adaptMeanRows);
-            batchInsert('adaptive_context_variances', ['idx', 'window', 'proto_idx', 'dim', 'value'], adaptVarRows);
+            batchInsert('adaptive_context_protos', ['idx', 'window', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance', 'mean_blob', 'variance_blob'], adaptProtoRows);
 
-            let semProtoRows = [], semMeanRows = [], semVarRows = [];
+            let semProtoRows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
                 const protos = this.#semanticProtos[idx];
                 for (let pidx = 0; pidx < protos.length; pidx++) {
                     const proto = protos[pidx];
-                    semProtoRows.push([idx, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0]);
-
-                    for (let dim = 0; dim < proto.mean.length; dim++) {
-                        const v = proto.mean[dim];
-                        if (isValidNumber(v)) semMeanRows.push([idx, pidx, dim, v]);
-                    }
-                    for (let dim = 0; dim < proto.variance.length; dim++) {
-                        const v = proto.variance[dim];
-                        if (isValidNumber(v)) semVarRows.push([idx, pidx, dim, v]);
-                    }
+                    const meanBuf = Buffer.from(proto.mean.buffer);
+                    const varBuf = Buffer.from(proto.variance.buffer);
+                    semProtoRows.push([idx, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0, meanBuf, varBuf]);
                 }
             }
-            batchInsert('semantic_protos', ['idx', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance'], semProtoRows);
-            batchInsert('semantic_means', ['idx', 'proto_idx', 'dim', 'value'], semMeanRows);
-            batchInsert('semantic_variances', ['idx', 'proto_idx', 'dim', 'value'], semVarRows);
+            batchInsert('semantic_protos', ['idx', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance', 'mean_blob', 'variance_blob'], semProtoRows);
 
-            let coreProtoRows = [], coreMeanRows = [], coreVarRows = [];
+            let coreProtoRows = [];
             for (let idx = 0; idx < ensembleSize; idx++) {
                 const entries = this.#coreEpisodic[idx];
                 for (let eidx = 0; eidx < entries.length; eidx++) {
                     const entry = entries[eidx];
                     if (!entry) continue;
-
                     for (let pidx = 0; pidx < entry.protos.length; pidx++) {
                         const proto = entry.protos[pidx];
-                        coreProtoRows.push([idx, eidx, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0]);
-
-                        for (let dim = 0; dim < proto.mean.length; dim++) {
-                            const v = proto.mean[dim];
-                            if (isValidNumber(v)) coreMeanRows.push([idx, eidx, pidx, dim, v]);
-                        }
-                        for (let dim = 0; dim < proto.variance.length; dim++) {
-                            const v = proto.variance[dim];
-                            if (isValidNumber(v)) coreVarRows.push([idx, eidx, pidx, dim, v]);
-                        }
+                        const meanBuf = Buffer.from(proto.mean.buffer);
+                        const varBuf = Buffer.from(proto.variance.buffer);
+                        coreProtoRows.push([idx, eidx, pidx, proto.size ?? 0, proto.accessCount ?? 0, proto.isCore ? 1 : 0, proto.importance ?? 0, meanBuf, varBuf]);
                     }
                 }
             }
-            batchInsert('core_episodic_protos', ['idx', 'entry_idx', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance'], coreProtoRows);
-            batchInsert('core_episodic_means', ['idx', 'entry_idx', 'proto_idx', 'dim', 'value'], coreMeanRows);
-            batchInsert('core_episodic_variances', ['idx', 'entry_idx', 'proto_idx', 'dim', 'value'], coreVarRows);
+            batchInsert('core_episodic_protos', ['idx', 'entry_idx', 'proto_idx', 'proto_size', 'access_count', 'is_core', 'importance', 'mean_blob', 'variance_blob'], coreProtoRows);
 
             db.exec('COMMIT');
 
             return { status: true, message: 'State saved successfully!' };
         } catch (error) {
             if (db) db.exec('ROLLBACK');
+
             console.log(error.message, error.stack);
+            process.exit();
+
             return { status: false, error: error.message, trace: error.stack };
         } finally {
             if (db) db.close();
