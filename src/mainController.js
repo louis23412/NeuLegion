@@ -29,13 +29,10 @@ const MIN_PRICE_MOVE = 0.0021;
 const MAX_PRICE_MOVE = 0.05;
 const PRICE_LAYER_BOOST = 0.10;
 
-const Y = '\x1b[93m';
 const C = '\x1b[96m';
 const X = '\x1b[0m';
 const BRIGHT_GREEN = '\x1b[92m';
 const BRIGHT_RED = '\x1b[91m';
-const BOLD = '\x1b[1m';
-const RESET = '\x1b[0m';
 const UP = '▲';
 const DOWN = '▼';
 const VBAR = '┃';
@@ -46,6 +43,8 @@ const hiveLayers = [];
 const NUM_LAYERS = NUM_CONTROLLERS_PER_LAYER.length;
 const MAX_LAYER = NUM_LAYERS - 1;
 const MAX_CACHE_SIZE = Math.round(BASE_CACHE_SIZE * (1 + CACHE_LAYER_BOOST * MAX_LAYER));
+
+let candleCounter = 0;
 
 for (let layer = 0; layer < NUM_LAYERS; layer++) {
     const numControllers = NUM_CONTROLLERS_PER_LAYER[layer];
@@ -62,7 +61,8 @@ for (let layer = 0; layer < NUM_LAYERS; layer++) {
             directoryPath,
             layer,
             signalSpeed: 0,
-            lastSignal: {}
+            lastSignal: {},
+            cont : 0
         });
     }
 
@@ -135,8 +135,8 @@ const runWorker = async (co) => {
     });
 };
 
-const processBatch = async (counter) => {
-    console.log(`New batch(${C}${counter}${X}):`);
+const processBatch = async () => {
+    console.log(`New batch(${C}${candleCounter}${X}):`);
 
     const totalStart = performance.now();
     let progressTracker = 0;
@@ -175,7 +175,90 @@ const processBatch = async (counter) => {
     }
 };
 
-let counter = 0;
+const logAllControllers = () => {
+    console.log('--');
+
+    const rankedControllers = hiveLayers.flat().sort((a, b) => a.signalSpeed - b.signalSpeed);
+
+    const maxIdLength = Math.max(...rankedControllers.map(c => `L${c.layer}C${c.id}`.length));
+    const maxSpeedLength = Math.max(...rankedControllers.map(c => ((c.signalSpeed / 1000).toFixed(3) + 's').length));
+    const maxScoreLength = Math.max(...rankedControllers.map(c => String(c.lastSignal.score).length));
+    const maxProbLength = Math.max(...rankedControllers.map(c => String((c.lastSignal?.prob ?? 0).toFixed(3)).length));
+    const maxContLength = Math.max(...rankedControllers.map(c => ((c.cont ?? 0).toFixed(3)).length));
+
+    const blockVisibleWidth = maxIdLength + maxSpeedLength + maxScoreLength + maxProbLength + maxContLength + 10;
+
+    const terminalWidth = process.stdout.columns || 80;
+
+    const sep = '  ';
+    const sepWidth = sep.length;
+
+    let numColumns = Math.floor((terminalWidth + sepWidth) / (blockVisibleWidth + sepWidth));
+    numColumns = Math.ceil(numColumns * 0.95);
+    if (numColumns < 1) numColumns = 1;
+
+    const blocks = rankedControllers.map(controller => {
+        const color = controller.type === 'positive' ? BRIGHT_GREEN : BRIGHT_RED;
+        const arrow = controller.type === 'positive' ? UP : DOWN;
+        const idStr = `L${controller.layer}C${controller.id}`.padEnd(maxIdLength);
+        const speedStr = (controller.signalSpeed / 1000).toFixed(3) + 's';
+        const paddedSpeed = speedStr.padStart(maxSpeedLength);
+        const scoreStr = String(controller.lastSignal.score).padStart(maxScoreLength);
+        const probStr = (controller.lastSignal?.prob ?? 0).toFixed(3);
+        const paddedProb = probStr.padStart(maxProbLength);
+
+        const contStr = (controller.cont ?? 0).toFixed(3);
+        const paddedCont = contStr.padStart(maxContLength);
+
+        const inner = `${arrow} ${idStr} ${paddedSpeed} ${scoreStr} ${paddedProb} ${paddedCont}`;
+
+        return `${color}${VBAR} ${inner} ${VBAR}${X}`;
+    });
+
+    for (let i = 0; i < blocks.length; i += numColumns) {
+        const row = blocks.slice(i, i + numColumns);
+        console.log(row.join(sep));
+    }
+
+    console.log('--');
+
+    const totalBuy = allControllers.filter(co => co.type === 'positive').reduce((sum, co) => sum + (co.cont || 0), 0);
+    const totalSell = allControllers.filter(co => co.type === 'negative').reduce((sum, co) => sum + (co.cont || 0), 0);
+
+    const net = totalBuy - totalSell;
+    const buyStr = totalBuy.toFixed(3);
+    const sellStr = totalSell.toFixed(3);
+    const netStr = net.toFixed(3);
+
+    console.log(`Buy : ${BRIGHT_GREEN}${buyStr}${X} % | Sell : ${BRIGHT_RED}${sellStr}${X} % | Net: ${net > 0 ? BRIGHT_GREEN : BRIGHT_RED}${netStr}${X} %`);
+
+    console.log('-'.repeat(terminalWidth / 2));
+};
+
+const adjustContributions = () => {
+    for (const layer of hiveLayers) {
+        const layerParams = getLayerParams(layer[0].layer);
+
+        for (const controller of layer) {
+            if (!controller.lastSignal || controller.lastSignal.score == null) {
+                controller.cont = 0;
+                continue;
+            }
+
+            const score = controller.lastSignal.score;
+
+            const cacheBoost = layerParams.cacheSize / BASE_CACHE_SIZE;
+            const moneyBoost = layerParams.atrFactor / BASE_ATR_FACTOR;
+            const inputBoost = 1 + layerParams.inputMult;
+            const popBoost = BASE_POPULATION / layerParams.pop;
+
+            const totalBoost = cacheBoost * moneyBoost * inputBoost * popBoost;
+
+            controller.cont = Number((score * totalBoost).toFixed(4));
+        }
+    }
+};
+
 const processCandles = async () => {
     const fileStream = fs.createReadStream(TRAINING_FILE);
     const rd = readline.createInterface({
@@ -200,36 +283,14 @@ const processCandles = async () => {
         }
 
         if (cache.length === MAX_CACHE_SIZE) {
-            counter++;
-            await processBatch(counter);
+            candleCounter++;
 
-            for (let layer = 0; layer < hiveLayers.length; layer++) {
-                console.log('--');
+            await processBatch();
 
-                const controllers = hiveLayers[layer];
-                const rankedControllers = controllers.toSorted((a, b) => a.signalSpeed - b.signalSpeed);
+            adjustContributions();
+            logAllControllers();
 
-                const blocks = [];
-                for (const cluster of rankedControllers) {
-                    const color = cluster.type === 'positive' ? BRIGHT_GREEN : BRIGHT_RED;
-                    const arrow = cluster.type === 'positive' ? UP : DOWN;
-                    const idStr = `L${layer}C${cluster.id}`;
-
-                    const speedStr = (cluster.signalSpeed / 1000).toFixed(3) + 's';
-                    const scoreDisplay = cluster.lastSignal.score;
-
-                    const inner = `${arrow} ${idStr} ${speedStr} ${scoreDisplay}`;
-                    const block = `${color}${BOLD}${VBAR} ${inner} ${VBAR}${RESET}`;
-
-                    blocks.push(block);
-                }
-
-                console.log(`${Y}L${layer}${X} => ${blocks.join('   ')}`);
-            }
-
-            console.log('--------------------------------------------------');
-
-            if (counter === TRAINING_CUTOFF) {
+            if (candleCounter === TRAINING_CUTOFF) {
                 console.log(`Done! Cutoff = ${TRAINING_CUTOFF}`);
                 process.exit();
             }

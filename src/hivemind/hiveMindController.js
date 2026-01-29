@@ -604,6 +604,7 @@ class HiveMindController {
         }
 
         return {
+            prob : prediction,
             score : finalScore,
             lastTrainingStep : this.#globalAccuracy.trainingSteps,
             skippedTraining : this.#globalAccuracy.skippedDuplicate,
