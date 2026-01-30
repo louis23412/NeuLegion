@@ -5,102 +5,184 @@ import { Worker } from 'node:worker_threads';
 import { performance } from 'node:perf_hooks';
 import { availableParallelism } from 'node:os';
 
-const TRAINING_FILE = path.join(import.meta.dirname, 'candles.jsonl');
+const CONFIG = {
+    file: path.join(import.meta.dirname, 'candles.jsonl'),
+    cutoff: null,
+    baseProcessCount: 1,
+    maxWorkers: Math.max(1, Math.floor(availableParallelism() * 0.25)),
+    forceMin: true,
 
-const TRAINING_CUTOFF = null;
+    dims: [4, 4, 4, 4],
 
-const BASE_PROCESS_COUNT = 1;
-const FORCE_MINIMAL_DIMENSIONS = true;
-const MAX_CONCURRENT_WORKERS = Math.max(1, Math.floor(availableParallelism() * 0.25));
+    groupInputBoost: 0.15,
+    sectionInputBoost: 0.25,
+    layerInputBoost: 0.35,
 
-const NUM_CONTROLLERS_PER_LAYER = [4, 4, 4, 4];
+    groupPopBoost: 0.05,
+    sectionPopBoost: 0.15,
+    layerPopBoost: 0.25,
 
-const INPUT_LAYER_BOOST = 0.15;
+    groupCacheBoost: 0.15,
+    sectionCacheBoost: 0.25,
+    layerCacheBoost: 0.35,
 
-const BASE_POPULATION = 64;
-const POP_LAYER_BOOST = 0.15;
+    groupPriceBoost: 0.05,
+    sectionPriceBoost: 0.10,
+    layerPriceBoost: 0.15,
 
-const BASE_CACHE_SIZE = 250;
-const CACHE_LAYER_BOOST = 1;
+    basePop: 64,
+    baseCache: 250,
 
-const BASE_ATR_FACTOR = 2.5;
-const BASE_STOP_FACTOR = 1;
-const MIN_PRICE_MOVE = 0.0021;
-const MAX_PRICE_MOVE = 0.05;
-const PRICE_LAYER_BOOST = 0.10;
-
-const C = '\x1b[96m';
-const X = '\x1b[0m';
-const BRIGHT_GREEN = '\x1b[92m';
-const BRIGHT_RED = '\x1b[91m';
-const UP = '▲';
-const DOWN = '▼';
-const VBAR = '┃';
+    baseAtr: 1.5,
+    baseStop: 0.75,
+    minPriceMove: 0.0021,
+    maxPriceMove: 0.05,
+};
 
 const cache = [];
-const hiveLayers = [];
-
-const NUM_LAYERS = NUM_CONTROLLERS_PER_LAYER.length;
-const MAX_LAYER = NUM_LAYERS - 1;
-const MAX_CACHE_SIZE = Math.round(BASE_CACHE_SIZE * (1 + CACHE_LAYER_BOOST * MAX_LAYER));
-
 let candleCounter = 0;
 
-for (let layer = 0; layer < NUM_LAYERS; layer++) {
-    const numControllers = NUM_CONTROLLERS_PER_LAYER[layer];
-    const controllers = [];
-    const half = Math.floor(numControllers / 2);
+const half = Math.floor(CONFIG.dims[3] / 2);
 
-    for (let id = 0; id < numControllers; id++) {
-        const type = id < half ? 'positive' : 'negative';
-        const directoryPath = path.join(import.meta.dirname, '..', 'state', `Layer${layer}`, `L${layer}C${id}`);
+const structureMap = Array.from({ length: CONFIG.dims[0] }, (_, group) =>
+    Array.from({ length: CONFIG.dims[1] }, (_, section) =>
+        Array.from({ length: CONFIG.dims[2] }, (_, layer) =>
+            Array.from({ length: CONFIG.dims[3] }, (_, cluster) => {
+                const directoryPath = path.join(
+                    import.meta.dirname,
+                    '..',
+                    'state',
+                    `Group${group}`,
+                    `Section${section}`,
+                    `Layer${layer}`,
+                    `G${group}S${section}L${layer}C${cluster}`
+                );
 
-        controllers.push({
-            id,
-            type,
-            directoryPath,
-            layer,
-            signalSpeed: 0,
-            lastSignal: {},
-            cont : 0
-        });
-    }
+                return {
+                    id: cluster,
+                    type: cluster < half ? 'positive' : 'negative',
+                    directoryPath,
+                    group,
+                    section,
+                    layer,
+                    signalSpeed: 0,
+                    lastSignal: {},
+                    cont: 0
+                };
+            })
+        )
+    )
+);
 
-    hiveLayers.push(controllers);
-}
+const getControllerParams = (group, section, layer) => {
+    const reversedGroup = CONFIG.dims[0] - 1 - group;
+    const reversedSection = CONFIG.dims[1] - 1 - section;
+    const reversedLayer = CONFIG.dims[2] - 1 - layer;
 
-const allControllers = hiveLayers.flat();
+    const groupCacheFactor = 1 + CONFIG.groupCacheBoost * group;
+    const sectionCacheFactor = 1 + CONFIG.sectionCacheBoost * section;
+    const layerCacheFactor = 1 + CONFIG.layerCacheBoost * layer;
+    const cacheFactor = groupCacheFactor * sectionCacheFactor * layerCacheFactor;
 
-const getLayerParams = (layer) => {
-    const reversedLayer = NUM_LAYERS - 1 - layer;
-    const cacheFactor = 1 + CACHE_LAYER_BOOST * layer;
-    const moneyFactor = 1 + PRICE_LAYER_BOOST * layer;
-    const popFactor = 1 + POP_LAYER_BOOST * reversedLayer;
+    const groupMoneyFactor = 1 + CONFIG.groupPriceBoost * group;
+    const sectionMoneyFactor = 1 + CONFIG.sectionPriceBoost * section;
+    const layerMoneyFactor = 1 + CONFIG.layerPriceBoost * layer;
+    const moneyFactor = groupMoneyFactor * sectionMoneyFactor * layerMoneyFactor;
+
+    const groupPopFactor = 1 + CONFIG.groupPopBoost * reversedGroup;
+    const sectionPopFactor = 1 + CONFIG.sectionPopBoost * reversedSection;
+    const layerPopFactor = 1 + CONFIG.layerPopBoost * reversedLayer;
+    const popFactor = groupPopFactor * sectionPopFactor * layerPopFactor;
+
+    const inputMult = Number((CONFIG.groupInputBoost * group + CONFIG.sectionInputBoost * section + CONFIG.layerInputBoost * layer).toFixed(3));
 
     return {
-        cacheSize: Math.round(BASE_CACHE_SIZE * cacheFactor),
-        atrFactor: Number((BASE_ATR_FACTOR * moneyFactor).toFixed(3)),
-        stopFactor: Number((BASE_STOP_FACTOR * moneyFactor).toFixed(3)),
-        minPriceMovement: Number((MIN_PRICE_MOVE * moneyFactor).toFixed(3)),
-        maxPriceMovement: Number((MAX_PRICE_MOVE * moneyFactor).toFixed(3)),
-        inputMult : Number((INPUT_LAYER_BOOST * layer).toFixed(3)),
-        pop : Math.round(BASE_POPULATION * popFactor)
+        cacheSize: Math.round(CONFIG.baseCache * cacheFactor),
+        atrFactor: Number((CONFIG.baseAtr * moneyFactor).toFixed(3)),
+        stopFactor: Number((CONFIG.baseStop * moneyFactor).toFixed(3)),
+        minPriceMovement: Number((CONFIG.minPriceMove * moneyFactor).toFixed(3)),
+        maxPriceMovement: Number((CONFIG.maxPriceMove * moneyFactor).toFixed(3)),
+        inputMult,
+        pop: Math.round(CONFIG.basePop * popFactor)
     };
 };
 
-const runWorker = async (co) => {
-    const { cacheSize, atrFactor, stopFactor, minPriceMovement, maxPriceMovement, inputMult, pop } = getLayerParams(co.layer);
-    const layerCache = cache.slice(-cacheSize);
+const adjustContributions = () => {
+    const allControllers = structureMap.flat(3);
+
+    allControllers.forEach(controller => {
+        const params = getControllerParams(controller.group, controller.section, controller.layer);
+
+        const score = controller.lastSignal.score || 0;
+
+        const cacheBoost = params.cacheSize / CONFIG.baseCache;
+        const moneyBoost = params.atrFactor / CONFIG.baseAtr;
+        const inputBoost = 1 + params.inputMult;
+        const popBoost = CONFIG.basePop / params.pop;
+
+        const totalBoost = cacheBoost * moneyBoost * inputBoost * popBoost;
+
+        controller.cont = Number((score * totalBoost).toFixed(4));
+    });
+};
+
+const processBatch = async () => {
+    console.log(`New batch(${candleCounter}):`);
+
+    const totalStart = performance.now();
+    let progressTracker = 0;
+    const results = [];
+
+    const allControllers = structureMap.flat(3);
+
+    console.log(`Processed ${progressTracker}/${allControllers.length} controllers (${((progressTracker / allControllers.length) * 100).toFixed(2)}%)...`);
+
+    for (let index = 0; index < allControllers.length; index += CONFIG.maxWorkers) {
+        const chunk = allControllers.slice(index, index + CONFIG.maxWorkers);
+        const promises = chunk.map(controller => runWorker(controller));
+
+        let chunkResults;
+        try {
+            chunkResults = await Promise.all(promises);
+        } catch (err) {
+            console.error('Error during parallel processing:', err);
+            process.exit(1);
+        }
+
+        chunkResults.forEach(result => {
+            progressTracker++;
+
+            process.stdout.moveCursor(0, -1);
+            console.log(`Processed ${progressTracker}/${allControllers.length} controllers (${((progressTracker / allControllers.length) * 100).toFixed(2)}%)...`);
+
+            results.push(result);
+        });
+    }
+
+    const totalEnd = performance.now();
+    console.log(`Batch completed in ${((totalEnd - totalStart) / 1000).toFixed(3)} seconds`);
+
+    for (const { controller, signal, duration } of results) {
+        controller.lastSignal = signal;
+        controller.signalSpeed = duration;
+    }
+};
+
+const runWorker = async (controller) => {
+    const params = getControllerParams(controller.group, controller.section, controller.layer);
+    const { cacheSize, atrFactor, stopFactor, minPriceMovement, maxPriceMovement, inputMult, pop } = params;
+
+    const recentCandles = cache.slice(-cacheSize);
 
     return new Promise((resolve, reject) => {
         const worker = new Worker(new URL('./worker.js', import.meta.url), {
             workerData: {
-                id: `L${co.layer}C${co.id}`,
-                directoryPath: co.directoryPath,
+                id: `G${controller.group}S${controller.section}L${controller.layer}C${controller.id}`,
+                directoryPath: controller.directoryPath,
                 cacheSize,
                 populationPerController: pop,
-                cache: layerCache,
-                type: co.type,
+                cache: recentCandles,
+                type: controller.type,
                 priceObj: {
                     atrFactor,
                     stopFactor,
@@ -108,8 +190,8 @@ const runWorker = async (co) => {
                     maxPriceMovement,
                 },
                 inputMult,
-                processCount : BASE_PROCESS_COUNT,
-                forceMin : FORCE_MINIMAL_DIMENSIONS
+                processCount: CONFIG.baseProcessCount,
+                forceMin: CONFIG.forceMin
             },
         });
 
@@ -119,7 +201,7 @@ const runWorker = async (co) => {
                 reject(new Error(msg.error));
             } else {
                 resolve({
-                    co,
+                    controller,
                     signal: msg.signal,
                     duration: msg.duration,
                 });
@@ -135,136 +217,18 @@ const runWorker = async (co) => {
     });
 };
 
-const processBatch = async () => {
-    console.log(`New batch(${C}${candleCounter}${X}):`);
-
-    const totalStart = performance.now();
-    let progressTracker = 0;
-    const results = [];
-
-    console.log(`Processed ${C}${progressTracker}${X}/${C}${allControllers.length}${X} controllers (${C}${((progressTracker / allControllers.length) * 100).toFixed(2)}${X}%)...`);
-
-    for (let index = 0; index < allControllers.length; index += MAX_CONCURRENT_WORKERS) {
-        const chunk = allControllers.slice(index, index + MAX_CONCURRENT_WORKERS);
-        const promises = chunk.map(co => runWorker(co));
-
-        let chunkResults;
-        try {
-            chunkResults = await Promise.all(promises);
-        } catch (err) {
-            console.error('Error during parallel processing:', err);
-            process.exit(1);
-        }
-
-        chunkResults.forEach(result => {
-            progressTracker++;
-
-            process.stdout.moveCursor(0, -1);
-            console.log(`Processed ${C}${progressTracker}${X}/${C}${allControllers.length}${X} controllers (${C}${((progressTracker / allControllers.length) * 100).toFixed(2)}${X}%)...`);
-
-            results.push(result);
-        });
-    }
-
-    const totalEnd = performance.now();
-    console.log(`Batch completed in ${C}${((totalEnd - totalStart) / 1000).toFixed(3)}${X} seconds`);
-
-    for (const { co, signal, duration } of results) {
-        co.lastSignal = signal;
-        co.signalSpeed = duration;
-    }
-};
-
-const logAllControllers = () => {
-    console.log('--');
-
-    const rankedControllers = hiveLayers.flat().sort((a, b) => a.signalSpeed - b.signalSpeed);
-
-    const maxIdLength = Math.max(...rankedControllers.map(c => `L${c.layer}C${c.id}`.length));
-    const maxSpeedLength = Math.max(...rankedControllers.map(c => ((c.signalSpeed / 1000).toFixed(3) + 's').length));
-    const maxScoreLength = Math.max(...rankedControllers.map(c => String(c.lastSignal.score).length));
-    const maxProbLength = Math.max(...rankedControllers.map(c => String((c.lastSignal?.prob ?? 0).toFixed(3)).length));
-    const maxContLength = Math.max(...rankedControllers.map(c => ((c.cont ?? 0).toFixed(3)).length));
-
-    const blockVisibleWidth = maxIdLength + maxSpeedLength + maxScoreLength + maxProbLength + maxContLength + 10;
-
-    const terminalWidth = process.stdout.columns || 80;
-
-    const sep = '  ';
-    const sepWidth = sep.length;
-
-    let numColumns = Math.floor((terminalWidth + sepWidth) / (blockVisibleWidth + sepWidth));
-    numColumns = Math.ceil(numColumns * 0.95);
-    if (numColumns < 1) numColumns = 1;
-
-    const blocks = rankedControllers.map(controller => {
-        const color = controller.type === 'positive' ? BRIGHT_GREEN : BRIGHT_RED;
-        const arrow = controller.type === 'positive' ? UP : DOWN;
-        const idStr = `L${controller.layer}C${controller.id}`.padEnd(maxIdLength);
-        const speedStr = (controller.signalSpeed / 1000).toFixed(3) + 's';
-        const paddedSpeed = speedStr.padStart(maxSpeedLength);
-        const scoreStr = String(controller.lastSignal.score).padStart(maxScoreLength);
-        const probStr = (controller.lastSignal?.prob ?? 0).toFixed(3);
-        const paddedProb = probStr.padStart(maxProbLength);
-
-        const contStr = (controller.cont ?? 0).toFixed(3);
-        const paddedCont = contStr.padStart(maxContLength);
-
-        const inner = `${arrow} ${idStr} ${paddedSpeed} ${scoreStr} ${paddedProb} ${paddedCont}`;
-
-        return `${color}${VBAR} ${inner} ${VBAR}${X}`;
-    });
-
-    for (let i = 0; i < blocks.length; i += numColumns) {
-        const row = blocks.slice(i, i + numColumns);
-        console.log(row.join(sep));
-    }
-
-    console.log('--');
-
-    const totalBuy = allControllers.filter(co => co.type === 'positive').reduce((sum, co) => sum + (co.cont || 0), 0);
-    const totalSell = allControllers.filter(co => co.type === 'negative').reduce((sum, co) => sum + (co.cont || 0), 0);
-
-    const net = totalBuy - totalSell;
-    const buyStr = totalBuy.toFixed(3);
-    const sellStr = totalSell.toFixed(3);
-    const netStr = net.toFixed(3);
-
-    console.log(`Buy : ${BRIGHT_GREEN}${buyStr}${X} % | Sell : ${BRIGHT_RED}${sellStr}${X} % | Net: ${net > 0 ? BRIGHT_GREEN : BRIGHT_RED}${netStr}${X} %`);
-
-    console.log('-'.repeat(terminalWidth / 2));
-};
-
-const adjustContributions = () => {
-    for (const layer of hiveLayers) {
-        const layerParams = getLayerParams(layer[0].layer);
-
-        for (const controller of layer) {
-            if (!controller.lastSignal || controller.lastSignal.score == null) {
-                controller.cont = 0;
-                continue;
-            }
-
-            const score = controller.lastSignal.score;
-
-            const cacheBoost = layerParams.cacheSize / BASE_CACHE_SIZE;
-            const moneyBoost = layerParams.atrFactor / BASE_ATR_FACTOR;
-            const inputBoost = 1 + layerParams.inputMult;
-            const popBoost = BASE_POPULATION / layerParams.pop;
-
-            const totalBoost = cacheBoost * moneyBoost * inputBoost * popBoost;
-
-            controller.cont = Number((score * totalBoost).toFixed(4));
-        }
-    }
-};
-
 const processCandles = async () => {
-    const fileStream = fs.createReadStream(TRAINING_FILE);
+    const fileStream = fs.createReadStream(CONFIG.file);
     const rd = readline.createInterface({
         input: fileStream,
         crlfDelay: Infinity,
     });
+
+    const maxGroup = CONFIG.dims[0] - 1;
+    const maxSection = CONFIG.dims[1] - 1;
+    const maxLayer = CONFIG.dims[2] - 1;
+    const maxCacheFactor = (1 + CONFIG.groupCacheBoost * maxGroup) * (1 + CONFIG.sectionCacheBoost * maxSection) * (1 + CONFIG.layerCacheBoost * maxLayer);
+    const maxCache = Math.round(CONFIG.baseCache * maxCacheFactor);
 
     for await (const line of rd) {
         if (!line.trim()) continue;
@@ -278,20 +242,18 @@ const processCandles = async () => {
         }
 
         cache.push(candle);
-        if (cache.length > MAX_CACHE_SIZE) {
+        if (cache.length > maxCache) {
             cache.shift();
         }
 
-        if (cache.length === MAX_CACHE_SIZE) {
+        if (cache.length === maxCache) {
             candleCounter++;
 
             await processBatch();
-
             adjustContributions();
-            logAllControllers();
 
-            if (candleCounter === TRAINING_CUTOFF) {
-                console.log(`Done! Cutoff = ${TRAINING_CUTOFF}`);
+            if (candleCounter === CONFIG.cutoff) {
+                console.log(`Done! Cutoff = ${CONFIG.cutoff}`);
                 process.exit();
             }
         }
