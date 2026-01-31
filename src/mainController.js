@@ -9,7 +9,7 @@ const cache = [];
 let candleCounter = 0;
 
 const CONFIG = {
-    cutoff: null,
+    cutoff: 1,
     baseProcessCount: 1,
     forceMin: true,
     maxWorkers: Math.max(1, Math.floor(availableParallelism() * 0.25)),
@@ -41,6 +41,9 @@ const CONFIG = {
     baseStop: 0.75,
     minPriceMove: 0.0021,
     maxPriceMove: 0.05,
+
+    scoreHistory : 100,
+    signalHistory : 100
 };
 
 let structureMap = Array.from({ length: CONFIG.dims[0] }, (_, group) =>
@@ -59,7 +62,9 @@ let structureMap = Array.from({ length: CONFIG.dims[0] }, (_, group) =>
                     layer,
                     signalSpeed: 0,
                     lastSignal: {},
-                    cont: 0
+                    cont: 0,
+                    scoreHistory : [],
+                    signalHistory : []
                 };
             })
         )
@@ -99,7 +104,7 @@ const getControllerParams = (group, section, layer) => {
     };
 };
 
-const adjustContributions = () => {
+const adjustAllControllers = () => {
     const allControllers = structureMap.flat(3);
 
     allControllers.forEach(controller => {
@@ -115,6 +120,11 @@ const adjustContributions = () => {
         const totalBoost = cacheBoost * moneyBoost * inputBoost * popBoost;
 
         controller.cont = Number((score * totalBoost).toFixed(4));
+
+        controller.scoreHistory.push(score);
+        controller.signalHistory.push(controller.signalSpeed);
+        if (controller.scoreHistory.length > CONFIG.scoreHistory) controller.scoreHistory.shift();
+        if (controller.signalHistory.length > CONFIG.signalHistory) controller.signalHistory.shift();
     });
 };
 
@@ -266,7 +276,7 @@ const processCandles = async () => {
             if (candleCounter <= rebuildCounter) continue;
 
             await processBatch();
-            adjustContributions();
+            adjustAllControllers();
             await saveLegionState();
 
             if (candleCounter % CONFIG.cutoff === 0) {
