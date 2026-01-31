@@ -573,14 +573,16 @@ class HiveMindController {
             this.#shouldDumpState = true;
         }
         
-        insertTradeStmt.run(
-            recentCandles.at(-1).timestamp,
-            sellPrice,
-            stopLoss,
-            entryPrice,
-            JSON.stringify(features),
-            prediction
-        );
+        if (recentCandles.length > 0) {
+            insertTradeStmt.run(
+                recentCandles.at(-1).timestamp,
+                sellPrice,
+                stopLoss,
+                entryPrice,
+                JSON.stringify(features),
+                prediction
+            );
+        }
 
         this.#processClosedTrades(processCount);
 

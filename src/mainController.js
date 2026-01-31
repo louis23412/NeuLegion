@@ -5,12 +5,16 @@ import { Worker } from 'node:worker_threads';
 import { performance } from 'node:perf_hooks';
 import { availableParallelism } from 'node:os';
 
+const cache = [];
+let candleCounter = 0;
+
 const CONFIG = {
-    file: path.join(import.meta.dirname, 'candles.jsonl'),
     cutoff: null,
     baseProcessCount: 1,
-    maxWorkers: Math.max(1, Math.floor(availableParallelism() * 0.25)),
     forceMin: true,
+    maxWorkers: Math.max(1, Math.floor(availableParallelism() * 0.25)),
+    file: path.join(import.meta.dirname, 'candles.jsonl'),
+    stateFolder : path.join(import.meta.dirname, '..', 'state'),
 
     dims: [4, 4, 4, 4],
 
@@ -39,24 +43,12 @@ const CONFIG = {
     maxPriceMove: 0.05,
 };
 
-const cache = [];
-let candleCounter = 0;
-
-const half = Math.floor(CONFIG.dims[3] / 2);
-
-const structureMap = Array.from({ length: CONFIG.dims[0] }, (_, group) =>
+let structureMap = Array.from({ length: CONFIG.dims[0] }, (_, group) =>
     Array.from({ length: CONFIG.dims[1] }, (_, section) =>
         Array.from({ length: CONFIG.dims[2] }, (_, layer) =>
             Array.from({ length: CONFIG.dims[3] }, (_, cluster) => {
-                const directoryPath = path.join(
-                    import.meta.dirname,
-                    '..',
-                    'state',
-                    `Group${group}`,
-                    `Section${section}`,
-                    `Layer${layer}`,
-                    `G${group}S${section}L${layer}C${cluster}`
-                );
+                const half = Math.floor(CONFIG.dims[3] / 2);
+                const directoryPath = path.join(CONFIG.stateFolder, `Group${group}`, `Section${section}`, `Layer${layer}`, `G${group}S${section}L${layer}C${cluster}`);
 
                 return {
                     id: cluster,
@@ -217,12 +209,35 @@ const runWorker = async (controller) => {
     });
 };
 
+const saveLegionState = async () => {
+    fs.writeFileSync(path.join(CONFIG.stateFolder, 'legionState.json'), JSON.stringify({
+        candleCounter,
+        legionState : structureMap
+    }));
+}
+
+const loadLegionState = () => {
+    const fileName = path.join(CONFIG.stateFolder, 'legionState.json');
+
+    if (!fs.existsSync(fileName)) {
+        return;
+    }
+
+    const rawData = fs.readFileSync(fileName)
+    const loadedData = JSON.parse(rawData)
+
+    structureMap = loadedData.legionState;
+    return loadedData.candleCounter;
+}
+
 const processCandles = async () => {
     const fileStream = fs.createReadStream(CONFIG.file);
     const rd = readline.createInterface({
         input: fileStream,
         crlfDelay: Infinity,
     });
+
+    let rebuildCounter = loadLegionState();
 
     const maxGroup = CONFIG.dims[0] - 1;
     const maxSection = CONFIG.dims[1] - 1;
@@ -248,12 +263,14 @@ const processCandles = async () => {
 
         if (cache.length === maxCache) {
             candleCounter++;
+            if (candleCounter <= rebuildCounter) continue;
 
             await processBatch();
             adjustContributions();
+            await saveLegionState();
 
-            if (candleCounter === CONFIG.cutoff) {
-                console.log(`Done! Cutoff = ${CONFIG.cutoff}`);
+            if (candleCounter % CONFIG.cutoff === 0) {
+                console.log(`Done! Cutoff = ${candleCounter}`);
                 process.exit();
             }
         }
