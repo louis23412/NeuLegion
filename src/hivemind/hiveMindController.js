@@ -35,8 +35,9 @@ class HiveMindController {
     #type;
     #forceMin;
     #shouldDumpState;
+    #memoryShareFrequency;
 
-    constructor ( id, dp, cs, es, type, priceObj, inputMult, forceMin = false ) {
+    constructor ( id, dp, cs, es, type, priceObj, inputMult, forceMin = false, memoryShareFrequency ) {
         this.#controllerID = id;
 
         try {
@@ -54,6 +55,7 @@ class HiveMindController {
 
         this.#config = priceObj;
         this.#forceMin = forceMin;
+        this.#memoryShareFrequency = memoryShareFrequency;
 
         this.#indicators = new IndicatorProcessor();
         this.#db = new Database(path.join(this.#directoryPath, `hivemind_controller-${this.#type}-${this.#controllerID}.db`), { fileMustExist: false });
@@ -526,7 +528,7 @@ class HiveMindController {
         this.#saveGlobalAccuracy();
     }
 
-    getSignal (candles, processCount) {
+    getSignal (candles, processCount = 1, sharedMemories = []) {
         const { error, recentCandles, fullCandles } = this.#getRecentCandles(candles);
 
         if (error) return { error };
@@ -586,7 +588,16 @@ class HiveMindController {
 
         this.#processClosedTrades(processCount);
 
+        let memoryBroadcast = {};
         if (this.#shouldDumpState && this.#hivemind) {
+            memoryBroadcast = this.#hivemind.broadcastMemory();
+
+            if (this.#globalAccuracy.trainingSteps % this.#memoryShareFrequency === 0 && sharedMemories.length > 0) {
+                for (const mem of sharedMemories) {
+                    this.#hivemind.translateMemory(mem)
+                }
+            }
+
             this.#hivemind.dumpState();
         }
 
@@ -611,7 +622,8 @@ class HiveMindController {
             lastTrainingStep : this.#globalAccuracy.trainingSteps,
             skippedTraining : this.#globalAccuracy.skippedDuplicate,
             openSimulations,
-            pendingClosedTrades
+            pendingClosedTrades,
+            memoryBroadcast
         };
     }
 }

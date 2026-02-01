@@ -6186,6 +6186,137 @@ class HiveMind {
         });
     }
 
+    broadcastMemory() {
+        if (this.#ensembleSize < 2) return { memories: [] };
+
+        const compositeScores = this.#performanceScores.map((perf, i) => {
+            const agree = this.#agreementScores[i] ?? 0.5;
+            const spec = this.#specializationScores[i] ?? 0.5;
+            return 0.45 * perf + 0.25 * agree + 0.3 * spec;
+        });
+
+        const rankedIndices = Array.from({ length: this.#ensembleSize }, (_, i) => i);
+        rankedIndices.sort((a, b) => compositeScores[b] - compositeScores[a]);
+
+        const minShare = Math.max(2, Math.round(this.#ensembleSize * 0.05));
+        const numDonors = Math.max(minShare, Math.round(this.#ensembleSize * (0.2 + 0.4 * this.#swarmIntelligenceFactor)));
+        const topPerformers = rankedIndices.slice(0, numDonors);
+
+        let candidateProtos = [];
+        for (const idx of topPerformers) {
+            const protos = this.#semanticProtos[idx];
+            if (protos.length === 0) continue;
+
+            const sorted = protos.slice().sort((a, b) => {
+                const utilA = this.#computeProtoUtility(a);
+                const utilB = this.#computeProtoUtility(b);
+                const impA = a.importance || 0;
+                const impB = b.importance || 0;
+                return (utilB + 15 * impB) - (utilA + 15 * impA);
+            });
+
+            const take = Math.min(sorted.length, Math.round(this.#effectiveSemanticMax * 0.35));
+            candidateProtos.push(...sorted.slice(0, take));
+        }
+
+        if (candidateProtos.length === 0) return { memories: [] };
+
+        const minBroadcast = Math.round(this.#baseProtoCapacity * 3);
+        const maxBroadcast = Math.round(this.#baseProtoCapacity * (8 + 12 * this.#swarmIntelligenceFactor));
+        let numToBroadcast = Math.floor(Math.random() * (maxBroadcast - minBroadcast + 1)) + minBroadcast;
+        numToBroadcast = Math.min(numToBroadcast, candidateProtos.length);
+
+        for (let i = candidateProtos.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [candidateProtos[i], candidateProtos[j]] = [candidateProtos[j], candidateProtos[i]];
+        }
+        const selected = candidateProtos.slice(0, numToBroadcast);
+
+        const broadcastMemories = selected.map(p => ({
+            mean: Array.from(p.mean),
+            variance: Array.from(p.variance),
+            size: p.size,
+            accessCount: p.accessCount,
+            importance: p.importance || 0,
+            isCore: !!p.isCore
+        }));
+
+        return {
+            memories: broadcastMemories,
+            numDonors: topPerformers.length,
+            totalBroadcast: broadcastMemories.length,
+            compatibility: {
+                ensembleSize: this.#ensembleSize,
+                inputSize: this.#inputSize,
+                hiddenSize: this.#hiddenSize
+            }
+        };
+    }
+
+    translateMemory(received) {
+        if (!received || !Array.isArray(received.memories) || received.memories.length === 0) return;
+
+        const incomingProtos = received.memories.map(p => ({
+            mean: new Float32Array(p.mean),
+            variance: new Float32Array(p.variance),
+            size: p.size,
+            accessCount: p.accessCount,
+            importance: p.importance,
+            isCore: p.isCore
+        }));
+
+        const compositeScores = this.#performanceScores.map((perf, i) => {
+            const agree = this.#agreementScores[i] ?? 0.5;
+            const spec = this.#specializationScores[i] ?? 0.5;
+            return 0.45 * perf + 0.25 * agree + 0.3 * spec;
+        });
+
+        const rankedIndices = Array.from({ length: this.#ensembleSize }, (_, i) => i);
+        rankedIndices.sort((a, b) => compositeScores[b] - compositeScores[a]);
+
+        const minShare = Math.max(2, Math.round(this.#ensembleSize * 0.05));
+        const numReceivers = Math.max(minShare, Math.round(this.#ensembleSize * (0.2 + 0.4 * this.#swarmIntelligenceFactor)));
+        const receivers = rankedIndices.slice(-numReceivers);
+
+        const maxPerReceiver = Math.round(this.#baseProtoCapacity * (1 + 2.5 * this.#swarmIntelligenceFactor));
+        const protosPerReceiver = Math.ceil(incomingProtos.length / Math.max(1, receivers.length));
+
+        let protoOffset = 0;
+        for (const recIdx of receivers) {
+            const recPerf = this.#performanceScores[recIdx] ?? 0.5;
+
+            const noiseScale = 0.03 + 0.09 * (1 - recPerf);
+
+            const toAdd = [];
+            for (let i = 0; i < protosPerReceiver && protoOffset < incomingProtos.length; i++, protoOffset++) {
+                const p = incomingProtos[protoOffset];
+
+                const noisyMean = new Float32Array(p.mean);
+                for (let j = 0; j < this.#hiddenSize; j++) {
+                    noisyMean[j] += (Math.random() - 0.5) * 2 * noiseScale;
+                }
+
+                toAdd.push({
+                    mean: noisyMean,
+                    variance: new Float32Array(p.variance),
+                    size: Math.max(1, p.size * (0.2 + 0.7 * recPerf)),
+                    accessCount: p.accessCount * 0.7,
+                    projNorms: this.#computeProjNorms(noisyMean),
+                    isCore: p.isCore,
+                    importance: p.importance * 0.6
+                });
+            }
+
+            if (toAdd.length > 0) {
+                if (toAdd.length > maxPerReceiver) {
+                    toAdd.sort((a, b) => this.#computeProtoUtility(b) - this.#computeProtoUtility(a));
+                    toAdd.length = maxPerReceiver;
+                }
+                this.#updateSemanticProtos(recIdx, toAdd);
+            }
+        }
+    }
+
     predict (inputs) {
         if ( !Array.isArray(inputs) || inputs.length !== this.#inputSize || !inputs.every(isValidNumber) ) { return 0 }
 

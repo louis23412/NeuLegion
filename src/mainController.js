@@ -9,14 +9,14 @@ const cache = [];
 let candleCounter = 0;
 
 const CONFIG = {
-    cutoff: 1,
+    cutoff: null,
     baseProcessCount: 1,
     forceMin: true,
     maxWorkers: Math.max(1, Math.floor(availableParallelism() * 0.25)),
     file: path.join(import.meta.dirname, 'candles.jsonl'),
     stateFolder : path.join(import.meta.dirname, '..', 'state'),
 
-    dims: [4, 4, 4, 4],
+    dims: [2, 2, 4, 16],
 
     groupInputBoost: 0.15,
     sectionInputBoost: 0.25,
@@ -43,7 +43,9 @@ const CONFIG = {
     maxPriceMove: 0.05,
 
     scoreHistory : 100,
-    signalHistory : 100
+    signalHistory : 100,
+
+    memorySharingFreq : 20
 };
 
 let structureMap = Array.from({ length: CONFIG.dims[0] }, (_, group) =>
@@ -64,7 +66,8 @@ let structureMap = Array.from({ length: CONFIG.dims[0] }, (_, group) =>
                     lastSignal: {},
                     cont: 0,
                     scoreHistory : [],
-                    signalHistory : []
+                    signalHistory : [],
+                    memConnections : 0
                 };
             })
         )
@@ -176,6 +179,23 @@ const runWorker = async (controller) => {
 
     const recentCandles = cache.slice(-cacheSize);
 
+    const mainId = `${controller.group}${controller.section}${controller.layer}${controller.id}`;
+    const mainCompat = controller.lastSignal?.memoryBroadcast?.compatibility;
+
+    const peerSharedMem = structureMap.flat(3).filter((c) => {
+        const peerId = `${c.group}${c.section}${c.layer}${c.id}`;
+        const peerCompat = c.lastSignal?.memoryBroadcast?.compatibility;
+
+        if (
+            JSON.stringify(mainCompat ?? {}) === JSON.stringify(peerCompat ?? {}) &&
+            c.type === controller.type &&
+            mainId !== peerId
+        ) { return c }
+    })
+    .map(c => c.lastSignal?.memoryBroadcast ?? {});
+
+    controller.memConnections = peerSharedMem.length;
+
     return new Promise((resolve, reject) => {
         const worker = new Worker(new URL('./worker.js', import.meta.url), {
             workerData: {
@@ -193,7 +213,9 @@ const runWorker = async (controller) => {
                 },
                 inputMult,
                 processCount: CONFIG.baseProcessCount,
-                forceMin: CONFIG.forceMin
+                forceMin: CONFIG.forceMin,
+                memShareFreq : CONFIG.memorySharingFreq,
+                sharedMem : peerSharedMem
             },
         });
 
@@ -278,6 +300,8 @@ const processCandles = async () => {
             await processBatch();
             adjustAllControllers();
             await saveLegionState();
+
+            console.log('-------------------------------------------------------');
 
             if (candleCounter % CONFIG.cutoff === 0) {
                 console.log(`Done! Cutoff = ${candleCounter}`);
