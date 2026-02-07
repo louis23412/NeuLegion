@@ -6198,8 +6198,7 @@ class HiveMind {
         const rankedIndices = Array.from({ length: this.#ensembleSize }, (_, i) => i);
         rankedIndices.sort((a, b) => compositeScores[b] - compositeScores[a]);
 
-        const minShare = Math.max(2, Math.round(this.#ensembleSize * 0.05));
-        const numDonors = Math.max(minShare, Math.round(this.#ensembleSize * (0.2 + 0.4 * this.#swarmIntelligenceFactor)));
+        const numDonors = Math.min(this.#ensembleSize, 3 + Math.floor(3 * this.#swarmIntelligenceFactor));
         const topPerformers = rankedIndices.slice(0, numDonors);
 
         let candidateProtos = [];
@@ -6215,15 +6214,15 @@ class HiveMind {
                 return (utilB + 15 * impB) - (utilA + 15 * impA);
             });
 
-            const take = Math.min(sorted.length, Math.round(this.#effectiveSemanticMax * 0.35));
+            const take = Math.min(sorted.length, 2 + Math.floor(2 * this.#swarmIntelligenceFactor));
             candidateProtos.push(...sorted.slice(0, take));
         }
 
         if (candidateProtos.length === 0) return { memories: [] };
 
-        const minBroadcast = Math.round(this.#baseProtoCapacity * 3);
-        const maxBroadcast = Math.round(this.#baseProtoCapacity * (8 + 12 * this.#swarmIntelligenceFactor));
-        let numToBroadcast = Math.floor(Math.random() * (maxBroadcast - minBroadcast + 1)) + minBroadcast;
+        const minBroadcast = 3;
+        const maxBroadcast = 10 + Math.floor(8 * this.#swarmIntelligenceFactor);
+        let numToBroadcast = minBroadcast + Math.floor(Math.random() * (maxBroadcast - minBroadcast + 1));
         numToBroadcast = Math.min(numToBroadcast, candidateProtos.length);
 
         for (let i = candidateProtos.length - 1; i > 0; i--) {
@@ -6274,11 +6273,10 @@ class HiveMind {
         const rankedIndices = Array.from({ length: this.#ensembleSize }, (_, i) => i);
         rankedIndices.sort((a, b) => compositeScores[b] - compositeScores[a]);
 
-        const minShare = Math.max(2, Math.round(this.#ensembleSize * 0.05));
-        const numReceivers = Math.max(minShare, Math.round(this.#ensembleSize * (0.2 + 0.4 * this.#swarmIntelligenceFactor)));
+        const numReceivers = Math.min(this.#ensembleSize, 5 + Math.floor(5 * this.#swarmIntelligenceFactor));
         const receivers = rankedIndices.slice(-numReceivers);
 
-        const maxPerReceiver = Math.round(this.#baseProtoCapacity * (1 + 2.5 * this.#swarmIntelligenceFactor));
+        const maxPerReceiver = 5 + Math.floor(8 * this.#swarmIntelligenceFactor);
         const protosPerReceiver = Math.ceil(incomingProtos.length / Math.max(1, receivers.length));
 
         let protoOffset = 0;

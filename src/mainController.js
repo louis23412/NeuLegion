@@ -16,36 +16,25 @@ const CONFIG = {
     file: path.join(import.meta.dirname, 'candles.jsonl'),
     stateFolder : path.join(import.meta.dirname, '..', 'state'),
 
-    dims: [2, 2, 4, 16],
+    dims: [2, 2, 2, 4],
 
-    groupInputBoost: 0.15,
-    sectionInputBoost: 0.25,
-    layerInputBoost: 0.35,
-
+    basePop: 64,
     groupPopBoost: 0.05,
     sectionPopBoost: 0.15,
     layerPopBoost: 0.25,
 
+    baseCache: 500,
     groupCacheBoost: 0.15,
     sectionCacheBoost: 0.25,
     layerCacheBoost: 0.35,
 
+    baseAtr: 2,
+    baseStop: 1,
+    minPriceMove: 0.0025,
+    maxPriceMove: 0.05,
     groupPriceBoost: 0.05,
     sectionPriceBoost: 0.10,
-    layerPriceBoost: 0.15,
-
-    basePop: 64,
-    baseCache: 250,
-
-    baseAtr: 1.5,
-    baseStop: 0.75,
-    minPriceMove: 0.0021,
-    maxPriceMove: 0.05,
-
-    scoreHistory : 100,
-    signalHistory : 100,
-
-    memorySharingFreq : 20
+    layerPriceBoost: 0.15
 };
 
 let structureMap = Array.from({ length: CONFIG.dims[0] }, (_, group) =>
@@ -56,18 +45,18 @@ let structureMap = Array.from({ length: CONFIG.dims[0] }, (_, group) =>
                 const directoryPath = path.join(CONFIG.stateFolder, `Group${group}`, `Section${section}`, `Layer${layer}`, `G${group}S${section}L${layer}C${cluster}`);
 
                 return {
-                    id: cluster,
                     type: cluster < half ? 'positive' : 'negative',
                     directoryPath,
                     group,
                     section,
                     layer,
+                    id: cluster,
                     signalSpeed: 0,
+                    memConnections : 0,
                     lastSignal: {},
-                    cont: 0,
-                    scoreHistory : [],
                     signalHistory : [],
-                    memConnections : 0
+                    probHistory : [],
+                    scoreHistory : []
                 };
             })
         )
@@ -94,41 +83,14 @@ const getControllerParams = (group, section, layer) => {
     const layerPopFactor = 1 + CONFIG.layerPopBoost * reversedLayer;
     const popFactor = groupPopFactor * sectionPopFactor * layerPopFactor;
 
-    const inputMult = Number((CONFIG.groupInputBoost * group + CONFIG.sectionInputBoost * section + CONFIG.layerInputBoost * layer).toFixed(3));
-
     return {
         cacheSize: Math.round(CONFIG.baseCache * cacheFactor),
         atrFactor: Number((CONFIG.baseAtr * moneyFactor).toFixed(3)),
         stopFactor: Number((CONFIG.baseStop * moneyFactor).toFixed(3)),
         minPriceMovement: Number((CONFIG.minPriceMove * moneyFactor).toFixed(3)),
         maxPriceMovement: Number((CONFIG.maxPriceMove * moneyFactor).toFixed(3)),
-        inputMult,
         pop: Math.round(CONFIG.basePop * popFactor)
     };
-};
-
-const adjustAllControllers = () => {
-    const allControllers = structureMap.flat(3);
-
-    allControllers.forEach(controller => {
-        const params = getControllerParams(controller.group, controller.section, controller.layer);
-
-        const score = controller.lastSignal.score || 0;
-
-        const cacheBoost = params.cacheSize / CONFIG.baseCache;
-        const moneyBoost = params.atrFactor / CONFIG.baseAtr;
-        const inputBoost = 1 + params.inputMult;
-        const popBoost = CONFIG.basePop / params.pop;
-
-        const totalBoost = cacheBoost * moneyBoost * inputBoost * popBoost;
-
-        controller.cont = Number((score * totalBoost).toFixed(4));
-
-        controller.scoreHistory.push(score);
-        controller.signalHistory.push(controller.signalSpeed);
-        if (controller.scoreHistory.length > CONFIG.scoreHistory) controller.scoreHistory.shift();
-        if (controller.signalHistory.length > CONFIG.signalHistory) controller.signalHistory.shift();
-    });
 };
 
 const processBatch = async () => {
@@ -164,18 +126,27 @@ const processBatch = async () => {
         });
     }
 
-    const totalEnd = performance.now();
-    console.log(`Batch completed in ${((totalEnd - totalStart) / 1000).toFixed(3)} seconds`);
-
     for (const { controller, signal, duration } of results) {
         controller.lastSignal = signal;
+
         controller.signalSpeed = duration;
+        controller.signalHistory.push(duration);
+        if (controller.signalHistory.length > 100) controller.signalHistory.shift();
+
+        controller.probHistory.push(signal.prob);
+        if (controller.probHistory.length > 100) controller.probHistory.shift();
+
+        controller.scoreHistory.push(signal.score);
+        if (controller.scoreHistory.length > 100) controller.scoreHistory.shift();
     }
+
+    const totalEnd = performance.now();
+    console.log(`Batch completed in ${((totalEnd - totalStart) / 1000).toFixed(3)} seconds`);
 };
 
 const runWorker = async (controller) => {
     const params = getControllerParams(controller.group, controller.section, controller.layer);
-    const { cacheSize, atrFactor, stopFactor, minPriceMovement, maxPriceMovement, inputMult, pop } = params;
+    const { cacheSize, atrFactor, stopFactor, minPriceMovement, maxPriceMovement, pop } = params;
 
     const recentCandles = cache.slice(-cacheSize);
 
@@ -187,9 +158,10 @@ const runWorker = async (controller) => {
         const peerCompat = c.lastSignal?.memoryBroadcast?.compatibility;
 
         if (
-            JSON.stringify(mainCompat ?? {}) === JSON.stringify(peerCompat ?? {}) &&
+            mainCompat &&
+            mainId !== peerId &&
             c.type === controller.type &&
-            mainId !== peerId
+            JSON.stringify(mainCompat ?? {}) === JSON.stringify(peerCompat ?? {})
         ) { return c }
     })
     .map(c => c.lastSignal?.memoryBroadcast ?? {});
@@ -202,7 +174,7 @@ const runWorker = async (controller) => {
                 id: `G${controller.group}S${controller.section}L${controller.layer}C${controller.id}`,
                 directoryPath: controller.directoryPath,
                 cacheSize,
-                populationPerController: pop,
+                pop,
                 cache: recentCandles,
                 type: controller.type,
                 priceObj: {
@@ -211,10 +183,8 @@ const runWorker = async (controller) => {
                     minPriceMovement,
                     maxPriceMovement,
                 },
-                inputMult,
                 processCount: CONFIG.baseProcessCount,
                 forceMin: CONFIG.forceMin,
-                memShareFreq : CONFIG.memorySharingFreq,
                 sharedMem : peerSharedMem
             },
         });
@@ -298,7 +268,6 @@ const processCandles = async () => {
             if (candleCounter <= rebuildCounter) continue;
 
             await processBatch();
-            adjustAllControllers();
             await saveLegionState();
 
             console.log('-------------------------------------------------------');

@@ -21,7 +21,9 @@ class HiveMindController {
         losses : 0,
         total : 0,
         totalPoints : 0,
-        realPoints : 0
+        realPoints : 0,
+        memoriesSent : 0,
+        memoriesReceived : 0
     }
 
     #cacheSize;
@@ -35,9 +37,10 @@ class HiveMindController {
     #type;
     #forceMin;
     #shouldDumpState;
-    #memoryShareFrequency;
+    #memoryBroadcast = null;
+    #lastSaveStatus = null;
 
-    constructor ( id, dp, cs, es, type, priceObj, inputMult, forceMin = false, memoryShareFrequency ) {
+    constructor ( id, dp, cs, es, type, priceObj, forceMin = false ) {
         this.#controllerID = id;
 
         try {
@@ -51,11 +54,11 @@ class HiveMindController {
         this.#type = type;
         this.#cacheSize = cs;
         this.#ensembleSize = es;
-        this.#chooseDimension(this.#ensembleSize, inputMult);
+
+        this.#chooseDimension();
 
         this.#config = priceObj;
         this.#forceMin = forceMin;
-        this.#memoryShareFrequency = memoryShareFrequency;
 
         this.#indicators = new IndicatorProcessor();
         this.#db = new Database(path.join(this.#directoryPath, `hivemind_controller-${this.#type}-${this.#controllerID}.db`), { fileMustExist: false });
@@ -143,6 +146,16 @@ class HiveMindController {
         if(realPointsRaw) {
             this.#globalAccuracy.realPoints = realPointsRaw.value;
         }
+
+        const memSentRaw = selectStmt.get('memories_sent');
+        if (memSentRaw) {
+            this.#globalAccuracy.memoriesSent = memSentRaw.value;
+        }
+
+        const memReceivedRaw = selectStmt.get('memories_received');
+        if (memReceivedRaw) {
+            this.#globalAccuracy.memoriesReceived = memReceivedRaw.value;
+        }
     }
 
     #saveGlobalAccuracy () {
@@ -160,6 +173,8 @@ class HiveMindController {
             upsertStmt.run('total_trades', this.#globalAccuracy.total);
             upsertStmt.run('total_points', this.#globalAccuracy.totalPoints);
             upsertStmt.run('real_points', this.#globalAccuracy.realPoints);
+            upsertStmt.run('memories_sent', this.#globalAccuracy.memoriesSent);
+            upsertStmt.run('memories_received', this.#globalAccuracy.memoriesReceived);
         });
         transaction();
     }
@@ -309,33 +324,18 @@ class HiveMindController {
         return result;
     }
 
-    #chooseDimension (es, mult) {
-        const MIN_SIZE = Math.floor(10 + 10 * mult);
-        const MAX_SIZE = Math.floor(100 + 100 * mult);
-        let desiredSize = Math.max(MIN_SIZE, MAX_SIZE - Math.floor((es - 1) / 10));
+    #chooseDimension () {
+        const MIN_SIZE = 10;
+        const MAX_SIZE = Math.floor(this.#cacheSize * 0.25);
+        let desiredSize = Math.max(MIN_SIZE, MAX_SIZE);
 
-        const searchRange = 1;
-
-        const getBestFactoring = (size) => {
-            let bestMinv = 1;
-            let bestInd = 1;
-            let bestCand = size;
-            for (let i = 2; i <= 10; i++) {
-                if (size % i === 0) {
-                    const cand = size / i;
-                    const minv = Math.min(i, cand);
-                    if (minv > bestMinv || (minv === bestMinv && i > bestInd)) {
-                        bestMinv = minv;
-                        bestInd = i;
-                        bestCand = cand;
-                    }
-                }
-            }
-            return { minv: bestMinv, ind: bestInd, cand: bestCand };
-        };
+        const searchRange = 2;
+        const maxIndCap = 10;
+        const preferMoreIndicators = (this.#ensembleSize % 2 === 0);
 
         let bestMinv = -1;
         let bestDiff = Infinity;
+        let bestBalanceDiff = Infinity;
         let bestTarget = desiredSize;
         let bestInd = 1;
         let bestCand = desiredSize;
@@ -344,20 +344,59 @@ class HiveMindController {
             const candidate = desiredSize + offset;
             if (candidate < MIN_SIZE || candidate > MAX_SIZE) continue;
 
-            const current = getBestFactoring(candidate);
+            let localMinv = 1;
+            let localBalanceDiff = Infinity;
+            let localInd = 1;
+            let localCand = candidate;
+
+            for (let i = 2; i <= Math.min(maxIndCap, Math.floor(candidate / 2)); i++) {
+                if (candidate % i === 0) {
+                    const thisInd = i;
+                    const thisCand = candidate / i;
+                    const thisMinv = Math.min(thisInd, thisCand);
+                    const thisBalanceDiff = Math.abs(thisInd - thisCand);
+
+                    let update = false;
+                    if (thisMinv > localMinv) {
+                        update = true;
+                    } else if (thisMinv === localMinv) {
+                        if (thisBalanceDiff < localBalanceDiff) {
+                            update = true;
+                        } else if (thisBalanceDiff === localBalanceDiff) {
+                            if (preferMoreIndicators && thisInd > localInd) {
+                                update = true;
+                            } else if (!preferMoreIndicators && thisInd < localInd) {
+                                update = true;
+                            }
+                        }
+                    }
+
+                    if (update) {
+                        localMinv = thisMinv;
+                        localBalanceDiff = thisBalanceDiff;
+                        localInd = thisInd;
+                        localCand = thisCand;
+                    }
+                }
+            }
+
+            const minv = localMinv;
+            const currentBalanceDiff = localBalanceDiff;
+            const ind = localInd;
+            const cand = localCand;
             const currentDiff = Math.abs(offset);
 
             let update = false;
-            if (current.minv > bestMinv) {
+            if (minv > bestMinv) {
                 update = true;
-            } else if (current.minv === bestMinv) {
+            } else if (minv === bestMinv) {
                 if (currentDiff < bestDiff) {
                     update = true;
                 } else if (currentDiff === bestDiff) {
-                    if (current.ind > bestInd) {
+                    if (currentBalanceDiff < bestBalanceDiff) {
                         update = true;
-                    } else if (current.ind === bestInd) {
-                        if (current.cand > bestCand) {
+                    } else if (currentBalanceDiff === bestBalanceDiff) {
+                        if (candidate > bestTarget) {
                             update = true;
                         }
                     }
@@ -365,11 +404,12 @@ class HiveMindController {
             }
 
             if (update) {
-                bestMinv = current.minv;
+                bestMinv = minv;
                 bestDiff = currentDiff;
+                bestBalanceDiff = currentBalanceDiff;
                 bestTarget = candidate;
-                bestInd = current.ind;
-                bestCand = current.cand;
+                bestInd = ind;
+                bestCand = cand;
             }
         }
 
@@ -524,8 +564,6 @@ class HiveMindController {
                 deleteTradeStmt.run(trade.timestamp);
             })();
         }
-
-        this.#saveGlobalAccuracy();
     }
 
     getSignal (candles, processCount = 1, sharedMemories = []) {
@@ -588,17 +626,16 @@ class HiveMindController {
 
         this.#processClosedTrades(processCount);
 
-        let memoryBroadcast = {};
         if (this.#shouldDumpState && this.#hivemind) {
-            memoryBroadcast = this.#hivemind.broadcastMemory();
+            this.#memoryBroadcast = this.#hivemind.broadcastMemory();
+            this.#globalAccuracy.memoriesSent++;
 
-            if (this.#globalAccuracy.trainingSteps % this.#memoryShareFrequency === 0 && sharedMemories.length > 0) {
-                for (const mem of sharedMemories) {
-                    this.#hivemind.translateMemory(mem)
-                }
+            for (const mem of sharedMemories) {
+                this.#hivemind.translateMemory(mem);
+                this.#globalAccuracy.memoriesReceived++;
             }
 
-            this.#hivemind.dumpState();
+            this.#lastSaveStatus = this.#hivemind.dumpState();
         }
 
         const tradesStmt = this.#db.prepare(`SELECT timestamp FROM open_trades`);
@@ -616,14 +653,42 @@ class HiveMindController {
             finalScore = this.#globalAccuracy.trainingSteps > 0 ? Number(((tradeWinAcc + trueAcc) / 2).toFixed(3)) : 0;
         }
 
+        this.#saveGlobalAccuracy();
+
         return {
-            prob : prediction,
-            score : finalScore,
+            controllerId : this.#controllerID,
+            hiveConnection : this.#hivemind ? true : false,
+            lastSaveStatus : this.#lastSaveStatus ? this.#lastSaveStatus.status : this.#lastSaveStatus,
+
+            pop : this.#ensembleSize,
+            cache : this.#cacheSize,
+
+            inputSize : this.#inputSize,
+            candlesUsed : this.#trainingCandleSize,
+            indicatorsUsed : this.#trainingIndicators,
+
+            atrFactor : this.#config.atrFactor,
+            stopFactor : this.#config.stopFactor,
+            minPriceMovement : this.#config.minPriceMovement,
+            maxPriceMovement : this.#config.maxPriceMovement,
+
+            entryPrice,
+            sellPrice,
+            stopLoss,
+
             lastTrainingStep : this.#globalAccuracy.trainingSteps,
             skippedTraining : this.#globalAccuracy.skippedDuplicate,
             openSimulations,
             pendingClosedTrades,
-            memoryBroadcast
+
+            prob : prediction,
+            score : finalScore,
+            tradeAcc : tradeWinAcc,
+            trueAcc,
+
+            memoriesSent : this.#globalAccuracy.memoriesSent,
+            memoriesReceived : this.#globalAccuracy.memoriesReceived,
+            memoryBroadcast : this.#memoryBroadcast,
         };
     }
 }
