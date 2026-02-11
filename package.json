@@ -7,10 +7,9 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "train" : "node ./src/mainController.js"
+    "train": "node ./src/mainController.js"
   },
   "dependencies": {
-    "better-sqlite3": "^12.5.0"
-  },
-  "devDependencies": {}
+    "better-sqlite3": "^12.6.2"
+  }
 }

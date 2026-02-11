@@ -23,7 +23,8 @@ class HiveMindController {
         totalPoints : 0,
         realPoints : 0,
         memoriesSent : 0,
-        memoriesReceived : 0
+        memoriesReceived : 0,
+        vaultMemoriesReceived : 0
     }
 
     #cacheSize;
@@ -62,6 +63,10 @@ class HiveMindController {
 
         this.#indicators = new IndicatorProcessor();
         this.#db = new Database(path.join(this.#directoryPath, `hivemind_controller-${this.#type}-${this.#controllerID}.db`), { fileMustExist: false });
+        this.#db.pragma('journal_mode = WAL');
+        this.#db.pragma('synchronous = NORMAL');
+        this.#db.pragma('temp_store = MEMORY');
+        this.#db.pragma('cache_size = -32000');
 
         this.#initDatabase();
         this.#loadGlobalAccuracy();
@@ -156,6 +161,11 @@ class HiveMindController {
         if (memReceivedRaw) {
             this.#globalAccuracy.memoriesReceived = memReceivedRaw.value;
         }
+
+        const vaultMemReceivedRaw = selectStmt.get('vault_memories_received');
+        if (vaultMemReceivedRaw) {
+            this.#globalAccuracy.vaultMemoriesReceived = vaultMemReceivedRaw.value;
+        }
     }
 
     #saveGlobalAccuracy () {
@@ -175,6 +185,7 @@ class HiveMindController {
             upsertStmt.run('real_points', this.#globalAccuracy.realPoints);
             upsertStmt.run('memories_sent', this.#globalAccuracy.memoriesSent);
             upsertStmt.run('memories_received', this.#globalAccuracy.memoriesReceived);
+            upsertStmt.run('vault_memories_received', this.#globalAccuracy.vaultMemoriesReceived);
         });
         transaction();
     }
@@ -627,12 +638,13 @@ class HiveMindController {
         this.#processClosedTrades(processCount);
 
         if (this.#shouldDumpState && this.#hivemind) {
-            this.#memoryBroadcast = this.#hivemind.broadcastMemory();
-            this.#globalAccuracy.memoriesSent++;
+            this.#memoryBroadcast = this.#hivemind.broadcastMemory(features.flat());
+            this.#globalAccuracy.memoriesSent += this.#memoryBroadcast.totalBroadcast;
 
             for (const mem of sharedMemories) {
                 this.#hivemind.translateMemory(mem);
-                this.#globalAccuracy.memoriesReceived++;
+                this.#globalAccuracy.memoriesReceived += mem.totalBroadcast;
+                this.#globalAccuracy.vaultMemoriesReceived += mem.vaultMemories;
             }
 
             this.#lastSaveStatus = this.#hivemind.dumpState();
@@ -688,6 +700,7 @@ class HiveMindController {
 
             memoriesSent : this.#globalAccuracy.memoriesSent,
             memoriesReceived : this.#globalAccuracy.memoriesReceived,
+            vaultMemoriesReceived : this.#globalAccuracy.vaultMemoriesReceived,
             memoryBroadcast : this.#memoryBroadcast,
         };
     }
