@@ -17,14 +17,24 @@ class HiveMindController {
     #globalAccuracy = { 
         trainingSteps : 0, 
         skippedDuplicate : 0,
+
         wins : 0,
         losses : 0,
         total : 0,
         totalPoints : 0,
         realPoints : 0,
+
         memoriesSent : 0,
+        memoryCoresSent : 0,
+        memoryVolatileSent : 0,
+
         memoriesReceived : 0,
-        vaultMemoriesReceived : 0
+        memoryCoresReceived : 0,
+        memoryVolatileReceived : 0,
+
+        vaultMemoriesReceived : 0,
+        vaultMemoryCores : 0,
+        vaultMemoryVolatile : 0
     }
 
     #cacheSize;
@@ -166,6 +176,36 @@ class HiveMindController {
         if (vaultMemReceivedRaw) {
             this.#globalAccuracy.vaultMemoriesReceived = vaultMemReceivedRaw.value;
         }
+
+        const vaultMemCore = selectStmt.get('vault_memories_core');
+        if (vaultMemCore) {
+            this.#globalAccuracy.vaultMemoryCores = vaultMemCore.value;
+        }
+
+        const vaultMemVolatile = selectStmt.get('vault_memories_volatile');
+        if (vaultMemVolatile) {
+            this.#globalAccuracy.vaultMemoryVolatile = vaultMemVolatile.value;
+        }
+
+        const sentMemCore = selectStmt.get('sent_memories_core');
+        if (sentMemCore) {
+            this.#globalAccuracy.memoryCoresSent = sentMemCore.value;
+        }
+
+        const sentMemVolatile = selectStmt.get('sent_memories_volatile');
+        if (sentMemVolatile) {
+            this.#globalAccuracy.memoryVolatileSent = sentMemVolatile.value;
+        }
+
+        const receivedMemCore = selectStmt.get('received_memories_core');
+        if (receivedMemCore) {
+            this.#globalAccuracy.memoryCoresReceived = receivedMemCore.value;
+        }
+
+        const receivedMemVolatile = selectStmt.get('received_memories_volatile');
+        if (receivedMemVolatile) {
+            this.#globalAccuracy.memoryVolatileReceived = receivedMemVolatile.value;
+        }
     }
 
     #saveGlobalAccuracy () {
@@ -186,6 +226,12 @@ class HiveMindController {
             upsertStmt.run('memories_sent', this.#globalAccuracy.memoriesSent);
             upsertStmt.run('memories_received', this.#globalAccuracy.memoriesReceived);
             upsertStmt.run('vault_memories_received', this.#globalAccuracy.vaultMemoriesReceived);
+            upsertStmt.run('vault_memories_core', this.#globalAccuracy.vaultMemoryCores);
+            upsertStmt.run('vault_memories_volatile', this.#globalAccuracy.vaultMemoryVolatile);
+            upsertStmt.run('sent_memories_core', this.#globalAccuracy.memoryCoresSent);
+            upsertStmt.run('sent_memories_volatile', this.#globalAccuracy.memoryVolatileSent);
+            upsertStmt.run('received_memories_core', this.#globalAccuracy.memoryCoresReceived);
+            upsertStmt.run('received_memories_volatile', this.#globalAccuracy.memoryVolatileReceived);
         });
         transaction();
     }
@@ -641,10 +687,23 @@ class HiveMindController {
             this.#memoryBroadcast = this.#hivemind.broadcastMemory(features.flat());
             this.#globalAccuracy.memoriesSent += this.#memoryBroadcast.totalBroadcast;
 
+            const sentCore = this.#memoryBroadcast.memories.reduce((acc, mem) => mem.isCore ? acc + 1 : acc, 0);
+            this.#globalAccuracy.memoryCoresSent += sentCore;
+            this.#globalAccuracy.memoryVolatileSent += this.#memoryBroadcast.memories.length - sentCore;
+
             for (const mem of sharedMemories) {
                 this.#hivemind.translateMemory(mem);
+
                 this.#globalAccuracy.memoriesReceived += mem.totalBroadcast;
                 this.#globalAccuracy.vaultMemoriesReceived += mem.vaultMemories;
+
+                const receivedCore = mem.memories.reduce((acc, m) => m.isCore ? acc + 1 : acc, 0);
+                this.#globalAccuracy.memoryCoresReceived += receivedCore;
+                this.#globalAccuracy.memoryVolatileReceived += mem.memories.length - receivedCore;
+
+                const vaultCore = mem.vaultAccess.reduce((acc, m) => m.isCore ? acc + 1 : acc, 0);
+                this.#globalAccuracy.vaultMemoryCores += vaultCore;
+                this.#globalAccuracy.vaultMemoryVolatile += mem.vaultAccess.length - vaultCore;
             }
 
             this.#lastSaveStatus = this.#hivemind.dumpState();
@@ -699,8 +758,17 @@ class HiveMindController {
             trueAcc,
 
             memoriesSent : this.#globalAccuracy.memoriesSent,
+            memoryCoresSent : this.#globalAccuracy.memoryCoresSent,
+            memoryVolatileSent : this.#globalAccuracy.memoryVolatileSent,
+
             memoriesReceived : this.#globalAccuracy.memoriesReceived,
+            memoryCoresReceived : this.#globalAccuracy.memoryCoresReceived,
+            memoryVolatileReceived : this.#globalAccuracy.memoryVolatileReceived,
+
             vaultMemoriesReceived : this.#globalAccuracy.vaultMemoriesReceived,
+            vaultMemoryCores : this.#globalAccuracy.vaultMemoryCores,
+            vaultMemoryVolatile : this.#globalAccuracy.vaultMemoryVolatile,
+
             memoryBroadcast : this.#memoryBroadcast,
         };
     }
