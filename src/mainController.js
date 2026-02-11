@@ -394,6 +394,21 @@ const updateVolatileNeg = memoryDb.prepare(`
     WHERE protoId = ?
 `);
 
+const updateCorePos = memoryDb.prepare(`
+    UPDATE core_positive
+    SET mean = ?, variance = ?, size = ?, accessCount = ?, importance = ?, hash = ?, lastAccessed = ?, usageCount = ?, merged_count = ?
+    WHERE protoId = ?
+`);
+
+const updateCoreNeg = memoryDb.prepare(`
+    UPDATE core_negative
+    SET mean = ?, variance = ?, size = ?, accessCount = ?, importance = ?, hash = ?, lastAccessed = ?, usageCount = ?, merged_count = ?
+    WHERE protoId = ?
+`);
+
+const deleteFromCorePos = memoryDb.prepare('DELETE FROM core_positive WHERE protoId = ?');
+const deleteFromCoreNeg = memoryDb.prepare('DELETE FROM core_negative WHERE protoId = ?');
+
 const promoteToCorePos = memoryDb.prepare(`
     INSERT INTO core_positive
     (protoId, compat_id, mean, variance, size, accessCount, importance, hash, lastAccessed, usageCount, merged_count)
@@ -603,6 +618,82 @@ const consolidateVolatile = (compat_id, isPositive, currentBatch) => {
             );
             deleteStmt.run(mem.protoId);
         }
+    }
+};
+
+const consolidateCore = (compat_id, isPositive, currentBatch) => {
+    const coreTable = isPositive ? 'core_positive' : 'core_negative';
+    const updateStmt = isPositive ? updateCorePos : updateCoreNeg;
+    const deleteStmt = isPositive ? deleteFromCorePos : deleteFromCoreNeg;
+
+    const rows = memoryDb.prepare(`
+        SELECT protoId, mean, variance, size, accessCount, importance, hash, lastAccessed, usageCount, merged_count
+        FROM ${coreTable} WHERE compat_id = ? ORDER BY importance DESC, size DESC
+    `).all(compat_id);
+
+    if (rows.length < 2) return;
+
+    let mems = rows.map(r => ({
+        protoId: r.protoId,
+        mean: JSON.parse(r.mean),
+        variance: JSON.parse(r.variance),
+        size: r.size,
+        accessCount: r.accessCount,
+        importance: r.importance,
+        hash: r.hash,
+        lastAccessed: r.lastAccessed || 0,
+        usageCount: r.usageCount,
+        merged_count: r.merged_count || 1
+    }));
+
+    let i = 0;
+    while (i < mems.length - 1) {
+        let j = i + 1;
+        while (j < mems.length) {
+            const kl = computeSymKL(mems[i].mean, mems[i].variance, mems[j].mean, mems[j].variance);
+            if (kl < CONFIG.consolidationThreshold) {
+                const target = mems[i];
+                const source = mems[j];
+                const s1 = target.size;
+                const s2 = source.size;
+                const totalSize = s1 + s2;
+
+                const newMean = target.mean.map((m, k) => (s1 * m + s2 * source.mean[k]) / totalSize);
+                const newVariance = target.mean.map((_, k) => {
+                    const dm1 = target.mean[k] - newMean[k];
+                    const dm2 = source.mean[k] - newMean[k];
+                    return (s1 * (target.variance[k] + dm1 * dm1) + s2 * (source.variance[k] + dm2 * dm2)) / totalSize;
+                }).map(v => Math.max(v, 1e-8));
+
+                target.mean = newMean;
+                target.variance = newVariance;
+                target.size = totalSize;
+                target.accessCount = (s1 * target.accessCount + s2 * source.accessCount) / totalSize;
+                target.importance = (s1 * target.importance + s2 * source.importance) / totalSize;
+                target.usageCount += source.usageCount;
+                target.merged_count += source.merged_count;
+                target.lastAccessed = Math.max(target.lastAccessed, source.lastAccessed, currentBatch);
+                target.hash = target.hash || source.hash;
+
+                updateStmt.run(
+                    JSON.stringify(target.mean),
+                    JSON.stringify(target.variance),
+                    target.size,
+                    target.accessCount,
+                    target.importance,
+                    target.hash,
+                    target.lastAccessed,
+                    target.usageCount,
+                    target.merged_count,
+                    target.protoId
+                );
+                deleteStmt.run(source.protoId);
+                mems.splice(j, 1);
+            } else {
+                j++;
+            }
+        }
+        i++;
     }
 };
 
@@ -1092,10 +1183,16 @@ const processBatch = async () => {
     const { posIdMap, negIdMap } = storeNewMemories(results, currentBatch);
 
     for (const compat_id of Object.values(posIdMap)) {
-        if (compat_id) consolidateVolatile(compat_id, true, currentBatch);
+        if (compat_id) {
+            consolidateVolatile(compat_id, true, currentBatch);
+            consolidateCore(compat_id, true, currentBatch);
+        }
     }
     for (const compat_id of Object.values(negIdMap)) {
-        if (compat_id) consolidateVolatile(compat_id, false, currentBatch);
+        if (compat_id) {
+            consolidateVolatile(compat_id, false, currentBatch);
+            consolidateCore(compat_id, false, currentBatch);
+        }
     }
 
     const coreCapacity = Math.floor(CONFIG.memoryVaultCapacity * 0.25);
