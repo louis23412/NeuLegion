@@ -6,7 +6,7 @@ import { Worker } from 'node:worker_threads';
 import { performance } from 'node:perf_hooks';
 import { availableParallelism } from 'node:os';
 
-const cache = [];
+let cache = [];
 let structureMap;
 let candleCounter = 0;
 
@@ -150,10 +150,10 @@ memoryDb.exec(`
     CREATE INDEX IF NOT EXISTS idx_compat_vol_pos ON volatile_positive (compat_id);
     CREATE INDEX IF NOT EXISTS idx_compat_vol_neg ON volatile_negative (compat_id);
 
-    CREATE INDEX IF NOT EXISTS idx_purge_vol_pos ON volatile_positive (importance ASC, accessCount ASC, lastAccessed ASC, merged_count ASC, protoId ASC);
-    CREATE INDEX IF NOT EXISTS idx_purge_vol_neg ON volatile_negative (importance ASC, accessCount ASC, lastAccessed ASC, merged_count ASC, protoId ASC);
-    CREATE INDEX IF NOT EXISTS idx_purge_core_pos ON core_positive (importance ASC, accessCount ASC, lastAccessed ASC, merged_count ASC, protoId ASC);
-    CREATE INDEX IF NOT EXISTS idx_purge_core_neg ON core_negative (importance ASC, accessCount ASC, lastAccessed ASC, merged_count ASC, protoId ASC);
+    CREATE INDEX IF NOT EXISTS idx_purge_vol_pos ON volatile_positive (lastAccessed ASC, importance ASC, accessCount ASC, merged_count ASC, protoId ASC);
+    CREATE INDEX IF NOT EXISTS idx_purge_vol_neg ON volatile_negative (lastAccessed ASC, importance ASC, accessCount ASC, merged_count ASC, protoId ASC);
+    CREATE INDEX IF NOT EXISTS idx_purge_core_pos ON core_positive (lastAccessed ASC, importance ASC, accessCount ASC, merged_count ASC, protoId ASC);
+    CREATE INDEX IF NOT EXISTS idx_purge_core_neg ON core_negative (lastAccessed ASC, importance ASC, accessCount ASC, merged_count ASC, protoId ASC);
 `);
 
 const insertCompatPos = memoryDb.prepare('INSERT INTO compat_positive (compatibility) VALUES (?) ON CONFLICT(compatibility) DO NOTHING');
@@ -218,7 +218,7 @@ const purgeVolatilePos = memoryDb.prepare(`
     DELETE FROM volatile_positive
     WHERE protoId IN (
         SELECT protoId FROM volatile_positive
-        ORDER BY importance ASC, accessCount ASC, lastAccessed ASC, merged_count ASC, protoId ASC
+        ORDER BY lastAccessed ASC, importance ASC, accessCount ASC, merged_count ASC, protoId ASC
         LIMIT ?
     )
 `);
@@ -227,7 +227,7 @@ const purgeVolatileNeg = memoryDb.prepare(`
     DELETE FROM volatile_negative
     WHERE protoId IN (
         SELECT protoId FROM volatile_negative
-        ORDER BY importance ASC, accessCount ASC, lastAccessed ASC, merged_count ASC, protoId ASC
+        ORDER BY lastAccessed ASC, importance ASC, accessCount ASC, merged_count ASC, protoId ASC
         LIMIT ?
     )
 `);
@@ -236,7 +236,7 @@ const purgeCorePos = memoryDb.prepare(`
     DELETE FROM core_positive
     WHERE protoId IN (
         SELECT protoId FROM core_positive
-        ORDER BY importance ASC, accessCount ASC, lastAccessed ASC, merged_count ASC, protoId ASC
+        ORDER BY lastAccessed ASC, importance ASC, accessCount ASC, merged_count ASC, protoId ASC
         LIMIT ?
     )
 `);
@@ -245,7 +245,7 @@ const purgeCoreNeg = memoryDb.prepare(`
     DELETE FROM core_negative
     WHERE protoId IN (
         SELECT protoId FROM core_negative
-        ORDER BY importance ASC, accessCount ASC, lastAccessed ASC, merged_count ASC, protoId ASC
+        ORDER BY lastAccessed ASC, importance ASC, accessCount ASC, merged_count ASC, protoId ASC
         LIMIT ?
     )
 `);
@@ -310,45 +310,21 @@ const selectAllMemoriesNeg = memoryDb.prepare(`
     WHERE compat_id = ?
 `);
 
-const accessMemoryCorePos = memoryDb.prepare(`
-    UPDATE core_positive
-    SET accessCount = MAX(${CONFIG.memoryDecayFloor}, accessCount * ${1 / CONFIG.memoryDecayFactor}),
-        importance = MAX(${CONFIG.memoryDecayFloor}, importance * ${1 / CONFIG.memoryDecayFactor}),
-        size = MAX(${CONFIG.memoryDecayFloor}, size * ${1 / CONFIG.memoryDecayFactor}),
-        lastAccessed = ?,
-        usageCount = usageCount + 1
-    WHERE protoId = ?
-`);
+const accessMemoryCorePos = memoryDb.prepare(
+    'UPDATE core_positive SET lastAccessed = ?, usageCount = usageCount + 1 WHERE protoId = ?'
+);
 
-const accessMemoryVolPos = memoryDb.prepare(`
-    UPDATE volatile_positive
-    SET accessCount = MAX(${CONFIG.memoryDecayFloor}, accessCount * ${1 / CONFIG.memoryDecayFactor}),
-        importance = MAX(${CONFIG.memoryDecayFloor}, importance * ${1 / CONFIG.memoryDecayFactor}),
-        size = MAX(${CONFIG.memoryDecayFloor}, size * ${1 / CONFIG.memoryDecayFactor}),
-        lastAccessed = ?,
-        usageCount = usageCount + 1
-    WHERE protoId = ?
-`);
+const accessMemoryCoreNeg = memoryDb.prepare(
+    'UPDATE core_negative SET lastAccessed = ?, usageCount = usageCount + 1 WHERE protoId = ?'
+);
 
-const accessMemoryCoreNeg = memoryDb.prepare(`
-    UPDATE core_negative
-    SET accessCount = MAX(${CONFIG.memoryDecayFloor}, accessCount * ${1 / CONFIG.memoryDecayFactor}),
-        importance = MAX(${CONFIG.memoryDecayFloor}, importance * ${1 / CONFIG.memoryDecayFactor}),
-        size = MAX(${CONFIG.memoryDecayFloor}, size * ${1 / CONFIG.memoryDecayFactor}),
-        lastAccessed = ?,
-        usageCount = usageCount + 1
-    WHERE protoId = ?
-`);
+const accessMemoryVolPos = memoryDb.prepare(
+    'UPDATE volatile_positive SET lastAccessed = ?, usageCount = usageCount + 1 WHERE protoId = ?'
+);
 
-const accessMemoryVolNeg = memoryDb.prepare(`
-    UPDATE volatile_negative
-    SET accessCount = MAX(${CONFIG.memoryDecayFloor}, accessCount * ${1 / CONFIG.memoryDecayFactor}),
-        importance = MAX(${CONFIG.memoryDecayFloor}, importance * ${1 / CONFIG.memoryDecayFactor}),
-        size = MAX(${CONFIG.memoryDecayFloor}, size * ${1 / CONFIG.memoryDecayFactor}),
-        lastAccessed = ?,
-        usageCount = usageCount + 1
-    WHERE protoId = ?
-`);
+const accessMemoryVolNeg = memoryDb.prepare(
+    'UPDATE volatile_negative SET lastAccessed = ?, usageCount = usageCount + 1 WHERE protoId = ?'
+);
 
 const boostCorePos = memoryDb.prepare(`
     UPDATE core_positive
@@ -546,10 +522,22 @@ const consolidateVolatile = (compat_id, isPositive, currentBatch) => {
         accessCount: r.accessCount,
         importance: r.importance,
         hash: r.hash,
-        lastAccessed: r.lastAccessed || 0,
+        lastAccessed: r.lastAccessed || 0, 
         usageCount: r.usageCount,
         merged_count: r.merged_count || 1
     }));
+
+    mems.forEach(mem => {
+        const delta = currentBatch - mem.lastAccessed;
+        if (delta > 0) {
+            const multiplier = Math.pow(CONFIG.memoryDecayFactor, delta);
+            mem.size = Math.max(CONFIG.memoryDecayFloor, mem.size * multiplier);
+            mem.accessCount = Math.max(CONFIG.memoryDecayFloor, mem.accessCount * multiplier);
+            mem.importance = Math.max(CONFIG.memoryDecayFloor, mem.importance * multiplier);
+        }
+    });
+
+    mems.sort((a, b) => b.importance - a.importance || b.size - a.size);
 
     let i = 0;
     while (i < mems.length - 1) {
@@ -645,6 +633,18 @@ const consolidateCore = (compat_id, isPositive, currentBatch) => {
         usageCount: r.usageCount,
         merged_count: r.merged_count || 1
     }));
+
+    mems.forEach(mem => {
+        const delta = currentBatch - mem.lastAccessed;
+        if (delta > 0) {
+            const multiplier = Math.pow(CONFIG.memoryDecayFactor, delta);
+            mem.size = Math.max(CONFIG.memoryDecayFloor, mem.size * multiplier);
+            mem.accessCount = Math.max(CONFIG.memoryDecayFloor, mem.accessCount * multiplier);
+            mem.importance = Math.max(CONFIG.memoryDecayFloor, mem.importance * multiplier);
+        }
+    });
+
+    mems.sort((a, b) => b.importance - a.importance || b.size - a.size);
 
     let i = 0;
     while (i < mems.length - 1) {
@@ -1007,8 +1007,19 @@ const processBatch = async () => {
                 size: row.size,
                 accessCount: row.accessCount,
                 importance: row.importance,
-                contentHash: row.hash
+                contentHash: row.hash,
+                lastAccessed: row.lastAccessed || 0
             }));
+
+            vaultCandidates.forEach(cand => {
+                const delta = currentBatch - cand.lastAccessed;
+                if (delta > 0) {
+                    const multiplier = Math.pow(CONFIG.memoryDecayFactor, delta);
+                    cand.size = Math.max(CONFIG.memoryDecayFloor, cand.size * multiplier);
+                    cand.accessCount = Math.max(CONFIG.memoryDecayFloor, cand.accessCount * multiplier);
+                    cand.importance = Math.max(CONFIG.memoryDecayFloor, cand.importance * multiplier);
+                }
+            });
 
             if (vaultCandidates.length === 0) {
                 mb.vaultAccess = [];
@@ -1167,18 +1178,6 @@ const processBatch = async () => {
             }
         })();
     }
-
-    ['volatile_positive', 'volatile_negative', 'core_positive', 'core_negative' ].forEach((memGroup) => {
-        memoryDb.exec(`
-            UPDATE ${memGroup}
-            SET importance = MAX(${CONFIG.memoryDecayFloor},
-                    importance * (${CONFIG.memoryDecayFactor} + ${1 - CONFIG.memoryDecayFactor} * EXP(-(${currentBatch} - lastAccessed) / 100))),
-                accessCount = MAX(${CONFIG.memoryDecayFloor},
-                    accessCount * (${CONFIG.memoryDecayFactor} + ${1 - CONFIG.memoryDecayFactor} * EXP(-(${currentBatch} - lastAccessed) / 100))),
-                size = MAX(${CONFIG.memoryDecayFloor},
-                    size * (${CONFIG.memoryDecayFactor} + ${1 - CONFIG.memoryDecayFactor} * EXP(-(${currentBatch} - lastAccessed) / 100)))
-        `);
-    })
 
     const { posIdMap, negIdMap } = storeNewMemories(results, currentBatch);
 
@@ -1347,7 +1346,7 @@ const processCandles = async () => {
 
         cache.push(candle);
         if (cache.length > maxCache) {
-            cache.shift();
+            cache = cache.slice(-maxCache);
         }
 
         if (cache.length === maxCache) {
