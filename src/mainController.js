@@ -291,21 +291,21 @@ const upsertCounterStmt = db.prepare(`
 `);
 
 const selectAllMemoriesPos = memoryDb.prepare(`
-    SELECT 'core' AS source, protoId, mean, variance, size, accessCount, importance, hash
+    SELECT 'core' AS source, protoId, mean, variance, size, accessCount, importance, hash, lastAccessed
     FROM core_positive
     WHERE compat_id = ?
     UNION ALL
-    SELECT 'volatile' AS source, protoId, mean, variance, size, accessCount, importance, hash
+    SELECT 'volatile' AS source, protoId, mean, variance, size, accessCount, importance, hash, lastAccessed
     FROM volatile_positive
     WHERE compat_id = ?
 `);
 
 const selectAllMemoriesNeg = memoryDb.prepare(`
-    SELECT 'core' AS source, protoId, mean, variance, size, accessCount, importance, hash
+    SELECT 'core' AS source, protoId, mean, variance, size, accessCount, importance, hash, lastAccessed
     FROM core_negative
     WHERE compat_id = ?
     UNION ALL
-    SELECT 'volatile' AS source, protoId, mean, variance, size, accessCount, importance, hash
+    SELECT 'volatile' AS source, protoId, mean, variance, size, accessCount, importance, hash, lastAccessed
     FROM volatile_negative
     WHERE compat_id = ?
 `);
