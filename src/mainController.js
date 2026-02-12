@@ -46,8 +46,10 @@ const CONFIG = {
     consolidationPromoteCount: 25,
     coreCapacityRatio: 0.333,
     performanceBoostFactor: 1.075,
-    maxVaultCandidates: 5000,
-    memoryVaultCapacity: 5000000
+    maxVaultCandidates: 10000,
+    memoryVaultCapacity: 5000000,
+    volatileConsolidationLimit: 1500,
+    coreConsolidationLimit: 600
 };
 
 fs.existsSync(path.join(CONFIG.stateFolder, 'main')) ? null : fs.mkdirSync(path.join(CONFIG.stateFolder, 'main'), { recursive: true });
@@ -159,6 +161,11 @@ memoryDb.exec(`
     CREATE INDEX IF NOT EXISTS idx_purge_vol_neg ON volatile_negative (lastAccessed ASC, importance ASC, accessCount ASC, merged_count ASC, protoId ASC);
     CREATE INDEX IF NOT EXISTS idx_purge_core_pos ON core_positive (lastAccessed ASC, importance ASC, accessCount ASC, merged_count ASC, protoId ASC);
     CREATE INDEX IF NOT EXISTS idx_purge_core_neg ON core_negative (lastAccessed ASC, importance ASC, accessCount ASC, merged_count ASC, protoId ASC);
+
+    CREATE INDEX IF NOT EXISTS idx_top_core_pos ON core_positive (compat_id, importance DESC, accessCount DESC, lastAccessed DESC);
+    CREATE INDEX IF NOT EXISTS idx_top_core_neg ON core_negative (compat_id, importance DESC, accessCount DESC, lastAccessed DESC);
+    CREATE INDEX IF NOT EXISTS idx_top_vol_pos ON volatile_positive (compat_id, importance DESC, accessCount DESC, lastAccessed DESC);
+    CREATE INDEX IF NOT EXISTS idx_top_vol_neg ON volatile_negative (compat_id, importance DESC, accessCount DESC, lastAccessed DESC);
 `);
 
 const insertCompatPos = memoryDb.prepare('INSERT INTO compat_positive (compatibility) VALUES (?) ON CONFLICT(compatibility) DO NOTHING');
@@ -555,8 +562,11 @@ const consolidateVolatile = (compat_id, isPositive, currentBatch) => {
 
     const rows = memoryDb.prepare(`
         SELECT protoId, mean, variance, size, accessCount, importance, hash, lastAccessed, usageCount, merged_count
-        FROM ${volTable} WHERE compat_id = ? ORDER BY importance DESC, size DESC
-    `).all(compat_id);
+        FROM ${volTable} 
+        WHERE compat_id = ?
+        ORDER BY importance DESC, accessCount DESC, lastAccessed DESC
+        LIMIT ?
+    `).all(compat_id, CONFIG.volatileConsolidationLimit);
 
     if (rows.length < 2) return;
 
@@ -568,7 +578,7 @@ const consolidateVolatile = (compat_id, isPositive, currentBatch) => {
         accessCount: r.accessCount,
         importance: r.importance,
         hash: r.hash,
-        lastAccessed: r.lastAccessed || 0, 
+        lastAccessed: r.lastAccessed,
         usageCount: r.usageCount,
         merged_count: r.merged_count || 1
     }));
@@ -662,8 +672,11 @@ const consolidateCore = (compat_id, isPositive, currentBatch) => {
 
     const rows = memoryDb.prepare(`
         SELECT protoId, mean, variance, size, accessCount, importance, hash, lastAccessed, usageCount, merged_count
-        FROM ${coreTable} WHERE compat_id = ? ORDER BY importance DESC, size DESC
-    `).all(compat_id);
+        FROM ${coreTable} 
+        WHERE compat_id = ?
+        ORDER BY importance DESC, accessCount DESC, lastAccessed DESC
+        LIMIT ?
+    `).all(compat_id, CONFIG.coreConsolidationLimit);
 
     if (rows.length < 2) return;
 
@@ -675,7 +688,7 @@ const consolidateCore = (compat_id, isPositive, currentBatch) => {
         accessCount: r.accessCount,
         importance: r.importance,
         hash: r.hash,
-        lastAccessed: r.lastAccessed || 0,
+        lastAccessed: r.lastAccessed,
         usageCount: r.usageCount,
         merged_count: r.merged_count || 1
     }));
@@ -1055,8 +1068,19 @@ const processBatch = async () => {
             } else if (totalCount <= CONFIG.maxVaultCandidates) {
                 rows = selectAll.all(compat_id, compat_id);
             } else {
-                const limitCore = Math.floor(CONFIG.maxVaultCandidates * 0.5);
-                const limitVol = CONFIG.maxVaultCandidates - limitCore;
+                const coreBias = 0.7;
+                let limitCore = Math.round(CONFIG.maxVaultCandidates * coreBias);
+                let limitVol = CONFIG.maxVaultCandidates - limitCore;
+
+                limitCore = Math.min(limitCore, countCore || 0);
+                limitVol = Math.min(limitVol, countVol || 0);
+
+                if (countVol > 0 && limitVol < 100) {
+                    const add = 100 - limitVol;
+                    limitVol = 100;
+                    limitCore = Math.max(0, limitCore - add);
+                }
+
                 const coreRows = selectTopCore.all(compat_id, limitCore);
                 const volRows = selectTopVol.all(compat_id, limitVol);
                 rows = [...coreRows, ...volRows];
