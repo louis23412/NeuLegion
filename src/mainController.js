@@ -38,10 +38,15 @@ const CONFIG = {
     sectionPriceBoost: 0.10,
     layerPriceBoost: 0.15,
 
-    memoryDecayFactor : 0.999,
-    memoryDecayFloor : 1,
-    consolidationThreshold: 0.05,
+    volatileMemoryDecayFactor: 0.999,
+    coreMemoryDecayFactor: 0.9995,
+    memoryDecayFloor: 1,
+    volatileConsolidationThreshold: 0.08,
+    coreConsolidationThreshold: 0.04,
     consolidationPromoteCount: 25,
+    coreCapacityRatio: 0.333,
+    performanceBoostFactor: 1.075,
+    maxVaultCandidates: 5000,
     memoryVaultCapacity: 5000000
 };
 
@@ -255,6 +260,43 @@ const countCoreNeg = memoryDb.prepare('SELECT COUNT(*) FROM core_negative').pluc
 const countVolPos = memoryDb.prepare('SELECT COUNT(*) FROM volatile_positive').pluck();
 const countVolNeg = memoryDb.prepare('SELECT COUNT(*) FROM volatile_negative').pluck();
 
+const getCountCorePos = memoryDb.prepare('SELECT COUNT(*) FROM core_positive WHERE compat_id = ?').pluck();
+const getCountCoreNeg = memoryDb.prepare('SELECT COUNT(*) FROM core_negative WHERE compat_id = ?').pluck();
+const getCountVolPos = memoryDb.prepare('SELECT COUNT(*) FROM volatile_positive WHERE compat_id = ?').pluck();
+const getCountVolNeg = memoryDb.prepare('SELECT COUNT(*) FROM volatile_negative WHERE compat_id = ?').pluck();
+
+const selectTopCorePos = memoryDb.prepare(`
+    SELECT 'core' AS source, protoId, mean, variance, size, accessCount, importance, hash, lastAccessed
+    FROM core_positive
+    WHERE compat_id = ?
+    ORDER BY importance DESC, accessCount DESC, lastAccessed DESC
+    LIMIT ?
+`);
+
+const selectTopCoreNeg = memoryDb.prepare(`
+    SELECT 'core' AS source, protoId, mean, variance, size, accessCount, importance, hash, lastAccessed
+    FROM core_negative
+    WHERE compat_id = ?
+    ORDER BY importance DESC, accessCount DESC, lastAccessed DESC
+    LIMIT ?
+`);
+
+const selectTopVolPos = memoryDb.prepare(`
+    SELECT 'volatile' AS source, protoId, mean, variance, size, accessCount, importance, hash, lastAccessed
+    FROM volatile_positive
+    WHERE compat_id = ?
+    ORDER BY importance DESC, accessCount DESC, lastAccessed DESC
+    LIMIT ?
+`);
+
+const selectTopVolNeg = memoryDb.prepare(`
+    SELECT 'volatile' AS source, protoId, mean, variance, size, accessCount, importance, hash, lastAccessed
+    FROM volatile_negative
+    WHERE compat_id = ?
+    ORDER BY importance DESC, accessCount DESC, lastAccessed DESC
+    LIMIT ?
+`);
+
 const updateLastCorePos = memoryDb.prepare(
     'UPDATE core_positive SET lastAccessed = ? WHERE protoId = ?'
 );
@@ -330,6 +372,7 @@ const boostCorePos = memoryDb.prepare(`
     UPDATE core_positive
     SET importance = importance * ?,
         accessCount = accessCount * ?,
+        size = size * ?,
         lastAccessed = ?
     WHERE protoId = ?
 `);
@@ -338,6 +381,7 @@ const boostCoreNeg = memoryDb.prepare(`
     UPDATE core_negative
     SET importance = importance * ?,
         accessCount = accessCount * ?,
+        size = size * ?,
         lastAccessed = ?
     WHERE protoId = ?
 `);
@@ -346,6 +390,7 @@ const boostVolatilePos = memoryDb.prepare(`
     UPDATE volatile_positive
     SET importance = importance * ?,
         accessCount = accessCount * ?,
+        size = size * ?,
         lastAccessed = ?
     WHERE protoId = ?
 `);
@@ -354,6 +399,7 @@ const boostVolatileNeg = memoryDb.prepare(`
     UPDATE volatile_negative
     SET importance = importance * ?,
         accessCount = accessCount * ?,
+        size = size * ?,
         lastAccessed = ?
     WHERE protoId = ?
 `);
@@ -530,7 +576,7 @@ const consolidateVolatile = (compat_id, isPositive, currentBatch) => {
     mems.forEach(mem => {
         const delta = currentBatch - mem.lastAccessed;
         if (delta > 0) {
-            const multiplier = Math.pow(CONFIG.memoryDecayFactor, delta);
+            const multiplier = Math.pow(CONFIG.volatileMemoryDecayFactor, delta);
             mem.size = Math.max(CONFIG.memoryDecayFloor, mem.size * multiplier);
             mem.accessCount = Math.max(CONFIG.memoryDecayFloor, mem.accessCount * multiplier);
             mem.importance = Math.max(CONFIG.memoryDecayFloor, mem.importance * multiplier);
@@ -544,7 +590,7 @@ const consolidateVolatile = (compat_id, isPositive, currentBatch) => {
         let j = i + 1;
         while (j < mems.length) {
             const kl = computeSymKL(mems[i].mean, mems[i].variance, mems[j].mean, mems[j].variance);
-            if (kl < CONFIG.consolidationThreshold) {
+            if (kl < CONFIG.volatileConsolidationThreshold) {
                 const target = mems[i];
                 const source = mems[j];
                 const s1 = target.size;
@@ -637,7 +683,7 @@ const consolidateCore = (compat_id, isPositive, currentBatch) => {
     mems.forEach(mem => {
         const delta = currentBatch - mem.lastAccessed;
         if (delta > 0) {
-            const multiplier = Math.pow(CONFIG.memoryDecayFactor, delta);
+            const multiplier = Math.pow(CONFIG.coreMemoryDecayFactor, delta);
             mem.size = Math.max(CONFIG.memoryDecayFloor, mem.size * multiplier);
             mem.accessCount = Math.max(CONFIG.memoryDecayFloor, mem.accessCount * multiplier);
             mem.importance = Math.max(CONFIG.memoryDecayFloor, mem.importance * multiplier);
@@ -651,7 +697,7 @@ const consolidateCore = (compat_id, isPositive, currentBatch) => {
         let j = i + 1;
         while (j < mems.length) {
             const kl = computeSymKL(mems[i].mean, mems[i].variance, mems[j].mean, mems[j].variance);
-            if (kl < CONFIG.consolidationThreshold) {
+            if (kl < CONFIG.coreConsolidationThreshold) {
                 const target = mems[i];
                 const source = mems[j];
                 const s1 = target.size;
@@ -990,13 +1036,30 @@ const processBatch = async () => {
             }
 
             const compat_id = compatRow.id;
-            const selectStmt = isPositive ? selectAllMemoriesPos : selectAllMemoriesNeg;
-            const rows = selectStmt.all(compat_id, compat_id);
 
-            if (rows.length === 0) {
+            const getCountCore = isPositive ? getCountCorePos : getCountCoreNeg;
+            const getCountVol = isPositive ? getCountVolPos : getCountVolNeg;
+            const selectAll = isPositive ? selectAllMemoriesPos : selectAllMemoriesNeg;
+            const selectTopCore = isPositive ? selectTopCorePos : selectTopCoreNeg;
+            const selectTopVol = isPositive ? selectTopVolPos : selectTopVolNeg;
+
+            const countCore = getCountCore.get(compat_id) || 0;
+            const countVol = getCountVol.get(compat_id) || 0;
+            const totalCount = countCore + countVol;
+
+            let rows;
+            if (totalCount === 0) {
                 mb.vaultAccess = [];
                 mb.vaultMemories = 0;
                 continue;
+            } else if (totalCount <= CONFIG.maxVaultCandidates) {
+                rows = selectAll.all(compat_id, compat_id);
+            } else {
+                const limitCore = Math.floor(CONFIG.maxVaultCandidates * 0.5);
+                const limitVol = CONFIG.maxVaultCandidates - limitCore;
+                const coreRows = selectTopCore.all(compat_id, limitCore);
+                const volRows = selectTopVol.all(compat_id, limitVol);
+                rows = [...coreRows, ...volRows];
             }
 
             let vaultCandidates = rows.map(row => ({
@@ -1013,12 +1076,16 @@ const processBatch = async () => {
 
             vaultCandidates.forEach(cand => {
                 const delta = currentBatch - cand.lastAccessed;
-                if (delta > 0) {
-                    const multiplier = Math.pow(CONFIG.memoryDecayFactor, delta);
-                    cand.size = Math.max(CONFIG.memoryDecayFloor, cand.size * multiplier);
-                    cand.accessCount = Math.max(CONFIG.memoryDecayFloor, cand.accessCount * multiplier);
-                    cand.importance = Math.max(CONFIG.memoryDecayFloor, cand.importance * multiplier);
+                if (delta <= 0) {
+                    cand.decayMultiplier = 1;
+                    return;
                 }
+                const decayFactor = cand.source === 'core' ? CONFIG.coreMemoryDecayFactor : CONFIG.volatileMemoryDecayFactor;
+                const multiplier = Math.pow(decayFactor, delta);
+                cand.decayMultiplier = multiplier;
+                cand.size = Math.max(CONFIG.memoryDecayFloor, cand.size * multiplier);
+                cand.accessCount = Math.max(CONFIG.memoryDecayFloor, cand.accessCount * multiplier);
+                cand.importance = Math.max(CONFIG.memoryDecayFloor, cand.importance * multiplier);
             });
 
             if (vaultCandidates.length === 0) {
@@ -1123,9 +1190,9 @@ const processBatch = async () => {
                     protoId: selected.protoId,
                     mean: selected.mean,
                     variance: selected.variance,
-                    size: Math.max(CONFIG.memoryDecayFloor, selected.size * 1 / CONFIG.memoryDecayFactor),
-                    accessCount: Math.max(CONFIG.memoryDecayFloor, selected.accessCount * 1 / CONFIG.memoryDecayFactor),
-                    importance: Math.max(CONFIG.memoryDecayFloor, selected.importance * 1 / CONFIG.memoryDecayFactor),
+                    size: Math.max(CONFIG.memoryDecayFloor, selected.size / selected.decayMultiplier),
+                    accessCount: Math.max(CONFIG.memoryDecayFloor, selected.accessCount / selected.decayMultiplier),
+                    importance: Math.max(CONFIG.memoryDecayFloor, selected.importance / selected.decayMultiplier),
                     contentHash: selected.contentHash,
                     isCore: selected.source === 'core'
                 });
@@ -1160,7 +1227,7 @@ const processBatch = async () => {
         const topCount = Math.max(1, Math.ceil(performing.length * 0.3));
         const threshold = performing[topCount - 1].avgScore;
 
-        const boostFactor = 1.05;
+        const boostFactor = CONFIG.performanceBoostFactor;
 
         memoryDb.transaction(() => {
             for (const p of performing) {
@@ -1173,7 +1240,7 @@ const processBatch = async () => {
                         ? (isPositive ? boostCorePos : boostCoreNeg)
                         : (isPositive ? boostVolatilePos : boostVolatileNeg);
 
-                    stmt.run(boostFactor, boostFactor, currentBatch, mem.protoId);
+                    stmt.run(boostFactor, boostFactor, boostFactor, currentBatch, mem.protoId);
                 }
             }
         })();
@@ -1194,7 +1261,7 @@ const processBatch = async () => {
         }
     }
 
-    const coreCapacity = Math.floor(CONFIG.memoryVaultCapacity * 0.25);
+    const coreCapacity = Math.floor(CONFIG.memoryVaultCapacity * CONFIG.coreCapacityRatio);
 
     const corePosCount = countCorePos.get();
     const coreNegCount = countCoreNeg.get();
