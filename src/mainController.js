@@ -49,7 +49,10 @@ const CONFIG = {
     maxVaultCandidates: 10000,
     memoryVaultCapacity: 5000000,
     volatileConsolidationLimit: 1500,
-    coreConsolidationLimit: 600
+    coreConsolidationLimit: 600,
+
+    coreHierarchyThreshold: 0.12,
+    volatileHierarchyThreshold: 0.20
 };
 
 fs.existsSync(path.join(CONFIG.stateFolder, 'main')) ? null : fs.mkdirSync(path.join(CONFIG.stateFolder, 'main'), { recursive: true });
@@ -110,7 +113,8 @@ memoryDb.exec(`
         hash TEXT NOT NULL,
         lastAccessed INTEGER DEFAULT 0,
         usageCount INTEGER NOT NULL DEFAULT 0,
-        merged_count INTEGER NOT NULL DEFAULT 1
+        merged_count INTEGER NOT NULL DEFAULT 1,
+        parent_proto TEXT
     );
     CREATE TABLE IF NOT EXISTS core_negative (
         protoId TEXT PRIMARY KEY,
@@ -123,7 +127,8 @@ memoryDb.exec(`
         hash TEXT NOT NULL,
         lastAccessed INTEGER DEFAULT 0,
         usageCount INTEGER NOT NULL DEFAULT 0,
-        merged_count INTEGER NOT NULL DEFAULT 1
+        merged_count INTEGER NOT NULL DEFAULT 1,
+        parent_proto TEXT
     );
     CREATE TABLE IF NOT EXISTS volatile_positive (
         protoId TEXT PRIMARY KEY,
@@ -136,7 +141,8 @@ memoryDb.exec(`
         hash TEXT NOT NULL,
         lastAccessed INTEGER DEFAULT 0,
         usageCount INTEGER NOT NULL DEFAULT 0,
-        merged_count INTEGER NOT NULL DEFAULT 1
+        merged_count INTEGER NOT NULL DEFAULT 1,
+        parent_proto TEXT
     );
     CREATE TABLE IF NOT EXISTS volatile_negative (
         protoId TEXT PRIMARY KEY,
@@ -149,7 +155,8 @@ memoryDb.exec(`
         hash TEXT NOT NULL,
         lastAccessed INTEGER DEFAULT 0,
         usageCount INTEGER NOT NULL DEFAULT 0,
-        merged_count INTEGER NOT NULL DEFAULT 1
+        merged_count INTEGER NOT NULL DEFAULT 1,
+        parent_proto TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_compat_core_pos ON core_positive (compat_id);
@@ -450,6 +457,26 @@ const promoteToCoreNeg = memoryDb.prepare(`
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
+const clearParentCorePos = memoryDb.prepare('UPDATE core_positive SET parent_proto = NULL WHERE compat_id = ?');
+const clearParentCoreNeg = memoryDb.prepare('UPDATE core_negative SET parent_proto = NULL WHERE compat_id = ?');
+const clearParentVolPos = memoryDb.prepare('UPDATE volatile_positive SET parent_proto = NULL WHERE compat_id = ?');
+const clearParentVolNeg = memoryDb.prepare('UPDATE volatile_negative SET parent_proto = NULL WHERE compat_id = ?');
+
+const updateParentCorePos = memoryDb.prepare('UPDATE core_positive SET parent_proto = ?, lastAccessed = ? WHERE protoId = ?');
+const updateParentCoreNeg = memoryDb.prepare('UPDATE core_negative SET parent_proto = ?, lastAccessed = ? WHERE protoId = ?');
+const updateParentVolPos = memoryDb.prepare('UPDATE volatile_positive SET parent_proto = ?, lastAccessed = ? WHERE protoId = ?');
+const updateParentVolNeg = memoryDb.prepare('UPDATE volatile_negative SET parent_proto = ?, lastAccessed = ? WHERE protoId = ?');
+
+const getParentIdCorePos = memoryDb.prepare('SELECT parent_proto FROM core_positive WHERE protoId = ?').pluck();
+const getParentIdCoreNeg = memoryDb.prepare('SELECT parent_proto FROM core_negative WHERE protoId = ?').pluck();
+const getParentIdVolPos = memoryDb.prepare('SELECT parent_proto FROM volatile_positive WHERE protoId = ?').pluck();
+const getParentIdVolNeg = memoryDb.prepare('SELECT parent_proto FROM volatile_negative WHERE protoId = ?').pluck();
+
+const selectMemCorePos = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash FROM core_positive WHERE protoId = ?');
+const selectMemCoreNeg = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash FROM core_negative WHERE protoId = ?');
+const selectMemVolPos = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash FROM volatile_positive WHERE protoId = ?');
+const selectMemVolNeg = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash FROM volatile_negative WHERE protoId = ?');
+
 const canonicalJSON = (obj) => {
     if (obj === null || typeof obj !== 'object') {
         return JSON.stringify(obj);
@@ -521,6 +548,76 @@ const buildFreshStructure = () => {
     });
 
     return legionStructure;
+};
+
+const buildPrototypeHierarchy = (compat_id, isPositive, memType, currentBatch) => {
+    if (!compat_id) return;
+
+    const threshold = memType === 'core' ? CONFIG.coreHierarchyThreshold : CONFIG.volatileHierarchyThreshold;
+    const decayFactor = memType === 'core' ? CONFIG.coreMemoryDecayFactor : CONFIG.volatileMemoryDecayFactor;
+
+    const table = memType === 'core'
+        ? (isPositive ? 'core_positive' : 'core_negative')
+        : (isPositive ? 'volatile_positive' : 'volatile_negative');
+
+    const clearStmt = memType === 'core'
+        ? (isPositive ? clearParentCorePos : clearParentCoreNeg)
+        : (isPositive ? clearParentVolPos : clearParentVolNeg);
+
+    clearStmt.run(compat_id);
+
+    const rows = memoryDb.prepare(
+        `SELECT protoId, mean, variance, size, accessCount, importance, hash, lastAccessed 
+         FROM ${table} 
+         WHERE compat_id = ?`
+    ).all(compat_id);
+
+    if (rows.length < 2) return;
+
+    let protos = rows.map(r => ({
+        protoId: r.protoId,
+        mean: JSON.parse(r.mean),
+        variance: JSON.parse(r.variance),
+        size: r.size,
+        accessCount: r.accessCount,
+        importance: r.importance,
+        hash: r.hash,
+        lastAccessed: r.lastAccessed
+    }));
+
+    protos.forEach(p => {
+        const delta = currentBatch - p.lastAccessed;
+        if (delta > 0) {
+            const mult = Math.pow(decayFactor, delta);
+            p.size = Math.max(CONFIG.memoryDecayFloor, p.size * mult);
+            p.accessCount = Math.max(CONFIG.memoryDecayFloor, p.accessCount * mult);
+            p.importance = Math.max(CONFIG.memoryDecayFloor, p.importance * mult);
+        }
+    });
+
+    protos.sort((a, b) => (b.size * b.importance) - (a.size * a.importance));
+
+    const updateStmt = memType === 'core'
+        ? (isPositive ? updateParentCorePos : updateParentCoreNeg)
+        : (isPositive ? updateParentVolPos : updateParentVolNeg);
+
+    for (let i = 1; i < protos.length; i++) {
+        const child = protos[i];
+        let bestKL = Infinity;
+        let bestParentId = null;
+
+        for (let j = 0; j < i; j++) {
+            const kl = computeSymKL(child.mean, child.variance, protos[j].mean, protos[j].variance);
+            if (kl < bestKL) {
+                bestKL = kl;
+                bestParentId = protos[j].protoId;
+            }
+        }
+
+        if (bestParentId && bestKL < threshold) {
+            updateStmt.run(bestParentId, currentBatch, child.protoId);
+        }
+    }
 };
 
 const getControllerParams = (group, section, layer) => {
@@ -1222,6 +1319,54 @@ const processBatch = async () => {
                 });
             }
 
+            const additionalVault = [];
+            const seenProtoIds = new Set(selectedVault.map(m => m.protoId));
+            const isPos = controller.type === 'positive';
+
+            const getParentIdStmt = (isCore) => isCore
+                ? (isPos ? getParentIdCorePos : getParentIdCoreNeg)
+                : (isPos ? getParentIdVolPos : getParentIdVolNeg);
+
+            const selectMemStmt = (isCore) => isCore
+                ? (isPos ? selectMemCorePos : selectMemCoreNeg)
+                : (isPos ? selectMemVolPos : selectMemVolNeg);
+
+            const accessStmt = (isCore) => isCore
+                ? (isPos ? accessMemoryCorePos : accessMemoryCoreNeg)
+                : (isPos ? accessMemoryVolPos : accessMemoryVolNeg);
+
+            for (const sel of selectedVault) {
+                let currentId = getParentIdStmt(sel.isCore).get(sel.protoId);
+                let depth = 0;
+
+                while (currentId && depth < 5 && !seenProtoIds.has(currentId)) {
+                    const row = selectMemStmt(sel.isCore).get(currentId);
+                    if (!row) break;
+
+                    accessStmt(sel.isCore).run(currentBatch, currentId);
+
+                    const boostedSize = row.size * CONFIG.performanceBoostFactor;
+                    const boostedAccess = row.accessCount * CONFIG.performanceBoostFactor;
+                    const boostedImportance = row.importance * CONFIG.performanceBoostFactor;
+
+                    additionalVault.push({
+                        protoId: currentId,
+                        mean: JSON.parse(row.mean),
+                        variance: JSON.parse(row.variance),
+                        size: boostedSize,
+                        accessCount: boostedAccess,
+                        importance: boostedImportance,
+                        contentHash: row.hash,
+                        isCore: sel.isCore
+                    });
+
+                    seenProtoIds.add(currentId);
+                    currentId = getParentIdStmt(sel.isCore).get(currentId);
+                    depth++;
+                }
+            }
+
+            selectedVault.push(...additionalVault);
             mb.vaultAccess = selectedVault;
             mb.vaultMemories = selectedVault.length;
         } else {
@@ -1275,13 +1420,20 @@ const processBatch = async () => {
     for (const compat_id of Object.values(posIdMap)) {
         if (compat_id) {
             consolidateVolatile(compat_id, true, currentBatch);
+            buildPrototypeHierarchy(compat_id, true, 'volatile', currentBatch);
+
             consolidateCore(compat_id, true, currentBatch);
+            buildPrototypeHierarchy(compat_id, true, 'core', currentBatch);
         }
     }
+
     for (const compat_id of Object.values(negIdMap)) {
         if (compat_id) {
             consolidateVolatile(compat_id, false, currentBatch);
+            buildPrototypeHierarchy(compat_id, false, 'volatile', currentBatch);
+
             consolidateCore(compat_id, false, currentBatch);
+            buildPrototypeHierarchy(compat_id, false, 'core', currentBatch);
         }
     }
 
