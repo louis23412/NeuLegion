@@ -41,19 +41,84 @@ const CONFIG = {
     volatileMemoryDecayFactor: 0.999,
     coreMemoryDecayFactor: 0.9995,
     memoryDecayFloor: 1,
-    volatileConsolidationThreshold: 0.08,
-    coreConsolidationThreshold: 0.04,
+    volatileConsolidationThreshold: 0.02,
+    coreConsolidationThreshold: 0.01,
     consolidationPromoteCount: 25,
     coreCapacityRatio: 0.333,
-    performanceBoostFactor: 1.075,
-    maxVaultCandidates: 10000,
+    performanceBoostFactor: 1.005,
+    maxVaultCandidates: 5000,
     memoryVaultCapacity: 5000000,
-    volatileConsolidationLimit: 1500,
-    coreConsolidationLimit: 600,
+    volatileConsolidationLimit: 1000,
+    coreConsolidationLimit: 750,
 
-    coreHierarchyThreshold: 0.12,
-    volatileHierarchyThreshold: 0.20
+    coreHierarchyThreshold: 0.03,
+    volatileHierarchyThreshold: 0.05,
+    hierarchyTraversalDepth: 5,
+    maxHierarchyProtos: 250,
+
+    coreMinNeighbors: 6,
+    coreMaxNeighbors: 24,
+    volatileMinNeighbors: 4,
+    volatileMaxNeighbors: 16
 };
+
+class PriorityQueue {
+    constructor() {
+        this.heap = [];
+    }
+
+    push(item) {
+        this.heap.push(item);
+        this._bubbleUp(this.heap.length - 1);
+    }
+
+    pop() {
+        if (this.heap.length === 0) return null;
+        if (this.heap.length === 1) return this.heap.pop();
+
+        const min = this.heap[0];
+        const end = this.heap.pop();
+        this.heap[0] = end;
+        this._sinkDown(0);
+        return min;
+    }
+
+    get size() {
+        return this.heap.length;
+    }
+
+    _bubbleUp(idx) {
+        const element = this.heap[idx];
+        while (idx > 0) {
+            const parentIdx = Math.floor((idx - 1) / 2);
+            const parent = this.heap[parentIdx];
+            if (parent.accumDist <= element.accumDist) break;
+            [this.heap[parentIdx], this.heap[idx]] = [this.heap[idx], this.heap[parentIdx]];
+            idx = parentIdx;
+        }
+    }
+
+    _sinkDown(idx) {
+        const length = this.heap.length;
+        const element = this.heap[idx];
+        while (true) {
+            let leftIdx = 2 * idx + 1;
+            let rightIdx = 2 * idx + 2;
+            let smallest = idx;
+
+            if (leftIdx < length && this.heap[leftIdx].accumDist < element.accumDist) {
+                smallest = leftIdx;
+            }
+            if (rightIdx < length && this.heap[rightIdx].accumDist < this.heap[smallest].accumDist) {
+                smallest = rightIdx;
+            }
+            if (smallest === idx) break;
+
+            [this.heap[idx], this.heap[smallest]] = [this.heap[smallest], this.heap[idx]];
+            idx = smallest;
+        }
+    }
+}
 
 fs.existsSync(path.join(CONFIG.stateFolder, 'main')) ? null : fs.mkdirSync(path.join(CONFIG.stateFolder, 'main'), { recursive: true });
 
@@ -113,8 +178,7 @@ memoryDb.exec(`
         hash TEXT NOT NULL,
         lastAccessed INTEGER DEFAULT 0,
         usageCount INTEGER NOT NULL DEFAULT 0,
-        merged_count INTEGER NOT NULL DEFAULT 1,
-        parent_proto TEXT
+        merged_count INTEGER NOT NULL DEFAULT 1
     );
     CREATE TABLE IF NOT EXISTS core_negative (
         protoId TEXT PRIMARY KEY,
@@ -127,8 +191,7 @@ memoryDb.exec(`
         hash TEXT NOT NULL,
         lastAccessed INTEGER DEFAULT 0,
         usageCount INTEGER NOT NULL DEFAULT 0,
-        merged_count INTEGER NOT NULL DEFAULT 1,
-        parent_proto TEXT
+        merged_count INTEGER NOT NULL DEFAULT 1
     );
     CREATE TABLE IF NOT EXISTS volatile_positive (
         protoId TEXT PRIMARY KEY,
@@ -141,8 +204,7 @@ memoryDb.exec(`
         hash TEXT NOT NULL,
         lastAccessed INTEGER DEFAULT 0,
         usageCount INTEGER NOT NULL DEFAULT 0,
-        merged_count INTEGER NOT NULL DEFAULT 1,
-        parent_proto TEXT
+        merged_count INTEGER NOT NULL DEFAULT 1
     );
     CREATE TABLE IF NOT EXISTS volatile_negative (
         protoId TEXT PRIMARY KEY,
@@ -155,8 +217,16 @@ memoryDb.exec(`
         hash TEXT NOT NULL,
         lastAccessed INTEGER DEFAULT 0,
         usageCount INTEGER NOT NULL DEFAULT 0,
-        merged_count INTEGER NOT NULL DEFAULT 1,
-        parent_proto TEXT
+        merged_count INTEGER NOT NULL DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS proto_edges (
+        source TEXT NOT NULL CHECK(source IN ('core', 'volatile')),
+        polarity TEXT NOT NULL CHECK(polarity IN ('positive', 'negative')),
+        parent_proto TEXT NOT NULL,
+        child_proto TEXT NOT NULL,
+        accum_distance REAL NOT NULL,
+        PRIMARY KEY (source, polarity, parent_proto, child_proto)
     );
 
     CREATE INDEX IF NOT EXISTS idx_compat_core_pos ON core_positive (compat_id);
@@ -173,6 +243,9 @@ memoryDb.exec(`
     CREATE INDEX IF NOT EXISTS idx_top_core_neg ON core_negative (compat_id, importance DESC, accessCount DESC, lastAccessed DESC);
     CREATE INDEX IF NOT EXISTS idx_top_vol_pos ON volatile_positive (compat_id, importance DESC, accessCount DESC, lastAccessed DESC);
     CREATE INDEX IF NOT EXISTS idx_top_vol_neg ON volatile_negative (compat_id, importance DESC, accessCount DESC, lastAccessed DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_proto_edges_child ON proto_edges (source, polarity, child_proto);
+    CREATE INDEX IF NOT EXISTS idx_proto_edges_parent ON proto_edges (source, polarity, parent_proto);
 `);
 
 const insertCompatPos = memoryDb.prepare('INSERT INTO compat_positive (compatibility) VALUES (?) ON CONFLICT(compatibility) DO NOTHING');
@@ -327,6 +400,9 @@ const updateLastVolNeg = memoryDb.prepare(
 const existsInCorePos = memoryDb.prepare('SELECT 1 FROM core_positive WHERE protoId = ?').pluck();
 const existsInCoreNeg = memoryDb.prepare('SELECT 1 FROM core_negative WHERE protoId = ?').pluck();
 
+const existsInVolatilePos = memoryDb.prepare('SELECT 1 FROM volatile_positive WHERE protoId = ?').pluck();
+const existsInVolatileNeg = memoryDb.prepare('SELECT 1 FROM volatile_negative WHERE protoId = ?').pluck();
+
 const deleteFromVolatilePos = memoryDb.prepare('DELETE FROM volatile_positive WHERE protoId = ?');
 const deleteFromVolatileNeg = memoryDb.prepare('DELETE FROM volatile_negative WHERE protoId = ?');
 
@@ -457,25 +533,27 @@ const promoteToCoreNeg = memoryDb.prepare(`
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
-const clearParentCorePos = memoryDb.prepare('UPDATE core_positive SET parent_proto = NULL WHERE compat_id = ?');
-const clearParentCoreNeg = memoryDb.prepare('UPDATE core_negative SET parent_proto = NULL WHERE compat_id = ?');
-const clearParentVolPos = memoryDb.prepare('UPDATE volatile_positive SET parent_proto = NULL WHERE compat_id = ?');
-const clearParentVolNeg = memoryDb.prepare('UPDATE volatile_negative SET parent_proto = NULL WHERE compat_id = ?');
+const selectMemCorePos = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash, lastAccessed FROM core_positive WHERE protoId = ?');
+const selectMemCoreNeg = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash, lastAccessed FROM core_negative WHERE protoId = ?');
+const selectMemVolPos = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash, lastAccessed FROM volatile_positive WHERE protoId = ?');
+const selectMemVolNeg = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash, lastAccessed FROM volatile_negative WHERE protoId = ?');
 
-const updateParentCorePos = memoryDb.prepare('UPDATE core_positive SET parent_proto = ?, lastAccessed = ? WHERE protoId = ?');
-const updateParentCoreNeg = memoryDb.prepare('UPDATE core_negative SET parent_proto = ?, lastAccessed = ? WHERE protoId = ?');
-const updateParentVolPos = memoryDb.prepare('UPDATE volatile_positive SET parent_proto = ?, lastAccessed = ? WHERE protoId = ?');
-const updateParentVolNeg = memoryDb.prepare('UPDATE volatile_negative SET parent_proto = ?, lastAccessed = ? WHERE protoId = ?');
+const insertProtoEdge = memoryDb.prepare(`
+    INSERT INTO proto_edges (source, polarity, parent_proto, child_proto, accum_distance)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(source, polarity, parent_proto, child_proto) DO NOTHING
+`);
 
-const getParentIdCorePos = memoryDb.prepare('SELECT parent_proto FROM core_positive WHERE protoId = ?').pluck();
-const getParentIdCoreNeg = memoryDb.prepare('SELECT parent_proto FROM core_negative WHERE protoId = ?').pluck();
-const getParentIdVolPos = memoryDb.prepare('SELECT parent_proto FROM volatile_positive WHERE protoId = ?').pluck();
-const getParentIdVolNeg = memoryDb.prepare('SELECT parent_proto FROM volatile_negative WHERE protoId = ?').pluck();
+const deleteProtoEdgesForProto = memoryDb.prepare(`
+    DELETE FROM proto_edges 
+    WHERE source = ? AND polarity = ? AND (parent_proto = ? OR child_proto = ?)
+`);
 
-const selectMemCorePos = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash FROM core_positive WHERE protoId = ?');
-const selectMemCoreNeg = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash FROM core_negative WHERE protoId = ?');
-const selectMemVolPos = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash FROM volatile_positive WHERE protoId = ?');
-const selectMemVolNeg = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash FROM volatile_negative WHERE protoId = ?');
+const getNeighbors = memoryDb.prepare(`
+    SELECT parent_proto AS neighbor_proto, accum_distance FROM proto_edges WHERE source = ? AND polarity = ? AND child_proto = ?
+    UNION ALL
+    SELECT child_proto AS neighbor_proto, accum_distance FROM proto_edges WHERE source = ? AND polarity = ? AND parent_proto = ?
+`);
 
 const canonicalJSON = (obj) => {
     if (obj === null || typeof obj !== 'object') {
@@ -489,30 +567,25 @@ const canonicalJSON = (obj) => {
     return '{' + parts.join(',') + '}';
 };
 
-const computeSymKL = (mu1, var1, mu2, var2) => {
+const computeGaussianDistance = (mu1, var1, mu2, var2) => {
     const d = mu1.length;
     if (d !== mu2.length || d === 0) return Infinity;
 
     const eps = 1e-8;
-    let logTerm12 = 0, traceTerm12 = 0;
-    let logTerm21 = 0, traceTerm21 = 0;
+    let mahalTerm = 0;
+    let logDetTerm = 0;
 
     for (let j = 0; j < d; j++) {
         const v1 = Math.max(var1[j], eps);
         const v2 = Math.max(var2[j], eps);
+        const avgV = (v1 + v2) / 2;
         const dm = mu1[j] - mu2[j];
 
-        logTerm12 += Math.log(v2 / v1);
-        traceTerm12 += (v1 + dm * dm) / v2;
-
-        logTerm21 += Math.log(v1 / v2);
-        traceTerm21 += (v2 + dm * dm) / v1;
+        mahalTerm += (dm * dm) / avgV;
+        logDetTerm += Math.log(avgV / Math.sqrt(v1 * v2));
     }
 
-    const kl12 = 0.5 * (logTerm12 + traceTerm12 - d);
-    const kl21 = 0.5 * (logTerm21 + traceTerm21 - d);
-
-    return (kl12 + kl21) / 2;
+    return (1/8) * mahalTerm + (1/2) * logDetTerm;
 };
 
 const buildFreshStructure = () => {
@@ -553,24 +626,19 @@ const buildFreshStructure = () => {
 const buildPrototypeHierarchy = (compat_id, isPositive, memType, currentBatch) => {
     if (!compat_id) return;
 
-    const threshold = memType === 'core' ? CONFIG.coreHierarchyThreshold : CONFIG.volatileHierarchyThreshold;
     const decayFactor = memType === 'core' ? CONFIG.coreMemoryDecayFactor : CONFIG.volatileMemoryDecayFactor;
 
+    const sourceStr = memType;
+    const polarityStr = isPositive ? 'positive' : 'negative';
     const table = memType === 'core'
         ? (isPositive ? 'core_positive' : 'core_negative')
         : (isPositive ? 'volatile_positive' : 'volatile_negative');
 
-    const clearStmt = memType === 'core'
-        ? (isPositive ? clearParentCorePos : clearParentCoreNeg)
-        : (isPositive ? clearParentVolPos : clearParentVolNeg);
-
-    clearStmt.run(compat_id);
-
-    const rows = memoryDb.prepare(
-        `SELECT protoId, mean, variance, size, accessCount, importance, hash, lastAccessed 
-         FROM ${table} 
-         WHERE compat_id = ?`
-    ).all(compat_id);
+    const rows = memoryDb.prepare(`
+        SELECT protoId, mean, variance, size, accessCount, importance, hash, lastAccessed 
+        FROM ${table} 
+        WHERE compat_id = ?
+    `).all(compat_id);
 
     if (rows.length < 2) return;
 
@@ -595,27 +663,47 @@ const buildPrototypeHierarchy = (compat_id, isPositive, memType, currentBatch) =
         }
     });
 
-    protos.sort((a, b) => (b.size * b.importance) - (a.size * a.importance));
+    protos.sort((a, b) =>
+        b.importance - a.importance ||
+        b.size - a.size ||
+        b.accessCount - a.accessCount ||
+        b.lastAccessed - a.lastAccessed
+    );
 
-    const updateStmt = memType === 'core'
-        ? (isPositive ? updateParentCorePos : updateParentCoreNeg)
-        : (isPositive ? updateParentVolPos : updateParentVolNeg);
+    const limitedProtos = protos.slice(0, CONFIG.maxHierarchyProtos);
+    if (limitedProtos.length < 2) return;
 
-    for (let i = 1; i < protos.length; i++) {
-        const child = protos[i];
-        let bestKL = Infinity;
-        let bestParentId = null;
+    const n = limitedProtos.length;
 
-        for (let j = 0; j < i; j++) {
-            const kl = computeSymKL(child.mean, child.variance, protos[j].mean, protos[j].variance);
-            if (kl < bestKL) {
-                bestKL = kl;
-                bestParentId = protos[j].protoId;
-            }
+    for (const p of limitedProtos) {
+        deleteProtoEdgesForProto.run(sourceStr, polarityStr, p.protoId, p.protoId);
+    }
+
+    const minNeighbors = memType === 'core' ? CONFIG.coreMinNeighbors : CONFIG.volatileMinNeighbors;
+    const maxNeighbors = memType === 'core' ? CONFIG.coreMaxNeighbors : CONFIG.volatileMaxNeighbors;
+
+    for (let i = 0; i < n; i++) {
+        const proto = limitedProtos[i];
+
+        const fraction = n <= 1 ? 0 : i / (n - 1);
+        let numNeighbors = Math.round(minNeighbors + (maxNeighbors - minNeighbors) * (1 - fraction));
+        numNeighbors = Math.max(1, numNeighbors);
+
+        const candidates = [];
+        for (let j = 0; j < n; j++) {
+            if (i === j) continue;
+            const other = limitedProtos[j];
+            const dist = computeGaussianDistance(proto.mean, proto.variance, other.mean, other.variance);
+            candidates.push({ neighborId: other.protoId, dist });
         }
 
-        if (bestParentId && bestKL < threshold) {
-            updateStmt.run(bestParentId, currentBatch, child.protoId);
+        candidates.sort((a, b) => a.dist - b.dist);
+
+        const actualNum = Math.min(numNeighbors, candidates.length);
+        for (let k = 0; k < actualNum; k++) {
+            const { neighborId, dist } = candidates[k];
+            insertProtoEdge.run(sourceStr, polarityStr, proto.protoId, neighborId, dist);
+            insertProtoEdge.run(sourceStr, polarityStr, neighborId, proto.protoId, dist);
         }
     }
 };
@@ -696,8 +784,8 @@ const consolidateVolatile = (compat_id, isPositive, currentBatch) => {
     while (i < mems.length - 1) {
         let j = i + 1;
         while (j < mems.length) {
-            const kl = computeSymKL(mems[i].mean, mems[i].variance, mems[j].mean, mems[j].variance);
-            if (kl < CONFIG.volatileConsolidationThreshold) {
+            const accumDistance = computeGaussianDistance(mems[i].mean, mems[i].variance, mems[j].mean, mems[j].variance);
+            if (accumDistance < CONFIG.volatileConsolidationThreshold) {
                 const target = mems[i];
                 const source = mems[j];
                 const s1 = target.size;
@@ -806,8 +894,8 @@ const consolidateCore = (compat_id, isPositive, currentBatch) => {
     while (i < mems.length - 1) {
         let j = i + 1;
         while (j < mems.length) {
-            const kl = computeSymKL(mems[i].mean, mems[i].variance, mems[j].mean, mems[j].variance);
-            if (kl < CONFIG.coreConsolidationThreshold) {
+            const accumDistance = computeGaussianDistance(mems[i].mean, mems[i].variance, mems[j].mean, mems[j].variance);
+            if (accumDistance < CONFIG.coreConsolidationThreshold) {
                 const target = mems[i];
                 const source = mems[j];
                 const s1 = target.size;
@@ -899,6 +987,7 @@ const storeNewMemories = memoryDb.transaction((results, currentBatch) => {
 
         if (isCore) {
             deleteFromVolatilePos.run(mem.protoId);
+            if (existsInCorePos.get(mem.protoId)) continue;
             upsertCorePos.run(
                 mem.protoId,
                 compat_id,
@@ -911,7 +1000,7 @@ const storeNewMemories = memoryDb.transaction((results, currentBatch) => {
             );
             updateLastCorePos.run(currentBatch, mem.protoId);
         } else {
-            if (existsInCorePos.get(mem.protoId)) continue;
+            if (existsInCorePos.get(mem.protoId) || existsInVolatilePos.get(mem.protoId)) continue;
             upsertVolatilePos.run(
                 mem.protoId,
                 compat_id,
@@ -932,6 +1021,7 @@ const storeNewMemories = memoryDb.transaction((results, currentBatch) => {
 
         if (isCore) {
             deleteFromVolatileNeg.run(mem.protoId);
+            if (existsInCoreNeg.get(mem.protoId)) continue;
             upsertCoreNeg.run(
                 mem.protoId,
                 compat_id,
@@ -944,7 +1034,7 @@ const storeNewMemories = memoryDb.transaction((results, currentBatch) => {
             );
             updateLastCoreNeg.run(currentBatch, mem.protoId);
         } else {
-            if (existsInCoreNeg.get(mem.protoId)) continue;
+            if (existsInCoreNeg.get(mem.protoId) || existsInVolatileNeg.get(mem.protoId)) continue;
             upsertVolatileNeg.run(
                 mem.protoId,
                 compat_id,
@@ -1255,19 +1345,19 @@ const processBatch = async () => {
             }
 
             if (hasQuery) {
-                const klValues = [];
+                const distValues = [];
                 for (const cand of vaultCandidates) {
-                    cand.symKL = computeSymKL(queryMean, queryVar, cand.mean, cand.variance);
-                    klValues.push(cand.symKL);
+                    cand.dist = computeGaussianDistance(queryMean, queryVar, cand.mean, cand.variance);
+                    distValues.push(cand.dist);
                 }
 
-                klValues.sort((a, b) => a - b);
-                const p80Idx = Math.floor(klValues.length * 0.8);
-                let temp = klValues[p80Idx] || 1;
+                distValues.sort((a, b) => a - b);
+                const p80Idx = Math.floor(distValues.length * 0.8);
+                let temp = distValues[p80Idx] || 1;
                 if (temp <= 0) temp = 1;
 
                 for (const cand of vaultCandidates) {
-                    cand.similarity = Math.exp(-cand.symKL / temp);
+                    cand.similarity = Math.exp(-cand.dist / temp);
                 }
             } else {
                 for (const cand of vaultCandidates) {
@@ -1275,32 +1365,19 @@ const processBatch = async () => {
                 }
             }
 
-            let numToSelect = Math.max(1, Math.floor(mb.totalBroadcast * 0.25));
+            let numToSelect = Math.max(1, Math.floor(mb.totalBroadcast * 0.4));
             numToSelect = Math.min(numToSelect, vaultCandidates.length);
 
             const selectedVault = [];
-            let pool = [...vaultCandidates];
 
-            for (let i = 0; i < numToSelect && pool.length > 0; i++) {
-                const weights = pool.map(c => c.similarity * c.importance + 1);
-                const sumWeights = weights.reduce((a, b) => a + b, 0);
+            vaultCandidates.sort((a, b) => {
+                const scoreA = Math.pow(a.similarity, 4) * (a.importance + a.accessCount);
+                const scoreB = Math.pow(b.similarity, 4) * (b.importance + b.accessCount);
+                return scoreB - scoreA;
+            });
 
-                let selected;
-                if (sumWeights === 0 || !isFinite(sumWeights)) {
-                    const idx = Math.floor(Math.random() * pool.length);
-                    selected = pool.splice(idx, 1)[0];
-                } else {
-                    let r = Math.random() * sumWeights;
-                    let cum = 0;
-                    for (let k = 0; k < weights.length; k++) {
-                        cum += weights[k];
-                        if (cum >= r) {
-                            selected = pool.splice(k, 1)[0];
-                            break;
-                        }
-                    }
-                    if (!selected) selected = pool.pop();
-                }
+            for (let i = 0; i < numToSelect; i++) {
+                const selected = vaultCandidates[i];
 
                 const accessStmt = selected.source === 'core'
                     ? (isPositive ? accessMemoryCorePos : accessMemoryCoreNeg)
@@ -1320,49 +1397,100 @@ const processBatch = async () => {
             }
 
             const additionalVault = [];
-            const seenProtoIds = new Set(selectedVault.map(m => m.protoId));
-            const isPos = controller.type === 'positive';
+            const capAdditional = mb.totalBroadcast - selectedVault.length;
 
-            const getParentIdStmt = (isCore) => isCore
-                ? (isPos ? getParentIdCorePos : getParentIdCoreNeg)
-                : (isPos ? getParentIdVolPos : getParentIdVolNeg);
+            if (capAdditional > 0 && selectedVault.length > 0) {
+                const coreSeeds = selectedVault.filter(m => m.isCore).map(m => m.protoId);
+                const volSeeds = selectedVault.filter(m => !m.isCore).map(m => m.protoId);
 
-            const selectMemStmt = (isCore) => isCore
-                ? (isPos ? selectMemCorePos : selectMemCoreNeg)
-                : (isPos ? selectMemVolPos : selectMemVolNeg);
+                const types = [
+                    {
+                        source: 'core',
+                        seeds: coreSeeds,
+                        thresh: CONFIG.coreHierarchyThreshold,
+                        decayF: CONFIG.coreMemoryDecayFactor,
+                        selectStmt: isPositive ? selectMemCorePos : selectMemCoreNeg,
+                        accessStmt: isPositive ? accessMemoryCorePos : accessMemoryCoreNeg
+                    },
+                    {
+                        source: 'volatile',
+                        seeds: volSeeds,
+                        thresh: CONFIG.volatileHierarchyThreshold,
+                        decayF: CONFIG.volatileMemoryDecayFactor,
+                        selectStmt: isPositive ? selectMemVolPos : selectMemVolNeg,
+                        accessStmt: isPositive ? accessMemoryVolPos : accessMemoryVolNeg
+                    }
+                ];
 
-            const accessStmt = (isCore) => isCore
-                ? (isPos ? accessMemoryCorePos : accessMemoryCoreNeg)
-                : (isPos ? accessMemoryVolPos : accessMemoryVolNeg);
+                for (const type of types) {
+                    if (type.seeds.length === 0) continue;
 
-            for (const sel of selectedVault) {
-                let currentId = getParentIdStmt(sel.isCore).get(sel.protoId);
-                let depth = 0;
+                    const pq = new PriorityQueue();
+                    const dist = new Map();
+                    const visited = new Set();
 
-                while (currentId && depth < 5 && !seenProtoIds.has(currentId)) {
-                    const row = selectMemStmt(sel.isCore).get(currentId);
-                    if (!row) break;
+                    for (const seed of type.seeds) {
+                        pq.push({ protoId: seed, accumDist: 0, depth: 0 });
+                        dist.set(seed, 0);
+                    }
 
-                    accessStmt(sel.isCore).run(currentBatch, currentId);
+                    const sourceStr = type.source;
+                    const polarityStr = isPositive ? 'positive' : 'negative';
 
-                    const boostedSize = row.size * CONFIG.performanceBoostFactor;
-                    const boostedAccess = row.accessCount * CONFIG.performanceBoostFactor;
-                    const boostedImportance = row.importance * CONFIG.performanceBoostFactor;
+                    while (pq.size > 0 && additionalVault.length < capAdditional) {
+                        const curr = pq.pop();
+                        if (visited.has(curr.protoId)) continue;
+                        visited.add(curr.protoId);
 
-                    additionalVault.push({
-                        protoId: currentId,
-                        mean: JSON.parse(row.mean),
-                        variance: JSON.parse(row.variance),
-                        size: boostedSize,
-                        accessCount: boostedAccess,
-                        importance: boostedImportance,
-                        contentHash: row.hash,
-                        isCore: sel.isCore
-                    });
+                        if (curr.accumDist > 0) {
+                            const row = type.selectStmt.get(curr.protoId);
+                            if (!row) continue;
 
-                    seenProtoIds.add(currentId);
-                    currentId = getParentIdStmt(sel.isCore).get(currentId);
-                    depth++;
+                            const delta = currentBatch - (row.lastAccessed || 0);
+                            const mult = delta > 0 ? Math.pow(type.decayF, delta) : 1.0;
+
+                            const decayedSize = Math.max(CONFIG.memoryDecayFloor, row.size * mult);
+                            const decayedAccess = Math.max(CONFIG.memoryDecayFloor, row.accessCount * mult);
+                            const decayedImportance = Math.max(CONFIG.memoryDecayFloor, row.importance * mult);
+
+                            const similarity = Math.exp(-curr.accumDist / type.thresh);
+                            const effectiveBoost = CONFIG.performanceBoostFactor * similarity;
+
+                            additionalVault.push({
+                                protoId: curr.protoId,
+                                mean: JSON.parse(row.mean),
+                                variance: JSON.parse(row.variance),
+                                size: decayedSize * effectiveBoost,
+                                accessCount: decayedAccess * effectiveBoost,
+                                importance: decayedImportance * effectiveBoost,
+                                contentHash: row.hash,
+                                isCore: type.source === 'core'
+                            });
+
+                            type.accessStmt.run(currentBatch, curr.protoId);
+                        }
+
+                        if (curr.depth >= CONFIG.hierarchyTraversalDepth) continue;
+
+                        const neighborRows = getNeighbors.all(
+                            sourceStr, polarityStr, curr.protoId,
+                            sourceStr, polarityStr, curr.protoId
+                        );
+
+                        for (const nr of neighborRows) {
+                            const neighId = nr.neighbor_proto;
+                            if (visited.has(neighId)) continue;
+
+                            const edgeDist = nr.accum_distance;
+                            const newAccum = curr.accumDist + edgeDist;
+
+                            const existing = dist.get(neighId);
+                            if (existing === undefined || newAccum < existing) {
+                                dist.set(neighId, newAccum);
+                                pq.push({ protoId: neighId, accumDist: newAccum, depth: curr.depth + 1 });
+                            }
+                        }
+                    }
                 }
             }
 
