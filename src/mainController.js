@@ -494,60 +494,10 @@ const boostVolatileNeg = memoryDb.prepare(`
     WHERE protoId = ?
 `);
 
-const updateVolatilePos = memoryDb.prepare(`
-    UPDATE volatile_positive
-    SET mean = ?, variance = ?, size = ?, accessCount = ?, importance = ?, hash = ?, lastAccessed = ?, usageCount = ?, merged_count = ?
-    WHERE protoId = ?
-`);
-
-const updateVolatileNeg = memoryDb.prepare(`
-    UPDATE volatile_negative
-    SET mean = ?, variance = ?, size = ?, accessCount = ?, importance = ?, hash = ?, lastAccessed = ?, usageCount = ?, merged_count = ?
-    WHERE protoId = ?
-`);
-
-const updateCorePos = memoryDb.prepare(`
-    UPDATE core_positive
-    SET mean = ?, variance = ?, size = ?, accessCount = ?, importance = ?, hash = ?, lastAccessed = ?, usageCount = ?, merged_count = ?
-    WHERE protoId = ?
-`);
-
-const updateCoreNeg = memoryDb.prepare(`
-    UPDATE core_negative
-    SET mean = ?, variance = ?, size = ?, accessCount = ?, importance = ?, hash = ?, lastAccessed = ?, usageCount = ?, merged_count = ?
-    WHERE protoId = ?
-`);
-
-const deleteFromCorePos = memoryDb.prepare('DELETE FROM core_positive WHERE protoId = ?');
-const deleteFromCoreNeg = memoryDb.prepare('DELETE FROM core_negative WHERE protoId = ?');
-
-const promoteToCorePos = memoryDb.prepare(`
-    INSERT INTO core_positive
-    (protoId, compat_id, mean, variance, size, accessCount, importance, hash, lastAccessed, usageCount, merged_count)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-const promoteToCoreNeg = memoryDb.prepare(`
-    INSERT INTO core_negative
-    (protoId, compat_id, mean, variance, size, accessCount, importance, hash, lastAccessed, usageCount, merged_count)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
 const selectMemCorePos = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash, lastAccessed FROM core_positive WHERE protoId = ?');
 const selectMemCoreNeg = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash, lastAccessed FROM core_negative WHERE protoId = ?');
 const selectMemVolPos = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash, lastAccessed FROM volatile_positive WHERE protoId = ?');
 const selectMemVolNeg = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash, lastAccessed FROM volatile_negative WHERE protoId = ?');
-
-const insertProtoEdge = memoryDb.prepare(`
-    INSERT INTO proto_edges (source, polarity, parent_proto, child_proto, accum_distance)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(source, polarity, parent_proto, child_proto) DO NOTHING
-`);
-
-const deleteProtoEdgesForProto = memoryDb.prepare(`
-    DELETE FROM proto_edges 
-    WHERE source = ? AND polarity = ? AND (parent_proto = ? OR child_proto = ?)
-`);
 
 const getNeighbors = memoryDb.prepare(`
     SELECT parent_proto AS neighbor_proto, accum_distance FROM proto_edges WHERE source = ? AND polarity = ? AND child_proto = ?
@@ -623,91 +573,6 @@ const buildFreshStructure = () => {
     return legionStructure;
 };
 
-const buildPrototypeHierarchy = (compat_id, isPositive, memType, currentBatch) => {
-    if (!compat_id) return;
-
-    const decayFactor = memType === 'core' ? CONFIG.coreMemoryDecayFactor : CONFIG.volatileMemoryDecayFactor;
-
-    const sourceStr = memType;
-    const polarityStr = isPositive ? 'positive' : 'negative';
-    const table = memType === 'core'
-        ? (isPositive ? 'core_positive' : 'core_negative')
-        : (isPositive ? 'volatile_positive' : 'volatile_negative');
-
-    const rows = memoryDb.prepare(`
-        SELECT protoId, mean, variance, size, accessCount, importance, hash, lastAccessed 
-        FROM ${table} 
-        WHERE compat_id = ?
-    `).all(compat_id);
-
-    if (rows.length < 2) return;
-
-    let protos = rows.map(r => ({
-        protoId: r.protoId,
-        mean: JSON.parse(r.mean),
-        variance: JSON.parse(r.variance),
-        size: r.size,
-        accessCount: r.accessCount,
-        importance: r.importance,
-        hash: r.hash,
-        lastAccessed: r.lastAccessed
-    }));
-
-    protos.forEach(p => {
-        const delta = currentBatch - p.lastAccessed;
-        if (delta > 0) {
-            const mult = Math.pow(decayFactor, delta);
-            p.size = Math.max(CONFIG.memoryDecayFloor, p.size * mult);
-            p.accessCount = Math.max(CONFIG.memoryDecayFloor, p.accessCount * mult);
-            p.importance = Math.max(CONFIG.memoryDecayFloor, p.importance * mult);
-        }
-    });
-
-    protos.sort((a, b) =>
-        b.importance - a.importance ||
-        b.size - a.size ||
-        b.accessCount - a.accessCount ||
-        b.lastAccessed - a.lastAccessed
-    );
-
-    const limitedProtos = protos.slice(0, CONFIG.maxHierarchyProtos);
-    if (limitedProtos.length < 2) return;
-
-    const n = limitedProtos.length;
-
-    for (const p of limitedProtos) {
-        deleteProtoEdgesForProto.run(sourceStr, polarityStr, p.protoId, p.protoId);
-    }
-
-    const minNeighbors = memType === 'core' ? CONFIG.coreMinNeighbors : CONFIG.volatileMinNeighbors;
-    const maxNeighbors = memType === 'core' ? CONFIG.coreMaxNeighbors : CONFIG.volatileMaxNeighbors;
-
-    for (let i = 0; i < n; i++) {
-        const proto = limitedProtos[i];
-
-        const fraction = n <= 1 ? 0 : i / (n - 1);
-        let numNeighbors = Math.round(minNeighbors + (maxNeighbors - minNeighbors) * (1 - fraction));
-        numNeighbors = Math.max(1, numNeighbors);
-
-        const candidates = [];
-        for (let j = 0; j < n; j++) {
-            if (i === j) continue;
-            const other = limitedProtos[j];
-            const dist = computeGaussianDistance(proto.mean, proto.variance, other.mean, other.variance);
-            candidates.push({ neighborId: other.protoId, dist });
-        }
-
-        candidates.sort((a, b) => a.dist - b.dist);
-
-        const actualNum = Math.min(numNeighbors, candidates.length);
-        for (let k = 0; k < actualNum; k++) {
-            const { neighborId, dist } = candidates[k];
-            insertProtoEdge.run(sourceStr, polarityStr, proto.protoId, neighborId, dist);
-            insertProtoEdge.run(sourceStr, polarityStr, neighborId, proto.protoId, dist);
-        }
-    }
-};
-
 const getControllerParams = (group, section, layer) => {
     const reversedGroup = CONFIG.dims[0] - 1 - group;
     const reversedSection = CONFIG.dims[1] - 1 - section;
@@ -736,209 +601,6 @@ const getControllerParams = (group, section, layer) => {
         maxPriceMovement: Number((CONFIG.maxPriceMove * moneyFactor).toFixed(3)),
         pop: Math.round(CONFIG.basePop * popFactor)
     };
-};
-
-const consolidateVolatile = (compat_id, isPositive, currentBatch) => {
-    const volTable = isPositive ? 'volatile_positive' : 'volatile_negative';
-    const updateStmt = isPositive ? updateVolatilePos : updateVolatileNeg;
-    const deleteStmt = isPositive ? deleteFromVolatilePos : deleteFromVolatileNeg;
-    const promoteStmt = isPositive ? promoteToCorePos : promoteToCoreNeg;
-    const existsCoreStmt = isPositive ? existsInCorePos : existsInCoreNeg;
-
-    const rows = memoryDb.prepare(`
-        SELECT protoId, mean, variance, size, accessCount, importance, hash, lastAccessed, usageCount, merged_count
-        FROM ${volTable} 
-        WHERE compat_id = ?
-        ORDER BY importance DESC, accessCount DESC, lastAccessed DESC
-        LIMIT ?
-    `).all(compat_id, CONFIG.volatileConsolidationLimit);
-
-    if (rows.length < 2) return;
-
-    let mems = rows.map(r => ({
-        protoId: r.protoId,
-        mean: JSON.parse(r.mean),
-        variance: JSON.parse(r.variance),
-        size: r.size,
-        accessCount: r.accessCount,
-        importance: r.importance,
-        hash: r.hash,
-        lastAccessed: r.lastAccessed,
-        usageCount: r.usageCount,
-        merged_count: r.merged_count || 1
-    }));
-
-    mems.forEach(mem => {
-        const delta = currentBatch - mem.lastAccessed;
-        if (delta > 0) {
-            const multiplier = Math.pow(CONFIG.volatileMemoryDecayFactor, delta);
-            mem.size = Math.max(CONFIG.memoryDecayFloor, mem.size * multiplier);
-            mem.accessCount = Math.max(CONFIG.memoryDecayFloor, mem.accessCount * multiplier);
-            mem.importance = Math.max(CONFIG.memoryDecayFloor, mem.importance * multiplier);
-        }
-    });
-
-    mems.sort((a, b) => b.importance - a.importance || b.size - a.size);
-
-    let i = 0;
-    while (i < mems.length - 1) {
-        let j = i + 1;
-        while (j < mems.length) {
-            const accumDistance = computeGaussianDistance(mems[i].mean, mems[i].variance, mems[j].mean, mems[j].variance);
-            if (accumDistance < CONFIG.volatileConsolidationThreshold) {
-                const target = mems[i];
-                const source = mems[j];
-                const s1 = target.size;
-                const s2 = source.size;
-                const totalSize = s1 + s2;
-
-                const newMean = target.mean.map((m, k) => (s1 * m + s2 * source.mean[k]) / totalSize);
-                const newVariance = target.mean.map((_, k) => {
-                    const dm1 = target.mean[k] - newMean[k];
-                    const dm2 = source.mean[k] - newMean[k];
-                    return (s1 * (target.variance[k] + dm1 * dm1) + s2 * (source.variance[k] + dm2 * dm2)) / totalSize;
-                }).map(v => Math.max(v, 1e-8));
-
-                target.mean = newMean;
-                target.variance = newVariance;
-                target.size = totalSize;
-                target.accessCount = (s1 * target.accessCount + s2 * source.accessCount) / totalSize;
-                target.importance = (s1 * target.importance + s2 * source.importance) / totalSize;
-                target.usageCount += source.usageCount;
-                target.merged_count += source.merged_count;
-                target.lastAccessed = Math.max(target.lastAccessed, source.lastAccessed, currentBatch);
-                target.hash = target.hash || source.hash;
-
-                updateStmt.run(
-                    JSON.stringify(target.mean),
-                    JSON.stringify(target.variance),
-                    target.size,
-                    target.accessCount,
-                    target.importance,
-                    target.hash,
-                    target.lastAccessed,
-                    target.usageCount,
-                    target.merged_count,
-                    target.protoId
-                );
-                deleteStmt.run(source.protoId);
-                mems.splice(j, 1);
-            } else {
-                j++;
-            }
-        }
-        i++;
-    }
-
-    for (const mem of mems) {
-        if (mem.merged_count >= CONFIG.consolidationPromoteCount && !existsCoreStmt.get(mem.protoId)) {
-            promoteStmt.run(
-                mem.protoId,
-                compat_id,
-                JSON.stringify(mem.mean),
-                JSON.stringify(mem.variance),
-                mem.size,
-                mem.accessCount,
-                mem.importance,
-                mem.hash,
-                currentBatch,
-                mem.usageCount,
-                mem.merged_count
-            );
-            deleteStmt.run(mem.protoId);
-        }
-    }
-};
-
-const consolidateCore = (compat_id, isPositive, currentBatch) => {
-    const coreTable = isPositive ? 'core_positive' : 'core_negative';
-    const updateStmt = isPositive ? updateCorePos : updateCoreNeg;
-    const deleteStmt = isPositive ? deleteFromCorePos : deleteFromCoreNeg;
-
-    const rows = memoryDb.prepare(`
-        SELECT protoId, mean, variance, size, accessCount, importance, hash, lastAccessed, usageCount, merged_count
-        FROM ${coreTable} 
-        WHERE compat_id = ?
-        ORDER BY importance DESC, accessCount DESC, lastAccessed DESC
-        LIMIT ?
-    `).all(compat_id, CONFIG.coreConsolidationLimit);
-
-    if (rows.length < 2) return;
-
-    let mems = rows.map(r => ({
-        protoId: r.protoId,
-        mean: JSON.parse(r.mean),
-        variance: JSON.parse(r.variance),
-        size: r.size,
-        accessCount: r.accessCount,
-        importance: r.importance,
-        hash: r.hash,
-        lastAccessed: r.lastAccessed,
-        usageCount: r.usageCount,
-        merged_count: r.merged_count || 1
-    }));
-
-    mems.forEach(mem => {
-        const delta = currentBatch - mem.lastAccessed;
-        if (delta > 0) {
-            const multiplier = Math.pow(CONFIG.coreMemoryDecayFactor, delta);
-            mem.size = Math.max(CONFIG.memoryDecayFloor, mem.size * multiplier);
-            mem.accessCount = Math.max(CONFIG.memoryDecayFloor, mem.accessCount * multiplier);
-            mem.importance = Math.max(CONFIG.memoryDecayFloor, mem.importance * multiplier);
-        }
-    });
-
-    mems.sort((a, b) => b.importance - a.importance || b.size - a.size);
-
-    let i = 0;
-    while (i < mems.length - 1) {
-        let j = i + 1;
-        while (j < mems.length) {
-            const accumDistance = computeGaussianDistance(mems[i].mean, mems[i].variance, mems[j].mean, mems[j].variance);
-            if (accumDistance < CONFIG.coreConsolidationThreshold) {
-                const target = mems[i];
-                const source = mems[j];
-                const s1 = target.size;
-                const s2 = source.size;
-                const totalSize = s1 + s2;
-
-                const newMean = target.mean.map((m, k) => (s1 * m + s2 * source.mean[k]) / totalSize);
-                const newVariance = target.mean.map((_, k) => {
-                    const dm1 = target.mean[k] - newMean[k];
-                    const dm2 = source.mean[k] - newMean[k];
-                    return (s1 * (target.variance[k] + dm1 * dm1) + s2 * (source.variance[k] + dm2 * dm2)) / totalSize;
-                }).map(v => Math.max(v, 1e-8));
-
-                target.mean = newMean;
-                target.variance = newVariance;
-                target.size = totalSize;
-                target.accessCount = (s1 * target.accessCount + s2 * source.accessCount) / totalSize;
-                target.importance = (s1 * target.importance + s2 * source.importance) / totalSize;
-                target.usageCount += source.usageCount;
-                target.merged_count += source.merged_count;
-                target.lastAccessed = Math.max(target.lastAccessed, source.lastAccessed, currentBatch);
-                target.hash = target.hash || source.hash;
-
-                updateStmt.run(
-                    JSON.stringify(target.mean),
-                    JSON.stringify(target.variance),
-                    target.size,
-                    target.accessCount,
-                    target.importance,
-                    target.hash,
-                    target.lastAccessed,
-                    target.usageCount,
-                    target.merged_count,
-                    target.protoId
-                );
-                deleteStmt.run(source.protoId);
-                mems.splice(j, 1);
-            } else {
-                j++;
-            }
-        }
-        i++;
-    }
 };
 
 const storeNewMemories = memoryDb.transaction((results, currentBatch) => {
@@ -1545,24 +1207,29 @@ const processBatch = async () => {
 
     const { posIdMap, negIdMap } = storeNewMemories(results, currentBatch);
 
+    const consolidationTasks = [];
     for (const compat_id of Object.values(posIdMap)) {
-        if (compat_id) {
-            consolidateVolatile(compat_id, true, currentBatch);
-            buildPrototypeHierarchy(compat_id, true, 'volatile', currentBatch);
-
-            consolidateCore(compat_id, true, currentBatch);
-            buildPrototypeHierarchy(compat_id, true, 'core', currentBatch);
-        }
+        if (compat_id) consolidationTasks.push({ compat_id, isPositive: true });
+    }
+    for (const compat_id of Object.values(negIdMap)) {
+        if (compat_id) consolidationTasks.push({ compat_id, isPositive: false });
     }
 
-    for (const compat_id of Object.values(negIdMap)) {
-        if (compat_id) {
-            consolidateVolatile(compat_id, false, currentBatch);
-            buildPrototypeHierarchy(compat_id, false, 'volatile', currentBatch);
+    let consolProgress = 0;
+    console.log(`Consolidation progress: ${consolProgress}/${consolidationTasks.length} (${((consolProgress / consolidationTasks.length) * 100).toFixed(2)}%)...`);
 
-            consolidateCore(compat_id, false, currentBatch);
-            buildPrototypeHierarchy(compat_id, false, 'core', currentBatch);
-        }
+    for (let index = 0; index < consolidationTasks.length; index += CONFIG.maxWorkers) {
+        const chunk = consolidationTasks.slice(index, index + CONFIG.maxWorkers);
+        const promises = chunk.map(task => 
+            runConsolidationWorker(task.compat_id, task.isPositive, currentBatch)
+        );
+
+        await Promise.all(promises);
+
+        consolProgress += chunk.length;
+
+        process.stdout.moveCursor(0, -1);
+        console.log(`Consolidation progress: ${consolProgress}/${consolidationTasks.length} (${((consolProgress / consolidationTasks.length) * 100).toFixed(2)}%)...`);
     }
 
     const coreCapacity = Math.floor(CONFIG.memoryVaultCapacity * CONFIG.coreCapacityRatio);
@@ -1684,6 +1351,49 @@ const runWorker = async (controller) => {
         worker.on('exit', (code) => {
             if (code !== 0) {
                 reject(new Error(`Worker exited with code ${code}`));
+            }
+        });
+    });
+};
+
+const runConsolidationWorker = async (compat_id, isPositive, currentBatch) => {
+    return new Promise((resolve, reject) => {
+        const worker = new Worker(new URL('./consolidation_worker.js', import.meta.url), {
+            workerData: {
+                compat_id,
+                isPositive,
+                currentBatch,
+                config: {
+                    volatileConsolidationThreshold: CONFIG.volatileConsolidationThreshold,
+                    coreConsolidationThreshold: CONFIG.coreConsolidationThreshold,
+                    volatileConsolidationLimit: CONFIG.volatileConsolidationLimit,
+                    coreConsolidationLimit: CONFIG.coreConsolidationLimit,
+                    consolidationPromoteCount: CONFIG.consolidationPromoteCount,
+                    memoryDecayFloor: CONFIG.memoryDecayFloor,
+                    volatileMemoryDecayFactor: CONFIG.volatileMemoryDecayFactor,
+                    coreMemoryDecayFactor: CONFIG.coreMemoryDecayFactor,
+                    maxHierarchyProtos: CONFIG.maxHierarchyProtos,
+                    coreMinNeighbors: CONFIG.coreMinNeighbors,
+                    coreMaxNeighbors: CONFIG.coreMaxNeighbors,
+                    volatileMinNeighbors: CONFIG.volatileMinNeighbors,
+                    volatileMaxNeighbors: CONFIG.volatileMaxNeighbors,
+                }
+            }
+        });
+
+        worker.on('message', (msg) => {
+            worker.terminate();
+            if (msg.error) {
+                reject(new Error(msg.error));
+            } else {
+                resolve();
+            }
+        });
+
+        worker.on('error', reject);
+        worker.on('exit', (code) => {
+            if (code !== 0) {
+                reject(new Error(`Consolidation worker exited with code ${code}`));
             }
         });
     });
