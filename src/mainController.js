@@ -517,6 +517,16 @@ const canonicalJSON = (obj) => {
     return '{' + parts.join(',') + '}';
 };
 
+const computeContentHash = (mean) => {
+    let hash = 2166136261;
+    for (let i = 0; i < mean.length; i++) {
+        let iv = Math.floor(mean[i] * 10000 + 0.5);
+        hash ^= iv;
+        hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+    }
+    return ((hash >>> 0) % 0xFFFFFFFF).toString(16).padStart(8, '0');
+};
+
 const computeGaussianDistance = (mu1, var1, mu2, var2) => {
     const d = mu1.length;
     if (d !== mu2.length || d === 0) return Infinity;
@@ -647,6 +657,8 @@ const storeNewMemories = memoryDb.transaction((results, currentBatch) => {
         const compat_id = posIdMap[compatStr];
         if (!compat_id) continue;
 
+        const contentHash = computeContentHash(mem.mean);
+
         if (isCore) {
             deleteFromVolatilePos.run(mem.protoId);
             if (existsInCorePos.get(mem.protoId)) continue;
@@ -658,7 +670,7 @@ const storeNewMemories = memoryDb.transaction((results, currentBatch) => {
                 mem.size ?? 0.0,
                 mem.accessCount ?? 0.0,
                 mem.importance ?? 0.0,
-                mem.contentHash ?? ''
+                contentHash
             );
             updateLastCorePos.run(currentBatch, mem.protoId);
         } else {
@@ -671,7 +683,7 @@ const storeNewMemories = memoryDb.transaction((results, currentBatch) => {
                 mem.size ?? 0.0,
                 mem.accessCount ?? 0.0,
                 mem.importance ?? 0.0,
-                mem.contentHash ?? ''
+                contentHash
             );
             updateLastVolPos.run(currentBatch, mem.protoId);
         }
@@ -680,6 +692,8 @@ const storeNewMemories = memoryDb.transaction((results, currentBatch) => {
     for (const { mem, compatStr, isCore } of negMems) {
         const compat_id = negIdMap[compatStr];
         if (!compat_id) continue;
+
+        const contentHash = computeContentHash(mem.mean);
 
         if (isCore) {
             deleteFromVolatileNeg.run(mem.protoId);
@@ -692,7 +706,7 @@ const storeNewMemories = memoryDb.transaction((results, currentBatch) => {
                 mem.size ?? 0.0,
                 mem.accessCount ?? 0.0,
                 mem.importance ?? 0.0,
-                mem.contentHash ?? ''
+                contentHash
             );
             updateLastCoreNeg.run(currentBatch, mem.protoId);
         } else {
@@ -705,7 +719,7 @@ const storeNewMemories = memoryDb.transaction((results, currentBatch) => {
                 mem.size ?? 0.0,
                 mem.accessCount ?? 0.0,
                 mem.importance ?? 0.0,
-                mem.contentHash ?? ''
+                contentHash
             );
             updateLastVolNeg.run(currentBatch, mem.protoId);
         }

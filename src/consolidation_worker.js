@@ -15,27 +15,6 @@ memoryDb.pragma('cache_size = -128000');
 
 const polarity = isPositive ? 'positive' : 'negative';
 
-const computeGaussianDistance = (mu1, var1, mu2, var2) => {
-    const d = mu1.length;
-    if (d !== mu2.length || d === 0) return Infinity;
-
-    const eps = 1e-8;
-    let mahalTerm = 0;
-    let logDetTerm = 0;
-
-    for (let j = 0; j < d; j++) {
-        const v1 = Math.max(var1[j], eps);
-        const v2 = Math.max(var2[j], eps);
-        const avgV = (v1 + v2) / 2;
-        const dm = mu1[j] - mu2[j];
-
-        mahalTerm += (dm * dm) / avgV;
-        logDetTerm += Math.log(avgV / Math.sqrt(v1 * v2));
-    }
-
-    return (1/8) * mahalTerm + (1/2) * logDetTerm;
-};
-
 const deleteProtoEdgesForProto = memoryDb.prepare(`
     DELETE FROM proto_edges 
     WHERE source = ? AND polarity = ? AND (parent_proto = ? OR child_proto = ?)
@@ -76,6 +55,37 @@ const coreUpdateStmt = memoryDb.prepare(`
 const coreDeleteStmt = memoryDb.prepare(`
     DELETE FROM ${isPositive ? 'core_positive' : 'core_negative'} WHERE protoId = ?
 `);
+
+const computeGaussianDistance = (mu1, var1, mu2, var2) => {
+    const d = mu1.length;
+    if (d !== mu2.length || d === 0) return Infinity;
+
+    const eps = 1e-8;
+    let mahalTerm = 0;
+    let logDetTerm = 0;
+
+    for (let j = 0; j < d; j++) {
+        const v1 = Math.max(var1[j], eps);
+        const v2 = Math.max(var2[j], eps);
+        const avgV = (v1 + v2) / 2;
+        const dm = mu1[j] - mu2[j];
+
+        mahalTerm += (dm * dm) / avgV;
+        logDetTerm += Math.log(avgV / Math.sqrt(v1 * v2));
+    }
+
+    return (1/8) * mahalTerm + (1/2) * logDetTerm;
+};
+
+const computeContentHash = (mean) => {
+    let hash = 2166136261;
+    for (let i = 0; i < mean.length; i++) {
+        let iv = Math.floor(mean[i] * 10000 + 0.5);
+        hash ^= iv;
+        hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+    }
+    return ((hash >>> 0) % 0xFFFFFFFF).toString(16).padStart(8, '0');
+};
 
 const consolidateVolatile = () => {
     const volTable = isPositive ? 'volatile_positive' : 'volatile_negative';
@@ -142,7 +152,7 @@ const consolidateVolatile = () => {
                 target.usageCount += source.usageCount;
                 target.merged_count += source.merged_count;
                 target.lastAccessed = Math.max(target.lastAccessed, source.lastAccessed, currentBatch);
-                target.hash = target.hash || source.hash;
+                target.hash = computeContentHash(newMean);
 
                 volUpdateStmt.run(
                     JSON.stringify(target.mean),
@@ -167,6 +177,8 @@ const consolidateVolatile = () => {
 
     for (const mem of mems) {
         if (mem.merged_count >= config.consolidationPromoteCount && !coreExistsStmt.get(mem.protoId)) {
+            const promoteHash = computeContentHash(mem.mean);
+
             corePromoteStmt.run(
                 mem.protoId,
                 compat_id,
@@ -175,7 +187,7 @@ const consolidateVolatile = () => {
                 mem.size,
                 mem.accessCount,
                 mem.importance,
-                mem.hash,
+                promoteHash,
                 currentBatch,
                 mem.usageCount,
                 mem.merged_count
@@ -250,7 +262,7 @@ const consolidateCore = () => {
                 target.usageCount += source.usageCount;
                 target.merged_count += source.merged_count;
                 target.lastAccessed = Math.max(target.lastAccessed, source.lastAccessed, currentBatch);
-                target.hash = target.hash || source.hash;
+                target.hash = computeContentHash(newMean);
 
                 coreUpdateStmt.run(
                     JSON.stringify(target.mean),
