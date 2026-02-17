@@ -21,7 +21,7 @@ class HiveMind {
     #semanticLR; #semanticBoost; #effectiveSemanticMax;
     #longTermMaxProtos; #shortTermMaxProtos; #rawMaxProtos;
     #lowDim; #numProjections; #projectionMatrices;
-    #semanticMergeEvery; #kernelGamma;
+    #semanticMergeEvery; #coreConsolidateEvery; #kernelGamma;
     #maxRetrievedProtos; #numRetrievalCandidates;
     #maxEpisodicConsider; #replaySamples;
     #coreMaxProtos; #coreEpisodicMaxEntries; #coreEpisodic;
@@ -70,7 +70,7 @@ class HiveMind {
                 'maxTrustHistory', 'maxPerformanceHistory', 'learningRate', 'learningRateDecay',
                 'swarmIntelligenceFactor', 'gradientResetFrequency', 'semanticLR', 'semanticBoost',
                 'effectiveSemanticMax', 'longTermMaxProtos', 'shortTermMaxProtos', 'rawMaxProtos',
-                'lowDim', 'numProjections', 'semanticMergeEvery',
+                'lowDim', 'numProjections', 'semanticMergeEvery', 'coreConsolidateEvery',
                 'maxRetrievedProtos', 'numRetrievalCandidates', 'maxEpisodicConsider',
                 'replaySamples', 'coreMaxProtos', 'coreEpisodicMaxEntries',
                 'lshNumTables', 'lshHashBits', 'numLshSets', 'priorityMax', 'trainingStepCount',
@@ -215,6 +215,9 @@ class HiveMind {
                                 break;
                             case 'protoIdCounter':
                                 this.#protoIdCounter = BigInt(value);
+                                break;
+                            case 'coreConsolidateEvery':
+                                this.#coreConsolidateEvery = value;
                                 break;
                             default:
                                 console.warn(`Unexpected metadata key loaded: ${key}`);
@@ -954,6 +957,7 @@ class HiveMind {
                 mergeTrimFactor: this.#mergeTrimFactor,
                 kernelGamma: this.#kernelGamma,
                 protoIdCounter: this.#protoIdCounter,
+                coreConsolidateEvery : this.#coreConsolidateEvery,
                 trainingStepCount: this.#trainingStepCount ?? 0
             };
 
@@ -1410,6 +1414,7 @@ class HiveMind {
         this.#numRetrievalCandidates = forceMin ? 32 : Math.round(this.#baseProtoCapacity * candidatesMultiplier);
         
         this.#semanticMergeEvery  = forceMin ? 20 : Math.round(8 + 24 * this.#protoCapacityFactor);
+        this.#coreConsolidateEvery = forceMin ? 40 : Math.round(25 + 35 * this.#protoCapacityFactor);
 
         this.#maxEpisodicConsider = forceMin ? 45 : Math.round(this.#contextWindow * (0.4 + 0.2 * this.#memoryFactor));
         this.#replaySamples = forceMin ? 3 : Math.round(this.#baseProtoCapacity * (0.5 + 0.5 * this.#protoCapacityFactor));
@@ -3644,6 +3649,177 @@ class HiveMind {
         this.#semanticProtos[transformerIdx] = sem;
     }
 
+    #consolidateCoreProtos (transformerIdx) {
+        let sem = this.#semanticProtos[transformerIdx];
+        let cores = sem.filter(p => p.isCore);
+        const minForCoreCons = Math.max(3, Math.round(this.#coreMaxProtos * 0.25));
+        if (cores.length < minForCoreCons) return;
+
+        const perf = this.#performanceScores[transformerIdx] ?? 0.5;
+        const agreement = this.#agreementScores[transformerIdx] ?? 0.5;
+        const stagnation = this.#isStagnating(transformerIdx);
+        const dropBoost = this.#detectSuddenDrop(transformerIdx);
+        const hidden = this.#hiddenSize;
+
+        let coreMergeKernelThresh = (0.84 + 0.11 * this.#protoCapacityFactor) 
+            - 0.22 * (1 - agreement) 
+            + 0.18 * perf;
+        if (stagnation) coreMergeKernelThresh += 0.09;
+        if (dropBoost > 1.2) coreMergeKernelThresh += 0.07;
+        coreMergeKernelThresh = Math.max(0.78, Math.min(0.96, coreMergeKernelThresh));
+
+        const coreVarThresh = 0.75 + 3.5 * (1 - perf) * this.#memoryFactor 
+            + 1.8 * (1 - agreement) * this.#protoCapacityFactor;
+        let minSizeForCoreSplit = Math.round(this.#coreMaxProtos * 0.35) 
+            - Math.round(8 * perf * this.#protoCapacityFactor);
+        minSizeForCoreSplit = Math.max(5, minSizeForCoreSplit);
+
+        const pairs = [];
+        for (let i = 0; i < cores.length; i++) {
+            for (let j = i + 1; j < cores.length; j++) {
+                const sim = this.#kernelSimilarity(cores[i], cores[j]);
+                if (sim > coreMergeKernelThresh) {
+                    pairs.push([i, j, sim]);
+                }
+            }
+        }
+
+        if (pairs.length > 0) {
+            pairs.sort((a, b) => b[2] - a[2]);
+            const removed = new Set();
+            for (const [i, j] of pairs) {
+                if (removed.has(cores[i]) || removed.has(cores[j])) continue;
+                let keep = cores[i].size >= cores[j].size ? cores[i] : cores[j];
+                let remove = keep === cores[i] ? cores[j] : cores[i];
+                if (this.#computeProtoUtility(remove) > this.#computeProtoUtility(keep)) {
+                    [keep, remove] = [remove, keep];
+                }
+                const oldMean = new Float32Array(keep.mean);
+                const totalSize = keep.size + remove.size;
+                const newMean = this.#vectorAdd(oldMean, remove.mean, keep.size / totalSize, remove.size / totalSize);
+                keep.mean.set(newMean);
+                keep.contentHash = this.#computeContentHash(keep.mean);
+                keep.size = totalSize;
+                keep.accessCount += remove.accessCount * 2.2;
+                keep.importance = (keep.importance || 0) + (remove.importance || 0) * 1.15;
+                const delta = this.#vectorSub(newMean, oldMean);
+                for (let k = 0; k < hidden; k++) {
+                    keep.variance[k] = (keep.size * (keep.variance[k] + delta[k] * delta[k]) 
+                        + remove.size * (remove.variance[k] + (remove.mean[k] - newMean[k]) ** 2)) 
+                        / totalSize * 1.25;
+                    keep.variance[k] = Math.min(Math.max(keep.variance[k], 1e-6), this.#maxVariancePerDim);
+                }
+                keep.projNorms = this.#computeProjNorms(keep.mean);
+                this.#updateProtoInLSH(transformerIdx, keep);
+                this.#removeProtoFromLSH(transformerIdx, remove);
+                removed.add(remove);
+            }
+            sem = sem.filter(p => !removed.has(p));
+            cores = sem.filter(p => p.isCore);
+        }
+
+        if (cores.length < this.#coreMaxProtos * 1.6) {
+            for (let i = 0; i < cores.length; i++) {
+                const p = cores[i];
+                if (p.size < minSizeForCoreSplit) continue;
+                let varSum = 0;
+                for (let j = 0; j < hidden; j++) varSum += p.variance[j];
+                const avgVar = varSum / hidden;
+                if (avgVar <= coreVarThresh) continue;
+                let maxVar = 0, splitDim = 0;
+                for (let j = 0; j < hidden; j++) {
+                    if (p.variance[j] > maxVar) {
+                        maxVar = p.variance[j];
+                        splitDim = j;
+                    }
+                }
+                const splitScale = Math.sqrt(maxVar) * 1.8 * (1 + 4.5 * (1 - perf));
+                if (stagnation || dropBoost > 1.2) splitScale *= 1.6;
+                const originalMean = new Float32Array(p.mean);
+                const oldSize = p.size;
+                const half = Math.floor(oldSize / 2);
+
+                p.mean[splitDim] -= splitScale;
+                p.size = oldSize - half;
+                p.accessCount *= (p.size / oldSize);
+                p.variance[splitDim] = Math.min(p.variance[splitDim] + splitScale ** 2 * 4, this.#maxVariancePerDim);
+                p.importance *= 0.6;
+                p.projNorms = this.#computeProjNorms(p.mean);
+                this.#updateProtoInLSH(transformerIdx, p);
+                p.contentHash = this.#computeContentHash(p.mean);
+
+                const newMean = new Float32Array(originalMean);
+                newMean[splitDim] += splitScale;
+                const newVariance = new Float32Array(p.variance);
+                newVariance[splitDim] = Math.min(newVariance[splitDim] + splitScale ** 2 * 4, this.#maxVariancePerDim);
+                
+                const newProtoId = `${this.#hiveId}-${(this.#protoIdCounter++).toString()}`;
+                const newProto = {
+                    mean: newMean,
+                    variance: newVariance,
+                    size: half,
+                    accessCount: p.accessCount * (half / oldSize),
+                    projNorms: this.#computeProjNorms(newMean),
+                    isCore: true,
+                    importance: p.importance * 0.6,
+                    protoId: newProtoId,
+                    contentHash: this.#computeContentHash(newMean)
+                };
+                sem.push(newProto);
+                this.#insertProtoToLSH(transformerIdx, newProto);
+                if (sem.length >= this.#effectiveSemanticMax * this.#mergeTrimFactor) break;
+            }
+        }
+
+        if (sem.filter(p => p.isCore).length > this.#coreMaxProtos * 1.4) {
+            sem.forEach(p => p.isCore = false);
+            const candidateCores = sem.slice().sort((a, b) => this.#computeProtoUtility(b) - this.#computeProtoUtility(a));
+            const finalCores = [candidateCores[0]];
+            candidateCores[0].isCore = true;
+            for (let c = 1; c < this.#coreMaxProtos && c < candidateCores.length; c++) {
+                let bestIdx = -1, maxMinDist = -Infinity;
+                for (let i = 0; i < candidateCores.length; i++) {
+                    if (finalCores.includes(candidateCores[i])) continue;
+                    let minSim = Infinity;
+                    for (const coreP of finalCores) {
+                        const sim = this.#projSimilarity(candidateCores[i].projNorms, coreP.projNorms);
+                        if (sim < minSim) minSim = sim;
+                    }
+                    const dist = 1 - minSim;
+                    if (dist > maxMinDist) {
+                        maxMinDist = dist;
+                        bestIdx = i;
+                    }
+                }
+                if (bestIdx !== -1) {
+                    candidateCores[bestIdx].isCore = true;
+                    finalCores.push(candidateCores[bestIdx]);
+                }
+            }
+        }
+
+        sem = sem.filter(p => p.isCore || (p.accessCount || 0) >= 2.0);
+
+        const numPriority = Math.min(Math.round(this.#priorityMax * this.#tempOverloadFactor), sem.length);
+        if (numPriority > 0) {
+            const indexed = sem.map((proto, i) => ({i, util: this.#computeProtoUtility(proto)}));
+            indexed.sort((a, b) => b.util - a.util);
+            this.#priorityIndices[transformerIdx] = indexed.slice(0, numPriority).map(o => o.i);
+        } else {
+            this.#priorityIndices[transformerIdx] = [];
+        }
+
+        this.#normalizeSemantic(transformerIdx, sem);
+        this.#semanticProtos[transformerIdx] = sem;
+
+        const coreEp = this.#coreEpisodic[transformerIdx];
+        if (coreEp.length > this.#coreEpisodicMaxEntries * 1.2) {
+            coreEp.sort((a, b) => this.#computeMemoryScoreFromProtos(b.protos, null, transformerIdx, -1, [], true) 
+                - this.#computeMemoryScoreFromProtos(a.protos, null, transformerIdx, -1, [], true));
+            this.#coreEpisodic[transformerIdx] = coreEp.slice(0, this.#coreEpisodicMaxEntries);
+        }
+    }
+
     #computeMemoryScoreFromProtos (protos, attentionScores, transformerIdx, entryIndex, memoryList, ignoreRecency = false) {
         if (!Array.isArray(protos) || protos.length === 0) return 0;
 
@@ -4071,10 +4247,18 @@ class HiveMind {
 
             this.#generativeReplay(transformerIdx);
 
+            let didConsolidate = false;
             if (this.#trainingStepCount % this.#semanticMergeEvery === 0 && training) {
                 this.#consolidateSemanticProtos(transformerIdx);
-                this.#replayOldMemory(transformerIdx);
+                didConsolidate = true;
             }
+
+            if (this.#trainingStepCount % this.#coreConsolidateEvery === 0 && training) {
+                this.#consolidateCoreProtos(transformerIdx);
+                didConsolidate = true;
+            }
+
+            if (didConsolidate) this.#replayOldMemory(transformerIdx);
 
             const dropBoost = this.#detectSuddenDrop(transformerIdx);
             if (dropBoost > 1.5 && Math.random() < 0.4) {
