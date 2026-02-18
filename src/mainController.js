@@ -38,6 +38,9 @@ const CONFIG = {
     sectionPriceBoost: 0.10,
     layerPriceBoost: 0.15,
 
+    broadcastRatio : 0.025,
+    injectionRatio : 0.025,
+
     volatileMemoryDecayFactor: 0.999,
     coreMemoryDecayFactor: 0.9995,
     memoryDecayFloor: 1,
@@ -45,7 +48,7 @@ const CONFIG = {
     coreConsolidationThreshold: 0.01,
     consolidationPromoteCount: 25,
     coreCapacityRatio: 0.333,
-    performanceBoostFactor: 1.005,
+    performanceBoostFactor: 1.001,
     maxVaultCandidates: 5000,
     memoryVaultCapacity: 5000000,
     volatileConsolidationLimit: 1000,
@@ -1230,7 +1233,7 @@ const processBatch = async () => {
     }
 
     let consolProgress = 0;
-    console.log(`Consolidation progress: ${consolProgress}/${consolidationTasks.length} (${((consolProgress / consolidationTasks.length) * 100).toFixed(2)}%)...`);
+    console.log(`Consolidation progress: ${consolProgress}/${consolidationTasks.length} (${((consolProgress / (consolidationTasks.length < 1 ? 1 : consolidationTasks.length)) * 100).toFixed(2)}%)...`);
 
     for (let index = 0; index < consolidationTasks.length; index += CONFIG.maxWorkers) {
         const chunk = consolidationTasks.slice(index, index + CONFIG.maxWorkers);
@@ -1344,6 +1347,8 @@ const runWorker = async (controller) => {
                 },
                 processCount: CONFIG.baseProcessCount,
                 forceMin: CONFIG.forceMin,
+                bcR : CONFIG.broadcastRatio,
+                injR : CONFIG.injectionRatio,
                 sharedMem : peerSharedMem
             },
         });
