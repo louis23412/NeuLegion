@@ -6672,8 +6672,7 @@ class HiveMind {
             memoriesInjected: totalInjected,
             totalMemories: finalTotal,
             injectedRatio: Number(((totalInjected / finalTotal) * 100).toFixed(3)),
-            protosPerMember: Number((totalInjected / this.#ensembleSize).toFixed(3)),
-            coreInjected: sharedCore.length
+            protosPerMember: Number((totalInjected / this.#ensembleSize).toFixed(3))
         };
     }
 
