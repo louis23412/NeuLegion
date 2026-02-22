@@ -25,9 +25,7 @@ class HiveMindController {
         realPoints : 0,
 
         memoriesSent : 0,
-        memoriesReceived : 0,
-        currentMemories : 0,
-        lastMemoryChange : 0
+        memoriesReceived : 0
     }
 
     #cacheSize;
@@ -164,16 +162,6 @@ class HiveMindController {
         if (memReceivedRaw) {
             this.#globalAccuracy.memoriesReceived = memReceivedRaw.value;
         }
-
-        const currMemsRaw = selectStmt.get('current_memories');
-        if (currMemsRaw) {
-            this.#globalAccuracy.currentMemories = currMemsRaw.value;
-        }
-
-        const memChangeRaw = selectStmt.get('memory_change');
-        if (memChangeRaw) {
-            this.#globalAccuracy.lastMemoryChange = memChangeRaw.value;
-        }
     }
 
     #saveGlobalAccuracy () {
@@ -193,8 +181,6 @@ class HiveMindController {
             upsertStmt.run('real_points', this.#globalAccuracy.realPoints);
             upsertStmt.run('memories_sent', this.#globalAccuracy.memoriesSent);
             upsertStmt.run('memories_received', this.#globalAccuracy.memoriesReceived);
-            upsertStmt.run('current_memories', this.#globalAccuracy.currentMemories);
-            upsertStmt.run('memory_change', this.#globalAccuracy.lastMemoryChange);
         });
         transaction();
     }
@@ -646,14 +632,21 @@ class HiveMindController {
 
         this.#processClosedTrades(processCount);
 
+        let memoryChange = 0;
+        let memoriesInjected = 0;
+        let currentMemories = 0;
+        let memoriesPerMember = 0;
         if (this.#shouldDumpState && this.#hivemind) {
             this.#memoryBroadcast = this.#hivemind.broadcastMemory(features.flat(), bcR);
             this.#globalAccuracy.memoriesSent += this.#memoryBroadcast.totalBroadcast;
 
             const translation = this.#hivemind.translateMemory(sharedMemories, injR);
             this.#globalAccuracy.memoriesReceived += translation.memoriesInjected;
-            this.#globalAccuracy.currentMemories = translation.totalMemories;
-            this.#globalAccuracy.lastMemoryChange = translation.injectedRatio;
+
+            memoryChange = translation.injectedRatio;
+            memoriesInjected = translation.memoriesInjected;
+            currentMemories = translation.totalMemories;
+            memoriesPerMember = translation.protosPerMember;
 
             this.#lastSaveStatus = this.#hivemind.dumpState();
         }
@@ -706,10 +699,12 @@ class HiveMindController {
             tradeAcc : tradeWinAcc,
             trueAcc,
 
-            memoriesSent : this.#globalAccuracy.memoriesSent,
-            memoriesReceived : this.#globalAccuracy.memoriesReceived,
-            currentMemories : this.#globalAccuracy.currentMemories,
-            lastMemoryChange : this.#globalAccuracy.lastMemoryChange,
+            totalMemoriesSent : this.#globalAccuracy.memoriesSent,
+            totalMemoriesReceived : this.#globalAccuracy.memoriesReceived,
+            lastMemoriesInjected : memoriesInjected,
+            lastMemoryChange : memoryChange,
+            lastMemoriesPerMember : memoriesPerMember,
+            currentMemories,
 
             memoryBroadcast : this.#memoryBroadcast,
         };

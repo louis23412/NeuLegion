@@ -1135,13 +1135,17 @@ const processBatch = async () => {
                             const similarity = Math.exp(-curr.accumDist / type.thresh);
                             const effectiveBoost = CONFIG.performanceBoostFactor * similarity;
 
+                            const finalSize = Math.max(CONFIG.memoryDecayFloor, decayedSize * effectiveBoost);
+                            const finalAccess = Math.max(CONFIG.memoryDecayFloor, decayedAccess * effectiveBoost);
+                            const finalImportance = Math.max(CONFIG.memoryDecayFloor, decayedImportance * effectiveBoost);
+
                             additionalVault.push({
                                 protoId: curr.protoId,
                                 mean: JSON.parse(row.mean),
                                 variance: JSON.parse(row.variance),
-                                size: decayedSize * effectiveBoost,
-                                accessCount: decayedAccess * effectiveBoost,
-                                importance: decayedImportance * effectiveBoost,
+                                size: finalSize,
+                                accessCount: finalAccess,
+                                importance: finalImportance,
                                 contentHash: row.hash,
                                 isCore: type.source === 'core'
                             });
