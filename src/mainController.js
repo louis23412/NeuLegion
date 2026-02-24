@@ -497,6 +497,57 @@ const boostVolatileNeg = memoryDb.prepare(`
     WHERE protoId = ?
 `);
 
+const updateVolatilePosMain = memoryDb.prepare(`
+    UPDATE volatile_positive
+    SET mean = ?, variance = ?, size = ?, accessCount = ?, importance = ?, hash = ?, lastAccessed = ?, usageCount = ?, merged_count = ?
+    WHERE protoId = ?
+`);
+
+const updateVolatileNegMain = memoryDb.prepare(`
+    UPDATE volatile_negative
+    SET mean = ?, variance = ?, size = ?, accessCount = ?, importance = ?, hash = ?, lastAccessed = ?, usageCount = ?, merged_count = ?
+    WHERE protoId = ?
+`);
+
+const deleteVolatilePosMain = memoryDb.prepare('DELETE FROM volatile_positive WHERE protoId = ?');
+const deleteVolatileNegMain = memoryDb.prepare('DELETE FROM volatile_negative WHERE protoId = ?');
+
+const insertCorePosMain = memoryDb.prepare(`
+    INSERT INTO core_positive (protoId, compat_id, mean, variance, size, accessCount, importance, hash, lastAccessed, usageCount, merged_count)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const insertCoreNegMain = memoryDb.prepare(`
+    INSERT INTO core_negative (protoId, compat_id, mean, variance, size, accessCount, importance, hash, lastAccessed, usageCount, merged_count)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const updateCorePosMain = memoryDb.prepare(`
+    UPDATE core_positive
+    SET mean = ?, variance = ?, size = ?, accessCount = ?, importance = ?, hash = ?, lastAccessed = ?, usageCount = ?, merged_count = ?
+    WHERE protoId = ?
+`);
+
+const updateCoreNegMain = memoryDb.prepare(`
+    UPDATE core_negative
+    SET mean = ?, variance = ?, size = ?, accessCount = ?, importance = ?, hash = ?, lastAccessed = ?, usageCount = ?, merged_count = ?
+    WHERE protoId = ?
+`);
+
+const deleteCorePosMain = memoryDb.prepare('DELETE FROM core_positive WHERE protoId = ?');
+const deleteCoreNegMain = memoryDb.prepare('DELETE FROM core_negative WHERE protoId = ?');
+
+const deleteProtoEdgesForProtoMain = memoryDb.prepare(`
+    DELETE FROM proto_edges 
+    WHERE source = ? AND polarity = ? AND (parent_proto = ? OR child_proto = ?)
+`);
+
+const insertProtoEdgeMain = memoryDb.prepare(`
+    INSERT INTO proto_edges (source, polarity, parent_proto, child_proto, accum_distance)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(source, polarity, parent_proto, child_proto) DO NOTHING
+`);
+
 const selectMemCorePos = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash, lastAccessed FROM core_positive WHERE protoId = ?');
 const selectMemCoreNeg = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash, lastAccessed FROM core_negative WHERE protoId = ?');
 const selectMemVolPos = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash, lastAccessed FROM volatile_positive WHERE protoId = ?');
@@ -855,16 +906,15 @@ const initLegion = () => {
 };
 
 const processBatch = async () => {
-    console.log(`New batch(${candleCounter}):`);
-
-    const totalStart = performance.now();
     const currentBatch = candleCounter;
     let progressTracker = 0;
     const results = [];
 
     const allControllers = structureMap.flat(3);
 
-    console.log(`Processed ${progressTracker}/${allControllers.length} controllers (${((progressTracker / allControllers.length) * 100).toFixed(2)}%)...`);
+    console.log('--');
+    const controllerStart = performance.now();
+    console.log(`> Processing controllers - ${progressTracker}/${allControllers.length} (${((progressTracker / allControllers.length) * 100).toFixed(2)}%)...`);
 
     for (let index = 0; index < allControllers.length; index += CONFIG.maxWorkers) {
         const chunk = allControllers.slice(index, index + CONFIG.maxWorkers);
@@ -882,11 +932,18 @@ const processBatch = async () => {
             progressTracker++;
 
             process.stdout.moveCursor(0, -1);
-            console.log(`Processed ${progressTracker}/${allControllers.length} controllers (${((progressTracker / allControllers.length) * 100).toFixed(2)}%)...`);
+            console.log(`> Processing controllers - ${progressTracker}/${allControllers.length} (${((progressTracker / allControllers.length) * 100).toFixed(2)}%)...`);
 
             results.push(result);
         });
     }
+
+    const controllersEnd = performance.now();
+    console.log(`> Processed all controllers in ${((controllersEnd - controllerStart) / 1000).toFixed(3)} seconds`);
+    console.log('--');
+
+    const memoryAnalyzeStart = performance.now();
+    console.log(`> Analyzing controller memories...`);
 
     for (const { controller, signal, duration } of results) {
         controller.lastSignal = signal;
@@ -1226,6 +1283,12 @@ const processBatch = async () => {
         })();
     }
 
+    const memoryAnalyzeEnd = performance.now();
+    console.log(`> Analyzed controller memories in ${((memoryAnalyzeEnd - memoryAnalyzeStart) / 1000).toFixed(3)} seconds`);
+    console.log('--');
+
+    const memoryConsolidateStart = performance.now();
+
     const { posIdMap, negIdMap } = storeNewMemories(results, currentBatch);
 
     const consolidationTasks = [];
@@ -1236,8 +1299,10 @@ const processBatch = async () => {
         if (compat_id) consolidationTasks.push({ compat_id, isPositive: false });
     }
 
+    const allDeltas = [];
+
     let consolProgress = 0;
-    console.log(`Consolidation progress: ${consolProgress}/${consolidationTasks.length} (${((consolProgress / (consolidationTasks.length < 1 ? 1 : consolidationTasks.length)) * 100).toFixed(2)}%)...`);
+    console.log(`> Consolidating vault memories - ${consolProgress}/${consolidationTasks.length} (${((consolProgress / (consolidationTasks.length || 1)) * 100).toFixed(2)}%)...`);
 
     for (let index = 0; index < consolidationTasks.length; index += CONFIG.maxWorkers) {
         const chunk = consolidationTasks.slice(index, index + CONFIG.maxWorkers);
@@ -1245,13 +1310,68 @@ const processBatch = async () => {
             runConsolidationWorker(task.compat_id, task.isPositive, currentBatch)
         );
 
-        await Promise.all(promises);
+        const chunkDeltas = await Promise.all(promises);
+        allDeltas.push(...chunkDeltas);
 
         consolProgress += chunk.length;
-
         process.stdout.moveCursor(0, -1);
-        console.log(`Consolidation progress: ${consolProgress}/${consolidationTasks.length} (${((consolProgress / consolidationTasks.length) * 100).toFixed(2)}%)...`);
+        console.log(`> Consolidating vault memories - ${consolProgress}/${consolidationTasks.length} (${((consolProgress / (consolidationTasks.length || 1)) * 100).toFixed(2)}%)...`);
     }
+
+    const memoryConsolidateEnd = performance.now();
+    console.log(`> Consolidated vault memories in ${((memoryConsolidateEnd- memoryConsolidateStart) / 1000).toFixed(3)} seconds`);
+    console.log('--');
+
+    const vaultStateStart = performance.now();
+    console.log(`> Updating memory vault state...`);
+
+    memoryDb.transaction(() => { // This is slow
+        for (const delta of allDeltas) {
+            const isPos = delta.isPositive;
+            const v = delta.volatile;
+            const c = delta.core;
+
+            v.updates.forEach(u => {
+                (isPos ? updateVolatilePosMain : updateVolatileNegMain).run(
+                    u.mean, u.variance, u.size, u.accessCount, u.importance, u.hash,
+                    u.lastAccessed, u.usageCount, u.merged_count, u.protoId
+                );
+            });
+
+            v.deletes.forEach(id => {
+                (isPos ? deleteVolatilePosMain : deleteVolatileNegMain).run(id);
+            });
+
+            v.promotes.forEach(p => {
+                (isPos ? insertCorePosMain : insertCoreNegMain).run(
+                    p.protoId, delta.compat_id, p.mean, p.variance, p.size,
+                    p.accessCount, p.importance, p.hash, p.lastAccessed,
+                    p.usageCount, p.merged_count
+                );
+            });
+
+            c.updates.forEach(u => {
+                (isPos ? updateCorePosMain : updateCoreNegMain).run(
+                    u.mean, u.variance, u.size, u.accessCount, u.importance, u.hash,
+                    u.lastAccessed, u.usageCount, u.merged_count, u.protoId
+                );
+            });
+
+            c.deletes.forEach(id => {
+                (isPos ? deleteCorePosMain : deleteCoreNegMain).run(id);
+            });
+
+            delta.edges.deletes.forEach(d => {
+                deleteProtoEdgesForProtoMain.run(d.source, d.polarity, d.protoId, d.protoId);
+            });
+
+            delta.edges.inserts.forEach(e => {
+                insertProtoEdgeMain.run(
+                    e.source, e.polarity, e.parent_proto, e.child_proto, e.accum_distance
+                );
+            });
+        }
+    })();
 
     const coreCapacity = Math.floor(CONFIG.memoryVaultCapacity * CONFIG.coreCapacityRatio);
 
@@ -1305,8 +1425,9 @@ const processBatch = async () => {
         currentTotal -= purgedVol;
     }
 
-    const totalEnd = performance.now();
-    console.log(`Batch completed in ${((totalEnd - totalStart) / 1000).toFixed(3)} seconds`);
+    const vaultStateEnd = performance.now();
+    console.log(`> Updated memory vault state in ${((vaultStateEnd- vaultStateStart) / 1000).toFixed(3)} seconds`);
+    console.log('--');
 };
 
 const runWorker = async (controller) => {
@@ -1409,15 +1530,13 @@ const runConsolidationWorker = async (compat_id, isPositive, currentBatch) => {
             if (msg.error) {
                 reject(new Error(msg.error));
             } else {
-                resolve();
+                resolve(msg.delta);
             }
         });
 
         worker.on('error', reject);
         worker.on('exit', (code) => {
-            if (code !== 0) {
-                reject(new Error(`Consolidation worker exited with code ${code}`));
-            }
+            if (code !== 0) reject(new Error(`Consolidation worker exited with code ${code}`));
         });
     });
 };
@@ -1457,8 +1576,14 @@ const processCandles = async () => {
             candleCounter++;
             if (candleCounter <= rebuildCounter) continue;
 
+            const finalStart = performance.now();
+            console.log(`New candle (${candleCounter}):`);
+
             await processBatch();
             saveLegionState();
+
+            const finalEnd = performance.now();
+            console.log(`> All completed in ${((finalEnd - finalStart) / 1000).toFixed(3)} seconds`);
 
             console.log('-------------------------------------------------------');
 
