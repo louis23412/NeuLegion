@@ -173,8 +173,8 @@ memoryDb.exec(`
     CREATE TABLE IF NOT EXISTS core_positive (
         protoId TEXT PRIMARY KEY,
         compat_id INTEGER NOT NULL REFERENCES compat_positive(id),
-        mean TEXT NOT NULL,
-        variance TEXT NOT NULL,
+        mean BLOB NOT NULL,
+        variance BLOB NOT NULL,
         size REAL NOT NULL,
         accessCount REAL NOT NULL,
         importance REAL NOT NULL,
@@ -186,8 +186,8 @@ memoryDb.exec(`
     CREATE TABLE IF NOT EXISTS core_negative (
         protoId TEXT PRIMARY KEY,
         compat_id INTEGER NOT NULL REFERENCES compat_negative(id),
-        mean TEXT NOT NULL,
-        variance TEXT NOT NULL,
+        mean BLOB NOT NULL,
+        variance BLOB NOT NULL,
         size REAL NOT NULL,
         accessCount REAL NOT NULL,
         importance REAL NOT NULL,
@@ -199,8 +199,8 @@ memoryDb.exec(`
     CREATE TABLE IF NOT EXISTS volatile_positive (
         protoId TEXT PRIMARY KEY,
         compat_id INTEGER NOT NULL REFERENCES compat_positive(id),
-        mean TEXT NOT NULL,
-        variance TEXT NOT NULL,
+        mean BLOB NOT NULL,
+        variance BLOB NOT NULL,
         size REAL NOT NULL,
         accessCount REAL NOT NULL,
         importance REAL NOT NULL,
@@ -212,8 +212,8 @@ memoryDb.exec(`
     CREATE TABLE IF NOT EXISTS volatile_negative (
         protoId TEXT PRIMARY KEY,
         compat_id INTEGER NOT NULL REFERENCES compat_negative(id),
-        mean TEXT NOT NULL,
-        variance TEXT NOT NULL,
+        mean BLOB NOT NULL,
+        variance BLOB NOT NULL,
         size REAL NOT NULL,
         accessCount REAL NOT NULL,
         importance REAL NOT NULL,
@@ -509,9 +509,6 @@ const updateVolatileNegMain = memoryDb.prepare(`
     WHERE protoId = ?
 `);
 
-const deleteVolatilePosMain = memoryDb.prepare('DELETE FROM volatile_positive WHERE protoId = ?');
-const deleteVolatileNegMain = memoryDb.prepare('DELETE FROM volatile_negative WHERE protoId = ?');
-
 const insertCorePosMain = memoryDb.prepare(`
     INSERT INTO core_positive (protoId, compat_id, mean, variance, size, accessCount, importance, hash, lastAccessed, usageCount, merged_count)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -534,9 +531,6 @@ const updateCoreNegMain = memoryDb.prepare(`
     WHERE protoId = ?
 `);
 
-const deleteCorePosMain = memoryDb.prepare('DELETE FROM core_positive WHERE protoId = ?');
-const deleteCoreNegMain = memoryDb.prepare('DELETE FROM core_negative WHERE protoId = ?');
-
 const deleteProtoEdgesForProtoMain = memoryDb.prepare(`
     DELETE FROM proto_edges 
     WHERE source = ? AND polarity = ? AND (parent_proto = ? OR child_proto = ?)
@@ -558,6 +552,202 @@ const getNeighbors = memoryDb.prepare(`
     UNION ALL
     SELECT child_proto AS neighbor_proto, accum_distance FROM proto_edges WHERE source = ? AND polarity = ? AND parent_proto = ?
 `);
+
+const storeNewMemories = memoryDb.transaction((results, currentBatch) => {
+    const posCompatSet = new Set();
+    const negCompatSet = new Set();
+    const posMems = [];
+    const negMems = [];
+
+    for (const { signal, controller } of results) {
+        if (!signal?.memoryBroadcast?.compatibility || !signal?.memoryBroadcast?.memories?.length) continue;
+
+        const mb = signal.memoryBroadcast;
+        const compatStr = canonicalJSON(mb.compatibility);
+
+        const isPositive = controller.type === 'positive';
+        (isPositive ? posCompatSet : negCompatSet).add(compatStr);
+
+        const targetArray = isPositive ? posMems : negMems;
+        for (const indivMem of mb.memories) {
+            if (!indivMem?.mean || !indivMem?.variance || !indivMem?.protoId) continue;
+            targetArray.push({
+                mem: indivMem,
+                compatStr,
+                isCore: !!indivMem.isCore
+            });
+        }
+    }
+
+    for (const str of posCompatSet) insertCompatPos.run(str);
+    for (const str of negCompatSet) insertCompatNeg.run(str);
+
+    const posIdMap = {};
+    for (const str of posCompatSet) {
+        const row = getCompatIdPos.get(str);
+        if (row) posIdMap[str] = row.id;
+    }
+    const negIdMap = {};
+    for (const str of negCompatSet) {
+        const row = getCompatIdNeg.get(str);
+        if (row) negIdMap[str] = row.id;
+    }
+
+    for (const { mem, compatStr, isCore } of posMems) {
+        const compat_id = posIdMap[compatStr];
+        if (!compat_id) continue;
+
+        const contentHash = computeContentHash(mem.mean);
+
+        if (isCore) {
+            deleteFromVolatilePos.run(mem.protoId);
+            if (existsInCorePos.get(mem.protoId)) continue;
+            upsertCorePos.run(
+                mem.protoId,
+                compat_id,
+                vectorToBlob(mem.mean),
+                vectorToBlob(mem.variance),
+                mem.size ?? 0.0,
+                mem.accessCount ?? 0.0,
+                mem.importance ?? 0.0,
+                contentHash
+            );
+            updateLastCorePos.run(currentBatch, mem.protoId);
+        } else {
+            if (existsInCorePos.get(mem.protoId) || existsInVolatilePos.get(mem.protoId)) continue;
+            upsertVolatilePos.run(
+                mem.protoId,
+                compat_id,
+                vectorToBlob(mem.mean),
+                vectorToBlob(mem.variance),
+                mem.size ?? 0.0,
+                mem.accessCount ?? 0.0,
+                mem.importance ?? 0.0,
+                contentHash
+            );
+            updateLastVolPos.run(currentBatch, mem.protoId);
+        }
+    }
+
+    for (const { mem, compatStr, isCore } of negMems) {
+        const compat_id = negIdMap[compatStr];
+        if (!compat_id) continue;
+
+        const contentHash = computeContentHash(mem.mean);
+
+        if (isCore) {
+            deleteFromVolatileNeg.run(mem.protoId);
+            if (existsInCoreNeg.get(mem.protoId)) continue;
+            upsertCoreNeg.run(
+                mem.protoId,
+                compat_id,
+                vectorToBlob(mem.mean),
+                vectorToBlob(mem.variance),
+                mem.size ?? 0.0,
+                mem.accessCount ?? 0.0,
+                mem.importance ?? 0.0,
+                contentHash
+            );
+            updateLastCoreNeg.run(currentBatch, mem.protoId);
+        } else {
+            if (existsInCoreNeg.get(mem.protoId) || existsInVolatileNeg.get(mem.protoId)) continue;
+            upsertVolatileNeg.run(
+                mem.protoId,
+                compat_id,
+                vectorToBlob(mem.mean),
+                vectorToBlob(mem.variance),
+                mem.size ?? 0.0,
+                mem.accessCount ?? 0.0,
+                mem.importance ?? 0.0,
+                contentHash
+            );
+            updateLastVolNeg.run(currentBatch, mem.protoId);
+        }
+    }
+
+    return { posIdMap, negIdMap };
+});
+
+const applyBulkDeltas = memoryDb.transaction((deltas) => {
+    const deletes = { volPos: [], volNeg: [], corePos: [], coreNeg: [] };
+    const updates = { volPos: [], volNeg: [], corePos: [], coreNeg: [] };
+    const promotes = { corePos: [], coreNeg: [] };
+
+    for (const delta of deltas) {
+        const isPos = delta.isPositive;
+        const v = delta.volatile;
+        const c = delta.core;
+
+        deletes[isPos ? 'volPos' : 'volNeg'].push(...v.deletes);
+        deletes[isPos ? 'corePos' : 'coreNeg'].push(...c.deletes);
+
+        v.updates.forEach(u => {
+            updates[isPos ? 'volPos' : 'volNeg'].push([
+                vectorToBlob(u.mean), vectorToBlob(u.variance),
+                u.size, u.accessCount, u.importance, u.hash,
+                u.lastAccessed, u.usageCount, u.merged_count, u.protoId
+            ]);
+        });
+        c.updates.forEach(u => {
+            updates[isPos ? 'corePos' : 'coreNeg'].push([
+                vectorToBlob(u.mean), vectorToBlob(u.variance),
+                u.size, u.accessCount, u.importance, u.hash,
+                u.lastAccessed, u.usageCount, u.merged_count, u.protoId
+            ]);
+        });
+
+        v.promotes.forEach(p => {
+            promotes[isPos ? 'corePos' : 'coreNeg'].push([
+                p.protoId, delta.compat_id,
+                vectorToBlob(p.mean), vectorToBlob(p.variance),
+                p.size, p.accessCount, p.importance, p.hash,
+                p.lastAccessed, p.usageCount, p.merged_count
+            ]);
+        });
+
+        delta.edges.deletes.forEach(d => {
+            deleteProtoEdgesForProtoMain.run(d.source, d.polarity, d.protoId, d.protoId);
+        });
+        delta.edges.inserts.forEach(e => {
+            insertProtoEdgeMain.run(e.source, e.polarity, e.parent_proto, e.child_proto, e.accum_distance);
+        });
+    }
+
+    const applyChunkedDelete = (table, ids) => {
+        if (!ids.length) return;
+        const chunkSize = 400;
+        for (let i = 0; i < ids.length; i += chunkSize) {
+            const chunk = ids.slice(i, i + chunkSize);
+            const ph = chunk.map(() => '?').join(',');
+            memoryDb.prepare(`DELETE FROM ${table} WHERE protoId IN (${ph})`).run(...chunk);
+        }
+    };
+
+    applyChunkedDelete('volatile_positive', deletes.volPos);
+    applyChunkedDelete('volatile_negative', deletes.volNeg);
+    applyChunkedDelete('core_positive', deletes.corePos);
+    applyChunkedDelete('core_negative', deletes.coreNeg);
+
+    updates.volPos.forEach(p => updateVolatilePosMain.run(...p));
+    updates.volNeg.forEach(p => updateVolatileNegMain.run(...p));
+    updates.corePos.forEach(p => updateCorePosMain.run(...p));
+    updates.coreNeg.forEach(p => updateCoreNegMain.run(...p));
+
+    promotes.corePos.forEach(p => insertCorePosMain.run(...p));
+    promotes.coreNeg.forEach(p => insertCoreNegMain.run(...p));
+});
+
+const vectorToBlob = (vec) => {
+    if (!Array.isArray(vec) || vec.length === 0) return Buffer.allocUnsafe(0);
+    const f64 = new Float64Array(vec);
+    return Buffer.from(f64.buffer, f64.byteOffset, f64.byteLength);
+};
+
+const blobToVector = (blob) => {
+    if (!Buffer.isBuffer(blob) || blob.length === 0 || blob.length % 8 !== 0) return [];
+    const f64 = new Float64Array(blob.buffer, blob.byteOffset, blob.length / 8);
+    return Array.from(f64);
+};
 
 const canonicalJSON = (obj) => {
     if (obj === null || typeof obj !== 'object') {
@@ -666,121 +856,6 @@ const getControllerParams = (group, section, layer) => {
         pop: Math.round(CONFIG.basePop * popFactor)
     };
 };
-
-const storeNewMemories = memoryDb.transaction((results, currentBatch) => {
-    const posCompatSet = new Set();
-    const negCompatSet = new Set();
-    const posMems = [];
-    const negMems = [];
-
-    for (const { signal, controller } of results) {
-        if (!signal?.memoryBroadcast?.compatibility || !signal?.memoryBroadcast?.memories?.length) continue;
-
-        const mb = signal.memoryBroadcast;
-        const compatStr = canonicalJSON(mb.compatibility);
-
-        const isPositive = controller.type === 'positive';
-        (isPositive ? posCompatSet : negCompatSet).add(compatStr);
-
-        const targetArray = isPositive ? posMems : negMems;
-        for (const indivMem of mb.memories) {
-            if (!indivMem?.mean || !indivMem?.variance || !indivMem?.protoId) continue;
-            targetArray.push({
-                mem: indivMem,
-                compatStr,
-                isCore: !!indivMem.isCore
-            });
-        }
-    }
-
-    for (const str of posCompatSet) insertCompatPos.run(str);
-    for (const str of negCompatSet) insertCompatNeg.run(str);
-
-    const posIdMap = {};
-    for (const str of posCompatSet) {
-        const row = getCompatIdPos.get(str);
-        if (row) posIdMap[str] = row.id;
-    }
-    const negIdMap = {};
-    for (const str of negCompatSet) {
-        const row = getCompatIdNeg.get(str);
-        if (row) negIdMap[str] = row.id;
-    }
-
-    for (const { mem, compatStr, isCore } of posMems) {
-        const compat_id = posIdMap[compatStr];
-        if (!compat_id) continue;
-
-        const contentHash = computeContentHash(mem.mean);
-
-        if (isCore) {
-            deleteFromVolatilePos.run(mem.protoId);
-            if (existsInCorePos.get(mem.protoId)) continue;
-            upsertCorePos.run(
-                mem.protoId,
-                compat_id,
-                JSON.stringify(mem.mean),
-                JSON.stringify(mem.variance),
-                mem.size ?? 0.0,
-                mem.accessCount ?? 0.0,
-                mem.importance ?? 0.0,
-                contentHash
-            );
-            updateLastCorePos.run(currentBatch, mem.protoId);
-        } else {
-            if (existsInCorePos.get(mem.protoId) || existsInVolatilePos.get(mem.protoId)) continue;
-            upsertVolatilePos.run(
-                mem.protoId,
-                compat_id,
-                JSON.stringify(mem.mean),
-                JSON.stringify(mem.variance),
-                mem.size ?? 0.0,
-                mem.accessCount ?? 0.0,
-                mem.importance ?? 0.0,
-                contentHash
-            );
-            updateLastVolPos.run(currentBatch, mem.protoId);
-        }
-    }
-
-    for (const { mem, compatStr, isCore } of negMems) {
-        const compat_id = negIdMap[compatStr];
-        if (!compat_id) continue;
-
-        const contentHash = computeContentHash(mem.mean);
-
-        if (isCore) {
-            deleteFromVolatileNeg.run(mem.protoId);
-            if (existsInCoreNeg.get(mem.protoId)) continue;
-            upsertCoreNeg.run(
-                mem.protoId,
-                compat_id,
-                JSON.stringify(mem.mean),
-                JSON.stringify(mem.variance),
-                mem.size ?? 0.0,
-                mem.accessCount ?? 0.0,
-                mem.importance ?? 0.0,
-                contentHash
-            );
-            updateLastCoreNeg.run(currentBatch, mem.protoId);
-        } else {
-            if (existsInCoreNeg.get(mem.protoId) || existsInVolatileNeg.get(mem.protoId)) continue;
-            upsertVolatileNeg.run(
-                mem.protoId,
-                compat_id,
-                JSON.stringify(mem.mean),
-                JSON.stringify(mem.variance),
-                mem.size ?? 0.0,
-                mem.accessCount ?? 0.0,
-                mem.importance ?? 0.0,
-                contentHash
-            );
-            updateLastVolNeg.run(currentBatch, mem.protoId);
-        }
-    }
-
-    return { posIdMap, negIdMap };
-});
 
 const saveLegionState = () => {
     db.transaction(() => {
@@ -1012,8 +1087,8 @@ const processBatch = async () => {
             let vaultCandidates = rows.map(row => ({
                 source: row.source,
                 protoId: row.protoId,
-                mean: JSON.parse(row.mean),
-                variance: JSON.parse(row.variance),
+                mean: blobToVector(row.mean),
+                variance: blobToVector(row.variance),
                 size: row.size,
                 accessCount: row.accessCount,
                 importance: row.importance,
@@ -1198,8 +1273,8 @@ const processBatch = async () => {
 
                             additionalVault.push({
                                 protoId: curr.protoId,
-                                mean: JSON.parse(row.mean),
-                                variance: JSON.parse(row.variance),
+                                mean: blobToVector(row.mean),
+                                variance: blobToVector(row.variance),
                                 size: finalSize,
                                 accessCount: finalAccess,
                                 importance: finalImportance,
@@ -1325,53 +1400,7 @@ const processBatch = async () => {
     const vaultStateStart = performance.now();
     console.log(`> Updating memory vault state...`);
 
-    memoryDb.transaction(() => { // This is slow
-        for (const delta of allDeltas) {
-            const isPos = delta.isPositive;
-            const v = delta.volatile;
-            const c = delta.core;
-
-            v.updates.forEach(u => {
-                (isPos ? updateVolatilePosMain : updateVolatileNegMain).run(
-                    u.mean, u.variance, u.size, u.accessCount, u.importance, u.hash,
-                    u.lastAccessed, u.usageCount, u.merged_count, u.protoId
-                );
-            });
-
-            v.deletes.forEach(id => {
-                (isPos ? deleteVolatilePosMain : deleteVolatileNegMain).run(id);
-            });
-
-            v.promotes.forEach(p => {
-                (isPos ? insertCorePosMain : insertCoreNegMain).run(
-                    p.protoId, delta.compat_id, p.mean, p.variance, p.size,
-                    p.accessCount, p.importance, p.hash, p.lastAccessed,
-                    p.usageCount, p.merged_count
-                );
-            });
-
-            c.updates.forEach(u => {
-                (isPos ? updateCorePosMain : updateCoreNegMain).run(
-                    u.mean, u.variance, u.size, u.accessCount, u.importance, u.hash,
-                    u.lastAccessed, u.usageCount, u.merged_count, u.protoId
-                );
-            });
-
-            c.deletes.forEach(id => {
-                (isPos ? deleteCorePosMain : deleteCoreNegMain).run(id);
-            });
-
-            delta.edges.deletes.forEach(d => {
-                deleteProtoEdgesForProtoMain.run(d.source, d.polarity, d.protoId, d.protoId);
-            });
-
-            delta.edges.inserts.forEach(e => {
-                insertProtoEdgeMain.run(
-                    e.source, e.polarity, e.parent_proto, e.child_proto, e.accum_distance
-                );
-            });
-        }
-    })();
+    applyBulkDeltas(allDeltas);
 
     const coreCapacity = Math.floor(CONFIG.memoryVaultCapacity * CONFIG.coreCapacityRatio);
 

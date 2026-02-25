@@ -16,6 +16,12 @@ memoryDb.pragma('query_only = ON');
 
 const polarity = isPositive ? 'positive' : 'negative';
 
+const blobToVector = (blob) => {
+    if (!Buffer.isBuffer(blob) || blob.length === 0 || blob.length % 8 !== 0) return [];
+    const f64 = new Float64Array(blob.buffer, blob.byteOffset, blob.length / 8);
+    return Array.from(f64); // keeps compatibility with existing number[] code
+};
+
 const computeGaussianDistance = (mu1, var1, mu2, var2) => {
     const d = mu1.length;
     if (d !== mu2.length || d === 0) return Infinity;
@@ -62,8 +68,8 @@ const consolidateVolatile = () => {
 
     let mems = rows.map(r => ({
         protoId: r.protoId,
-        mean: JSON.parse(r.mean),
-        variance: JSON.parse(r.variance),
+        mean: blobToVector(r.mean),
+        variance: blobToVector(r.variance),
         size: r.size,
         accessCount: r.accessCount,
         importance: r.importance,
@@ -120,8 +126,8 @@ const consolidateVolatile = () => {
 
                 updates.push({
                     protoId: target.protoId,
-                    mean: JSON.stringify(target.mean),
-                    variance: JSON.stringify(target.variance),
+                    mean: target.mean,
+                    variance: target.variance,
                     size: target.size,
                     accessCount: target.accessCount,
                     importance: target.importance,
@@ -145,8 +151,8 @@ const consolidateVolatile = () => {
             const promoteHash = computeContentHash(mem.mean);
             promotes.push({
                 protoId: mem.protoId,
-                mean: JSON.stringify(mem.mean),
-                variance: JSON.stringify(mem.variance),
+                mean: mem.mean,
+                variance: mem.variance,
                 size: mem.size,
                 accessCount: mem.accessCount,
                 importance: mem.importance,
@@ -177,8 +183,8 @@ const consolidateCore = () => {
 
     let mems = rows.map(r => ({
         protoId: r.protoId,
-        mean: JSON.parse(r.mean),
-        variance: JSON.parse(r.variance),
+        mean: blobToVector(r.mean),
+        variance: blobToVector(r.variance),
         size: r.size,
         accessCount: r.accessCount,
         importance: r.importance,
@@ -234,8 +240,8 @@ const consolidateCore = () => {
 
                 updates.push({
                     protoId: target.protoId,
-                    mean: JSON.stringify(target.mean),
-                    variance: JSON.stringify(target.variance),
+                    mean: target.mean,
+                    variance: target.variance,
                     size: target.size,
                     accessCount: target.accessCount,
                     importance: target.importance,
@@ -274,8 +280,8 @@ const buildPrototypeHierarchy = (memType) => {
 
     let protos = rows.map(r => ({
         protoId: r.protoId,
-        mean: JSON.parse(r.mean),
-        variance: JSON.parse(r.variance),
+        mean: blobToVector(r.mean),
+        variance: blobToVector(r.variance),
         size: r.size,
         accessCount: r.accessCount,
         importance: r.importance,
