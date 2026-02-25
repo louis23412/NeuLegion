@@ -12,49 +12,15 @@ memoryDb.pragma('journal_mode = WAL');
 memoryDb.pragma('synchronous = NORMAL');
 memoryDb.pragma('temp_store = MEMORY');
 memoryDb.pragma('cache_size = -128000');
+memoryDb.pragma('query_only = ON');
 
 const polarity = isPositive ? 'positive' : 'negative';
 
-const deleteProtoEdgesForProto = memoryDb.prepare(`
-    DELETE FROM proto_edges 
-    WHERE source = ? AND polarity = ? AND (parent_proto = ? OR child_proto = ?)
-`);
-
-const insertProtoEdge = memoryDb.prepare(`
-    INSERT INTO proto_edges (source, polarity, parent_proto, child_proto, accum_distance)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(source, polarity, parent_proto, child_proto) DO NOTHING
-`);
-
-const volUpdateStmt = memoryDb.prepare(`
-    UPDATE ${isPositive ? 'volatile_positive' : 'volatile_negative'}
-    SET mean = ?, variance = ?, size = ?, accessCount = ?, importance = ?, hash = ?, lastAccessed = ?, usageCount = ?, merged_count = ?
-    WHERE protoId = ?
-`);
-
-const volDeleteStmt = memoryDb.prepare(`
-    DELETE FROM ${isPositive ? 'volatile_positive' : 'volatile_negative'} WHERE protoId = ?
-`);
-
-const corePromoteStmt = memoryDb.prepare(`
-    INSERT INTO ${isPositive ? 'core_positive' : 'core_negative'}
-    (protoId, compat_id, mean, variance, size, accessCount, importance, hash, lastAccessed, usageCount, merged_count)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-const coreExistsStmt = memoryDb.prepare(`
-    SELECT 1 FROM ${isPositive ? 'core_positive' : 'core_negative'} WHERE protoId = ?
-`).pluck();
-
-const coreUpdateStmt = memoryDb.prepare(`
-    UPDATE ${isPositive ? 'core_positive' : 'core_negative'}
-    SET mean = ?, variance = ?, size = ?, accessCount = ?, importance = ?, hash = ?, lastAccessed = ?, usageCount = ?, merged_count = ?
-    WHERE protoId = ?
-`);
-
-const coreDeleteStmt = memoryDb.prepare(`
-    DELETE FROM ${isPositive ? 'core_positive' : 'core_negative'} WHERE protoId = ?
-`);
+const blobToVector = (blob) => {
+    if (!Buffer.isBuffer(blob) || blob.length === 0 || blob.length % 8 !== 0) return [];
+    const f64 = new Float64Array(blob.buffer, blob.byteOffset, blob.length / 8);
+    return Array.from(f64); // keeps compatibility with existing number[] code
+};
 
 const computeGaussianDistance = (mu1, var1, mu2, var2) => {
     const d = mu1.length;
@@ -98,12 +64,12 @@ const consolidateVolatile = () => {
     `);
 
     const rows = loadStmt.all(compat_id, config.volatileConsolidationLimit);
-    if (rows.length < 2) return;
+    if (rows.length < 2) return { updates: [], deletes: [], promotes: [] };
 
     let mems = rows.map(r => ({
         protoId: r.protoId,
-        mean: JSON.parse(r.mean),
-        variance: JSON.parse(r.variance),
+        mean: blobToVector(r.mean),
+        variance: blobToVector(r.variance),
         size: r.size,
         accessCount: r.accessCount,
         importance: r.importance,
@@ -124,6 +90,10 @@ const consolidateVolatile = () => {
     });
 
     mems.sort((a, b) => b.importance - a.importance || b.size - a.size);
+
+    const updates = [];
+    const deletes = [];
+    const promotes = [];
 
     let i = 0;
     while (i < mems.length - 1) {
@@ -154,19 +124,20 @@ const consolidateVolatile = () => {
                 target.lastAccessed = Math.max(target.lastAccessed, source.lastAccessed, currentBatch);
                 target.hash = computeContentHash(newMean);
 
-                volUpdateStmt.run(
-                    JSON.stringify(target.mean),
-                    JSON.stringify(target.variance),
-                    target.size,
-                    target.accessCount,
-                    target.importance,
-                    target.hash,
-                    target.lastAccessed,
-                    target.usageCount,
-                    target.merged_count,
-                    target.protoId
-                );
-                volDeleteStmt.run(source.protoId);
+                updates.push({
+                    protoId: target.protoId,
+                    mean: target.mean,
+                    variance: target.variance,
+                    size: target.size,
+                    accessCount: target.accessCount,
+                    importance: target.importance,
+                    hash: target.hash,
+                    lastAccessed: target.lastAccessed,
+                    usageCount: target.usageCount,
+                    merged_count: target.merged_count
+                });
+
+                deletes.push(source.protoId);
                 mems.splice(j, 1);
             } else {
                 j++;
@@ -176,25 +147,25 @@ const consolidateVolatile = () => {
     }
 
     for (const mem of mems) {
-        if (mem.merged_count >= config.consolidationPromoteCount && !coreExistsStmt.get(mem.protoId)) {
+        if (mem.merged_count >= config.consolidationPromoteCount) {
             const promoteHash = computeContentHash(mem.mean);
-
-            corePromoteStmt.run(
-                mem.protoId,
-                compat_id,
-                JSON.stringify(mem.mean),
-                JSON.stringify(mem.variance),
-                mem.size,
-                mem.accessCount,
-                mem.importance,
-                promoteHash,
-                currentBatch,
-                mem.usageCount,
-                mem.merged_count
-            );
-            volDeleteStmt.run(mem.protoId);
+            promotes.push({
+                protoId: mem.protoId,
+                mean: mem.mean,
+                variance: mem.variance,
+                size: mem.size,
+                accessCount: mem.accessCount,
+                importance: mem.importance,
+                hash: promoteHash,
+                lastAccessed: currentBatch,
+                usageCount: mem.usageCount,
+                merged_count: mem.merged_count
+            });
+            deletes.push(mem.protoId);
         }
     }
+
+    return { updates, deletes, promotes };
 }
 
 const consolidateCore = () => {
@@ -208,12 +179,12 @@ const consolidateCore = () => {
     `);
 
     const rows = loadStmt.all(compat_id, config.coreConsolidationLimit);
-    if (rows.length < 2) return;
+    if (rows.length < 2) return { updates: [], deletes: [] };
 
     let mems = rows.map(r => ({
         protoId: r.protoId,
-        mean: JSON.parse(r.mean),
-        variance: JSON.parse(r.variance),
+        mean: blobToVector(r.mean),
+        variance: blobToVector(r.variance),
         size: r.size,
         accessCount: r.accessCount,
         importance: r.importance,
@@ -234,6 +205,9 @@ const consolidateCore = () => {
     });
 
     mems.sort((a, b) => b.importance - a.importance || b.size - a.size);
+
+    const updates = [];
+    const deletes = [];
 
     let i = 0;
     while (i < mems.length - 1) {
@@ -264,19 +238,20 @@ const consolidateCore = () => {
                 target.lastAccessed = Math.max(target.lastAccessed, source.lastAccessed, currentBatch);
                 target.hash = computeContentHash(newMean);
 
-                coreUpdateStmt.run(
-                    JSON.stringify(target.mean),
-                    JSON.stringify(target.variance),
-                    target.size,
-                    target.accessCount,
-                    target.importance,
-                    target.hash,
-                    target.lastAccessed,
-                    target.usageCount,
-                    target.merged_count,
-                    target.protoId
-                );
-                coreDeleteStmt.run(source.protoId);
+                updates.push({
+                    protoId: target.protoId,
+                    mean: target.mean,
+                    variance: target.variance,
+                    size: target.size,
+                    accessCount: target.accessCount,
+                    importance: target.importance,
+                    hash: target.hash,
+                    lastAccessed: target.lastAccessed,
+                    usageCount: target.usageCount,
+                    merged_count: target.merged_count
+                });
+
+                deletes.push(source.protoId);
                 mems.splice(j, 1);
             } else {
                 j++;
@@ -284,11 +259,12 @@ const consolidateCore = () => {
         }
         i++;
     }
+
+    return { updates, deletes };
 }
 
 const buildPrototypeHierarchy = (memType) => {
     const decayFactor = memType === 'core' ? config.coreMemoryDecayFactor : config.volatileMemoryDecayFactor;
-    const sourceStr = memType;
     const table = memType === 'core'
         ? (isPositive ? 'core_positive' : 'core_negative')
         : (isPositive ? 'volatile_positive' : 'volatile_negative');
@@ -300,12 +276,12 @@ const buildPrototypeHierarchy = (memType) => {
     `);
 
     const rows = loadStmt.all(compat_id);
-    if (rows.length < 2) return;
+    if (rows.length < 2) return { deletes: [], inserts: [] };
 
     let protos = rows.map(r => ({
         protoId: r.protoId,
-        mean: JSON.parse(r.mean),
-        variance: JSON.parse(r.variance),
+        mean: blobToVector(r.mean),
+        variance: blobToVector(r.variance),
         size: r.size,
         accessCount: r.accessCount,
         importance: r.importance,
@@ -331,12 +307,14 @@ const buildPrototypeHierarchy = (memType) => {
     );
 
     const limitedProtos = protos.slice(0, config.maxHierarchyProtos);
-    if (limitedProtos.length < 2) return;
+    if (limitedProtos.length < 2) return { deletes: [], inserts: [] };
 
     const n = limitedProtos.length;
+    const deletes = [];
+    const inserts = [];
 
     for (const p of limitedProtos) {
-        deleteProtoEdgesForProto.run(sourceStr, polarity, p.protoId, p.protoId);
+        deletes.push({ source: memType, polarity, protoId: p.protoId });
     }
 
     const minNeighbors = memType === 'core' ? config.coreMinNeighbors : config.volatileMinNeighbors;
@@ -361,18 +339,45 @@ const buildPrototypeHierarchy = (memType) => {
         const actualNum = Math.min(numNeighbors, candidates.length);
         for (let k = 0; k < actualNum; k++) {
             const { neighborId, dist } = candidates[k];
-            insertProtoEdge.run(sourceStr, polarity, proto.protoId, neighborId, dist);
-            insertProtoEdge.run(sourceStr, polarity, neighborId, proto.protoId, dist);
+            inserts.push({
+                source: memType,
+                polarity,
+                parent_proto: proto.protoId,
+                child_proto: neighborId,
+                accum_distance: dist
+            });
+            inserts.push({
+                source: memType,
+                polarity,
+                parent_proto: neighborId,
+                child_proto: proto.protoId,
+                accum_distance: dist
+            });
         }
     }
+
+    return { deletes, inserts };
 }
 
 try {
-    consolidateVolatile();
-    buildPrototypeHierarchy('volatile');
-    consolidateCore();
-    buildPrototypeHierarchy('core');
-    parentPort.postMessage({ success: true });
+    const volatileChanges = consolidateVolatile();
+    const volatileEdges = buildPrototypeHierarchy('volatile');
+    const coreChanges = consolidateCore();
+    const coreEdges = buildPrototypeHierarchy('core');
+
+    parentPort.postMessage({
+        success: true,
+        delta: {
+            compat_id,
+            isPositive,
+            volatile: volatileChanges,
+            core: coreChanges,
+            edges: {
+                deletes: [...volatileEdges.deletes, ...coreEdges.deletes],
+                inserts: [...volatileEdges.inserts, ...coreEdges.inserts]
+            }
+        }
+    });
 } catch (err) {
     parentPort.postMessage({ error: err.message || String(err) });
 }
