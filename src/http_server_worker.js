@@ -3,19 +3,19 @@ import http from 'node:http';
 
 const { ip, port } = workerData;
 
-let currentLegionState = {
+const currentLegionState = {
     status: 'initializing',
     candleCounter: 0,
-    controllers: [],
-    timestamp: Date.now()
+    consensus : {},
+    controllers: []
 };
 
 parentPort.on('message', (msg) => {
     if (msg.type === 'UPDATE_STATE') {
-        currentLegionState = {
-            ...msg.state,
-            status : msg.status
-        };
+        currentLegionState.status = msg.status,
+        currentLegionState.candleCounter = msg.candleCounter,
+        currentLegionState.consensus = msg.consensus,
+        currentLegionState.controllers = msg.controllers
     }
 });
 

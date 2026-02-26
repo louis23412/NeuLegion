@@ -813,18 +813,278 @@ const getCleanLegionState = () => {
     });
 }
 
+const getCurrentMarketContext = () => {
+    if (cache.length === 0) {
+        return { price: 1.0, atrProxy: 0.01, volatility: 0.005 };
+    }
+    const last = cache[cache.length - 1];
+    const price = last.close ?? last.c ?? last[4] ?? 1.0;
+
+    const window = Math.min(14, cache.length);
+    let atrSum = 0;
+    for (let i = cache.length - window; i < cache.length; i++) {
+        const c = cache[i];
+        const prevClose = i > 0 ? (cache[i - 1].close ?? cache[i - 1].c ?? cache[i - 1][4] ?? c.close) : c.close;
+        atrSum += Math.max(
+            c.high - c.low,
+            Math.abs(c.high - prevClose),
+            Math.abs(c.low - prevClose)
+        );
+    }
+    const atrProxy = atrSum / window || 0.01;
+    const volatility = atrProxy / price;
+    return { price, atrProxy, volatility };
+};
+
+const collectAndEnrichSignals = () => {
+    const signals = [];
+    structureMap.flat(3).forEach(ctrl => {
+        const sig = ctrl.lastSignal || {};
+        const mb = sig.memoryBroadcast || {};
+        const dir = ctrl.type === 'positive' ? 'BUY' : 'SELL';
+        const recentScores = (ctrl.scoreHistory || []).slice(-10);
+        const recentPerf = recentScores.length
+            ? recentScores.reduce((a, b) => a + b, 0) / recentScores.length
+            : (sig.score ?? 0.5);
+
+        signals.push({
+            id: `${ctrl.group}-${ctrl.section}-${ctrl.layer}-${ctrl.id}`,
+            direction: dir,
+            polaritySign: dir === 'BUY' ? 1 : -1,
+            prob: Math.max(0.01, Math.min(0.99, (sig.prob ?? 50) / 100)),
+            score: (sig.score ?? 50) / 100,
+            signalSpeed: ctrl.signalSpeed ?? 1000,
+            memConnections: ctrl.memConnections ?? 0,
+            vaultMemories: mb.vaultMemories ?? 0,
+            entryPrice: sig.entryPrice ?? 0,
+            exitPrice: sig.sellPrice ?? 0,
+            stopLoss: sig.stopLoss ?? 0,
+            group: ctrl.group,
+            section: ctrl.section,
+            layer: ctrl.layer,
+            recentPerf,
+            compatibility: mb.compatibility ? canonicalJSON(mb.compatibility) : null
+        });
+    });
+    return signals;
+};
+
+const getHierarchyFactor = (group, section, layer) => {
+    const revG = CONFIG.dims[0] - 1 - group;
+    const revS = CONFIG.dims[1] - 1 - section;
+    const revL = CONFIG.dims[2] - 1 - layer;
+    return (1 + CONFIG.groupPopBoost * revG) *
+           (1 + CONFIG.sectionPopBoost * revS) *
+           (1 + CONFIG.layerPopBoost * revL);
+};
+
+const computeDynamicWeights = (signals) => {
+    const maxSpeed = Math.max(...signals.map(s => s.signalSpeed), 1000) || 1000;
+    const maxMem = Math.max(...signals.map(s => s.memConnections), 1);
+    return signals.map(s => {
+        const hier = getHierarchyFactor(s.group, s.section, s.layer);
+        const speedNorm = Math.max(0.1, 1 - (s.signalSpeed / maxSpeed));
+        const memNorm = 1 + (s.memConnections / maxMem) * 0.3;
+        const vaultBoost = 1 + s.vaultMemories * CONFIG.broadcastRatio * 2;
+        const perfBoost = 1 + (s.recentPerf - 0.5) * 2;
+        const base = s.prob * s.score * perfBoost;
+        const weight = base * speedNorm * memNorm * vaultBoost * hier * CONFIG.performanceBoostFactor;
+        return { ...s, weight: Math.max(0.01, weight) };
+    });
+};
+
+const propagateInfluence = (weightedSignals) => {
+    const pq = new PriorityQueue();
+    const visited = new Map();
+
+    const sorted = [...weightedSignals].sort((a, b) => b.weight - a.weight);
+    const seedCount = Math.ceil(sorted.length * 0.3);
+    for (let i = 0; i < seedCount; i++) {
+        const s = sorted[i];
+        pq.push({ ...s, accumDist: -s.weight, depth: 0 });
+    }
+
+    while (pq.size > 0) {
+        const curr = pq.pop();
+        const key = curr.id;
+        const currBoost = -curr.accumDist;
+
+        if (visited.has(key) && visited.get(key) >= currBoost) continue;
+        visited.set(key, currBoost);
+
+        weightedSignals.forEach(neigh => {
+            if (neigh.id === key) return;
+
+            const sameLevel = neigh.section === curr.section && neigh.layer === curr.layer;
+            const sameCompat = curr.compatibility && neigh.compatibility && curr.compatibility === neigh.compatibility;
+            const proximity = Math.abs(neigh.group - curr.group) +
+                              Math.abs(neigh.section - curr.section) +
+                              Math.abs(neigh.layer - curr.layer);
+
+            if (sameLevel || sameCompat || proximity <= 2) {
+                const edgeDist = sameCompat ? 0.5 : proximity * 0.3;
+                const newBoost = currBoost * Math.exp(-edgeDist * CONFIG.volatileHierarchyThreshold);
+                const newAccumDist = -newBoost;
+
+                const existing = visited.get(neigh.id) || 0;
+                if (newBoost > existing) {
+                    pq.push({ ...neigh, accumDist: newAccumDist, depth: curr.depth + 1 });
+                }
+            }
+        });
+    }
+
+    return weightedSignals.map(s => {
+        const boosted = visited.get(s.id) || s.weight;
+        return {
+            ...s,
+            finalWeight: s.weight * 0.7 + boosted * 0.3
+        };
+    });
+};
+
+const hierarchicalAggregate = (propagated) => {
+    const layerAgg = new Map();
+
+    propagated.forEach(s => {
+        const key = `${s.group}-${s.section}-${s.layer}-${s.direction}`;
+        if (!layerAgg.has(key)) {
+            layerAgg.set(key, {
+                strength: 0,
+                weightSum: 0,
+                entrySum: 0,
+                exitSum: 0,
+                stopSum: 0,
+                count: 0
+            });
+        }
+        const agg = layerAgg.get(key);
+        agg.strength += s.polaritySign * s.prob * s.finalWeight;
+        agg.weightSum += s.finalWeight;
+        if (s.entryPrice > 0) {
+            agg.entrySum += s.entryPrice * s.finalWeight;
+            agg.count++;
+        }
+        if (s.exitPrice > 0) {
+            agg.exitSum += s.exitPrice * s.finalWeight;
+        }
+        if (s.stopLoss > 0) {
+            agg.stopSum += s.stopLoss * s.finalWeight;
+        }
+    });
+
+    let totalPosStrength = 0;
+    let totalNegStrength = 0;
+    let posWeightSum = 0;
+    let negWeightSum = 0;
+    let posEntrySum = 0;
+    let posExitSum = 0;
+    let posStopSum = 0;
+    let negEntrySum = 0;
+    let negExitSum = 0;
+    let negStopSum = 0;
+    let posCount = 0;
+    let negCount = 0;
+
+    layerAgg.forEach(agg => {
+        const w = agg.weightSum;
+        if (agg.strength > 0) {
+            totalPosStrength += agg.strength;
+            posWeightSum += w;
+            posEntrySum += agg.entrySum;
+            posExitSum += agg.exitSum;
+            posStopSum += agg.stopSum;
+            posCount += agg.count;
+        } else {
+            totalNegStrength += Math.abs(agg.strength);
+            negWeightSum += w;
+            negEntrySum += agg.entrySum;
+            negExitSum += agg.exitSum;
+            negStopSum += agg.stopSum;
+            negCount += agg.count;
+        }
+    });
+
+    return {
+        totalPos: totalPosStrength,
+        totalNeg: totalNegStrength,
+        posW: posWeightSum,
+        negW: negWeightSum,
+        posPrices: { entry: posEntrySum, exit: posExitSum, stop: posStopSum },
+        negPrices: { entry: negEntrySum, exit: negExitSum, stop: negStopSum },
+        posCount,
+        negCount
+    };
+};
+
+const resolveConsensus = (agg, market) => {
+    const net = agg.totalPos - agg.totalNeg;
+    const totalAbs = agg.totalPos + agg.totalNeg || 1;
+    const rawConf = Math.abs(net) / totalAbs;
+    const conflict = Math.min(agg.totalPos, agg.totalNeg) / totalAbs;
+    const agreement = 1 - conflict * 1.5;
+
+    let confidence = Math.max(0, Math.min(100,
+        rawConf * agreement * 100 * (1 + market.volatility * 5)
+    ));
+
+    const direction = net > 0 ? 'BUY' : 'SELL';
+    const winningPrices = direction === 'BUY' ? agg.posPrices : agg.negPrices;
+    const wSum = direction === 'BUY' ? agg.posW : agg.negW;
+
+    let entry = (wSum > 0 ? winningPrices.entry / wSum : market.price);
+    let exit  = (wSum > 0 ? winningPrices.exit  / wSum : 0);
+    let stop  = (wSum > 0 ? winningPrices.stop  / wSum : 0);
+
+    if (exit === 0) {
+        exit = direction === 'BUY'
+            ? entry * (1 + market.atrProxy * 5)
+            : entry * (1 - market.atrProxy * 5);
+    }
+    if (stop === 0) {
+        stop = direction === 'BUY'
+            ? entry * (1 - market.atrProxy * 2)
+            : entry * (1 + market.atrProxy * 2);
+    }
+
+    if (direction === 'BUY') {
+        stop = Math.min(stop, entry * (1 - market.atrProxy));
+        exit = Math.max(exit, entry * (1 + market.atrProxy));
+    } else {
+        stop = Math.max(stop, entry * (1 + market.atrProxy));
+        exit = Math.min(exit, entry * (1 - market.atrProxy));
+    }
+
+    return {
+        direction,
+        confidence: Number(confidence.toFixed(3)),
+        entryPrice: Number(entry.toFixed(4)),
+        exitPrice: Number(exit.toFixed(4)),
+        stopLoss: Number(stop.toFixed(4))
+    };
+};
+
+const getLegionConsensus = () => {
+    const market = getCurrentMarketContext();
+    let signals = collectAndEnrichSignals();
+    signals = computeDynamicWeights(signals);
+    signals = propagateInfluence(signals);
+    const agg = hierarchicalAggregate(signals);
+    return resolveConsensus(agg, market);
+};
+
 const broadcastLegionState = (status) => {
     if (!httpWorker) return;
 
     const allControllers = getCleanLegionState();
+    const legionConsensus = getLegionConsensus();
 
     httpWorker.postMessage({
         type: 'UPDATE_STATE',
-        state: {
-            candleCounter,
-            controllers: allControllers
-        },
-        status
+        status,
+        candleCounter,
+        consensus : legionConsensus,
+        controllers: allControllers
     });
 };
 
@@ -1688,7 +1948,6 @@ const processCandles = async () => {
     const rebuildCounter = initLegion();
 
     spawnDedicatedHttpServer();
-    broadcastLegionState('running');
 
     const maxGroup = CONFIG.dims[0] - 1;
     const maxSection = CONFIG.dims[1] - 1;
