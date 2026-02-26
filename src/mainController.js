@@ -757,10 +757,66 @@ const spawnDedicatedHttpServer = () => {
     });
 };
 
+const getCleanLegionState = () => {
+    return structureMap.flat(3).map((c) => {
+        return {
+            id : c.lastSignal?.controllerId,
+            polarity : c.type,
+            signalSpeed : c.signalSpeed,
+
+            hiveConnection : c.lastSignal?.hiveConnection,
+            lastSaveStatus : c.lastSignal?.lastSaveStatus,
+
+            legionPosition : [c.group, c.section, c.layer, c.id],
+
+            params : {
+                population : c.lastSignal?.pop,
+                cacheSize : c.lastSignal?.cache,
+                inputSize : c.lastSignal?.inputSize,
+                candlesUesd : c.lastSignal?.candlesUsed,
+                indicatorsUsed : c.lastSignal?.indicatorsUsed,
+                atrFactor : c.lastSignal?.atrFactor,
+                stopFactor : c.lastSignal?.stopFactor,
+                minMove : c.lastSignal?.minPriceMovement,
+                maxMove : c.lastSignal?.maxPriceMovement
+            },
+
+            price : {
+                entryPrice : c.lastSignal?.entryPrice,
+                exitPrice : c.lastSignal?.sellPrice,
+                stopLoss : c.lastSignal?.stopLoss
+            },
+
+            stats : {
+                probability : c.lastSignal?.prob,
+                accuracyScore : c.lastSignal?.score,
+                tradeAccuracy : c.lastSignal?.tradeAcc,
+                probabilityAccuracy : c.lastSignal?.trueAcc,
+                trainingSteps : c.lastSignal?.lastTrainingStep,
+                skippedTraining : c.lastSignal?.skippedTraining,
+                openSimulations : c.lastSignal?.openSimulations,
+                pendingClosedTrades : c.lastSignal?.pendingClosedTrades
+            },
+
+            memory : {
+                memoryConnections : c.memConnections,
+                totalSent : c.lastSignal?.totalMemoriesSent,
+                totalReceived : c.lastSignal?.totalMemoriesReceived,
+                lastInjectedTotal : c.lastSignal?.lastMemoriesInjected,
+                controllerMemories : c.lastSignal?.currentMemories,
+                lastInjectionRatio : c.lastSignal?.lastMemoryChange,
+                lastMemoriesPerMember : c.lastSignal?.lastMemoriesPerMember,
+                lastBroadcastPeerMemories : c.lastSignal?.memoryBroadcast?.totalBroadcast,
+                lastBroadcastVaultMemories : c.lastSignal?.memoryBroadcast?.vaultMemories
+            }
+        }
+    });
+}
+
 const broadcastLegionState = (status) => {
     if (!httpWorker) return;
 
-    const allControllers = structureMap.flat(3);
+    const allControllers = getCleanLegionState();
 
     httpWorker.postMessage({
         type: 'UPDATE_STATE',
