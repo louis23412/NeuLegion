@@ -1,3 +1,4 @@
+import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
@@ -9,11 +10,13 @@ import { availableParallelism } from 'node:os';
 let cache = [];
 let structureMap;
 let candleCounter = 0;
+let httpWorker = null;
 
 const CONFIG = {
     cutoff: null,
     baseProcessCount: 1,
     forceMin: true,
+    httpPort: 3001,
     maxWorkers: Math.max(1, Math.floor(availableParallelism() * 0.25)),
     file: path.join(import.meta.dirname, 'candles.jsonl'),
     stateFolder : path.join(import.meta.dirname, '..', 'state'),
@@ -736,6 +739,109 @@ const applyBulkDeltas = memoryDb.transaction((deltas) => {
     promotes.corePos.forEach(p => insertCorePosMain.run(...p));
     promotes.coreNeg.forEach(p => insertCoreNegMain.run(...p));
 });
+
+const spawnDedicatedHttpServer = () => {
+    httpWorker = new Worker(new URL('./http_server_worker.js', import.meta.url), {
+        workerData : {
+            ip : getLocalIP(),
+            port : CONFIG.httpPort
+        }
+    });
+
+    httpWorker.on('error', (err) => {
+        console.error('[HTTP Worker] Error:', err);
+    });
+
+    httpWorker.on('exit', (code) => {
+        if (code !== 0) console.error(`[HTTP Worker] Exited with code ${code}`);
+    });
+};
+
+const getCleanLegionState = () => {
+    return structureMap.flat(3).map((c) => {
+        return {
+            id : c.lastSignal?.controllerId,
+            polarity : c.type,
+            signalSpeed : c.signalSpeed,
+
+            hiveConnection : c.lastSignal?.hiveConnection,
+            lastSaveStatus : c.lastSignal?.lastSaveStatus,
+
+            legionPosition : [c.group, c.section, c.layer, c.id],
+
+            params : {
+                population : c.lastSignal?.pop,
+                cacheSize : c.lastSignal?.cache,
+                inputSize : c.lastSignal?.inputSize,
+                candlesUesd : c.lastSignal?.candlesUsed,
+                indicatorsUsed : c.lastSignal?.indicatorsUsed,
+                atrFactor : c.lastSignal?.atrFactor,
+                stopFactor : c.lastSignal?.stopFactor,
+                minMove : c.lastSignal?.minPriceMovement,
+                maxMove : c.lastSignal?.maxPriceMovement
+            },
+
+            price : {
+                entryPrice : c.lastSignal?.entryPrice,
+                exitPrice : c.lastSignal?.sellPrice,
+                stopLoss : c.lastSignal?.stopLoss
+            },
+
+            stats : {
+                probability : c.lastSignal?.prob,
+                accuracyScore : c.lastSignal?.score,
+                tradeAccuracy : c.lastSignal?.tradeAcc,
+                probabilityAccuracy : c.lastSignal?.trueAcc,
+                trainingSteps : c.lastSignal?.lastTrainingStep,
+                skippedTraining : c.lastSignal?.skippedTraining,
+                openSimulations : c.lastSignal?.openSimulations,
+                pendingClosedTrades : c.lastSignal?.pendingClosedTrades
+            },
+
+            memory : {
+                memoryConnections : c.memConnections,
+                totalSent : c.lastSignal?.totalMemoriesSent,
+                totalReceived : c.lastSignal?.totalMemoriesReceived,
+                lastInjectedTotal : c.lastSignal?.lastMemoriesInjected,
+                controllerMemories : c.lastSignal?.currentMemories,
+                lastInjectionRatio : c.lastSignal?.lastMemoryChange,
+                lastMemoriesPerMember : c.lastSignal?.lastMemoriesPerMember,
+                lastBroadcastPeerMemories : c.lastSignal?.memoryBroadcast?.totalBroadcast,
+                lastBroadcastVaultMemories : c.lastSignal?.memoryBroadcast?.vaultMemories
+            }
+        }
+    });
+}
+
+const broadcastLegionState = (status) => {
+    if (!httpWorker) return;
+
+    const allControllers = getCleanLegionState();
+
+    httpWorker.postMessage({
+        type: 'UPDATE_STATE',
+        state: {
+            candleCounter,
+            controllers: allControllers
+        },
+        status
+    });
+};
+
+const getLocalIP = () => {
+  const interfaces = os.networkInterfaces();
+  let ipAddress;
+
+  Object.keys(interfaces).forEach((ifaceName) => {
+    interfaces[ifaceName].forEach((iface) => {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        ipAddress = iface.address;
+      }
+    });
+  });
+
+  return ipAddress;
+}
 
 const vectorToBlob = (vec) => {
     if (!Array.isArray(vec) || vec.length === 0) return Buffer.allocUnsafe(0);
@@ -1577,7 +1683,12 @@ const processCandles = async () => {
         crlfDelay: Infinity,
     });
 
+    const ipAddress = getLocalIP();
+
     const rebuildCounter = initLegion();
+
+    spawnDedicatedHttpServer();
+    broadcastLegionState('running');
 
     const maxGroup = CONFIG.dims[0] - 1;
     const maxSection = CONFIG.dims[1] - 1;
@@ -1606,10 +1717,11 @@ const processCandles = async () => {
             if (candleCounter <= rebuildCounter) continue;
 
             const finalStart = performance.now();
-            console.log(`New candle (${candleCounter}):`);
+            console.log(`New candle (${candleCounter}) - http://${ipAddress}:${CONFIG.httpPort}`);
 
             await processBatch();
             saveLegionState();
+            broadcastLegionState('running');
 
             const finalEnd = performance.now();
             console.log(`> All completed in ${((finalEnd - finalStart) / 1000).toFixed(3)} seconds`);
@@ -1617,13 +1729,24 @@ const processCandles = async () => {
             console.log('-------------------------------------------------------');
 
             if (CONFIG.cutoff && candleCounter % CONFIG.cutoff === 0) {
-                console.log(`Done! Cutoff = ${candleCounter}`);
-                process.exit();
+                console.log(`Cutoff reached (${candleCounter}). Candle processing stopped.`);
+                console.log(`HTTP state server is still running - http://${ipAddress}:${CONFIG.httpPort}`);
+
+                broadcastLegionState('Stopped - Cuttoff reached');
+
+                fileStream.destroy();
+                rd.close();
+                return;
             }
         }
     }
 
     console.log('End of file reached. Processing complete.');
+    console.log(`HTTP state server is still running - http://${ipAddress}:${CONFIG.httpPort}`);
+
+    broadcastLegionState(`Stopped - End of file reached`);
+
+    await new Promise(() => {});
 };
 
 processCandles().catch(err => {
