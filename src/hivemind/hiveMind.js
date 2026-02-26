@@ -6530,13 +6530,13 @@ class HiveMind {
         };
     }
 
-    translateMemory (received, injectionRatio = 0.025) {
+    translateMemory (received, currentInputs = null, injectionRatio = 0.025) {
         const currTotalMemories = this.#semanticProtos.reduce((acc, arr) => acc + arr.length, 0);
         if (!received || !Array.isArray(received)) {
             return { memoriesInjected: 0, totalMemories: currTotalMemories, injectedRatio: 0 };
         }
 
-        let combined = [];
+        let neutralized = [];
 
         const compatObj = {
             ensembleSize: this.#ensembleSize,
@@ -6547,123 +6547,142 @@ class HiveMind {
         };
 
         for (const peerHiveMem of received) {
-            if (JSON.stringify(peerHiveMem.compatibility) === JSON.stringify(compatObj)) {
-                if (Array.isArray(peerHiveMem.memories)) {
-                    combined.push(...peerHiveMem.memories.map(p => ({
-                        mean: new Float32Array(p.mean || []),
-                        variance: new Float32Array(p.variance || []),
-                        size: p.size || 1,
-                        accessCount: p.accessCount || 1,
-                        importance: p.importance || 0,
-                        isCore: p.isCore,
-                        contentHash: p.contentHash
-                    })));
-                }
+            if (JSON.stringify(peerHiveMem.compatibility) !== JSON.stringify(compatObj)) continue;
 
-                if (Array.isArray(peerHiveMem.vaultAccess)) {
-                    combined.push(...peerHiveMem.vaultAccess.map(p => ({
-                        mean: new Float32Array(p.mean || []),
-                        variance: new Float32Array(p.variance || []),
-                        size: p.size || 1,
-                        accessCount: p.accessCount || 1,
-                        importance: p.importance || 0,
-                        isCore: p.isCore,
-                        contentHash: p.contentHash
-                    })));
+            if (Array.isArray(peerHiveMem.memories)) {
+                for (const m of peerHiveMem.memories) {
+                    if (!m.mean || !m.variance) continue;
+                    const mean = new Float32Array(m.mean);
+                    const variance = new Float32Array(m.variance);
+                    const newProto = this.#createNewProto(mean, variance, 1, false);
+                    newProto.contentHash = m.contentHash || this.#computeContentHash(mean);
+                    neutralized.push(newProto);
+                }
+            }
+
+            if (Array.isArray(peerHiveMem.vaultAccess)) {
+                for (const m of peerHiveMem.vaultAccess) {
+                    if (!m.mean || !m.variance) continue;
+                    const mean = new Float32Array(m.mean);
+                    const variance = new Float32Array(m.variance);
+                    const newProto = this.#createNewProto(mean, variance, 1, false);
+                    newProto.contentHash = m.contentHash || this.#computeContentHash(newProto.mean);
+                    neutralized.push(newProto);
                 }
             }
         }
 
+        if (neutralized.length === 0) {
+            return { memoriesInjected: 0, totalMemories: currTotalMemories, injectedRatio: 0 };
+        }
+
         const bestByHash = new Map();
-        for (const p of combined) {
+        for (const p of neutralized) {
             if (!p.contentHash) p.contentHash = this.#computeContentHash(p.mean);
             const existing = bestByHash.get(p.contentHash);
             if (!existing || this.#computeProtoUtility(p) > this.#computeProtoUtility(existing)) {
                 bestByHash.set(p.contentHash, p);
             }
         }
-        combined = Array.from(bestByHash.values());
-        if (combined.length === 0) return { memoriesInjected: 0, totalMemories: currTotalMemories, injectedRatio: 0 };
+        let candidates = Array.from(bestByHash.values());
 
-        combined.sort((a, b) => this.#computeProtoUtility(b) - this.#computeProtoUtility(a));
+        let queryMean = null;
+        let queryProjs = null;
+        if (currentInputs && Array.isArray(currentInputs) && currentInputs.length === this.#inputSize) {
+            const proj = Array.from({ length: this.#inputSize }, () => new Float32Array(this.#hiddenSize));
+            for (let i = 0; i < this.#inputSize; i++) {
+                const scaled = currentInputs[i] * (1 + this.#swarmIntelligenceFactor);
+                for (let j = 0; j < this.#hiddenSize; j++) proj[i][j] = scaled;
+            }
+            const tempProtos = this.#poolMultiPrototype(proj, 8, 3.5);
+            if (tempProtos.length > 0) {
+                queryMean = this.#weightedMean(tempProtos);
+                queryProjs = this.#computeProjNorms(queryMean);
+            }
+        }
 
-        let totalLen = 0;
-        for (let i = 0; i < this.#ensembleSize; i++) totalLen += this.#semanticProtos[i].length;
-        const avgLen = Math.max(8, totalLen / this.#ensembleSize);
-        const maxProtos = Math.max(1, Math.round(avgLen * injectionRatio));
+        const scored = candidates.map(proto => {
+            let relevance = 0.5;
+            if (queryMean && queryProjs) {
+                relevance = this.#kernelSimilarity(
+                    { mean: queryMean, variance: new Float32Array(this.#hiddenSize).fill(this.#maxVariancePerDim * 0.25) },
+                    proto
+                );
+            }
+            const util = this.#computeProtoUtility(proto);
+            return { proto, score: 0.65 * relevance + 0.35 * util };
+        });
 
-        const coreRatio = 0.35;
-        const coreCount = Math.round(maxProtos * coreRatio);
-        const personalCount = maxProtos - coreCount;
+        scored.sort((a, b) => b.score - a.score);
+        candidates = scored.map(s => s.proto);
 
-        const sharedCore = combined.slice(0, coreCount).map(base => {
+        const avgLen = Math.max(8, currTotalMemories / this.#ensembleSize);
+        const maxInjectTotal = Math.max(1, Math.round(avgLen * injectionRatio * 0.8));
+
+        const coreCount = Math.max(1, Math.round(maxInjectTotal * 0.4));
+        const personalPerMember = Math.round((maxInjectTotal * 0.6) / this.#ensembleSize);
+
+        const sharedCores = candidates.slice(0, coreCount).map(base => {
             const noisy = new Float32Array(base.mean);
-            for (let j = 0; j < this.#hiddenSize; j++) noisy[j] += (Math.random() - 0.5) * 0.015;
+            for (let j = 0; j < this.#hiddenSize; j++) noisy[j] += (Math.random() - 0.5) * 0.012;
             const np = this.#createNewProto(noisy, base.variance, 1, false);
-            this.#reinforceProto(np, 0.7, 0, 0.6);
+            this.#reinforceProto(np, 0.8, 0, 0.7);
             this.#finalizeSemanticProto(np, null);
             return np;
         });
+
+        const beforeHashes = new Set();
+        for (let i = 0; i < this.#ensembleSize; i++) {
+            this.#semanticProtos[i].forEach(p => beforeHashes.add(p.contentHash));
+        }
 
         let totalInjected = 0;
 
         for (let idx = 0; idx < this.#ensembleSize; idx++) {
             const before = this.#semanticProtos[idx].length;
 
-            const personalPool = combined.slice(coreCount);
-
-            const scoredPersonal = personalPool.map(proto => ({
-                proto,
-                score: this.#computeMemberAffinity(proto, idx)
-            }));
-            scoredPersonal.sort((a, b) => b.score - a.score);
+            const remaining = candidates.slice(coreCount);
+            const affinityScored = remaining.map(p => ({
+                proto: p,
+                score: this.#computeMemberAffinity(p, idx)
+            })).sort((a, b) => b.score - a.score);
 
             const personalProtos = [];
-            const selectedForDiversity = [];
+            const selected = [];
+            const diversityThresh = 0.62 + 0.15 * (this.#specializationScores[idx] ?? 0.5);
+            const minBypass = Math.max(2, Math.floor(personalPerMember * 0.35));
 
-            const specScore = this.#specializationScores[idx] ?? 0.5;
-            const diversityThreshold = 0.65 + 0.12 * specScore;
-            const bypassMin = Math.max(2, Math.round(personalCount * 0.3));
-
-            for (let i = 0; i < scoredPersonal.length && personalProtos.length < personalCount; i++) {
-                let cand = scoredPersonal[i].proto;
-
+            for (let i = 0; i < affinityScored.length && personalProtos.length < personalPerMember; i++) {
+                let cand = affinityScored[i].proto;
                 if (!cand.projNorms || cand.projNorms.length !== this.#numProjections) {
                     cand.projNorms = this.#computeProjNorms(cand.mean);
                 }
 
-                let maxSimToSelected = -1;
+                let maxSim = -1;
+                for (const s of selected) maxSim = Math.max(maxSim, this.#projSimilarity(cand.projNorms, s.projNorms));
+                for (const core of sharedCores) maxSim = Math.max(maxSim, this.#projSimilarity(cand.projNorms, core.projNorms));
 
-                for (const sel of selectedForDiversity) {
-                    const sim = this.#projSimilarity(cand.projNorms, sel.projNorms);
-                    if (sim > maxSimToSelected) maxSimToSelected = sim;
-                }
-
-                for (const coreP of sharedCore) {
-                    const sim = this.#projSimilarity(cand.projNorms, coreP.projNorms);
-                    if (sim > maxSimToSelected) maxSimToSelected = sim;
-                }
-
-                if (maxSimToSelected < diversityThreshold || selectedForDiversity.length < bypassMin) {
-                    selectedForDiversity.push(cand);
+                if (maxSim < diversityThresh || selected.length < minBypass) {
+                    selected.push(cand);
 
                     const noisy = new Float32Array(cand.mean);
-                    const noiseScale = 0.018 * (1.5 - specScore);
-                    for (let j = 0; j < this.#hiddenSize; j++) noisy[j] += (Math.random() - 0.5) * 2 * noiseScale;
+                    const noiseScale = 0.016 * (1.4 - (this.#specializationScores[idx] ?? 0.5));
+                    for (let j = 0; j < this.#hiddenSize; j++) noisy[j] += (Math.random() - 0.5) * noiseScale;
 
                     const np = this.#createNewProto(noisy, cand.variance, 1, false);
-                    this.#reinforceProto(np, 0.65, 0, 0.55);
-                    this.#finalizeSemanticProto(np, null);
+                    this.#reinforceProto(np, 0.75, 0, 0.6);
+                    this.#finalizeSemanticProto(np, idx);
                     personalProtos.push(np);
                 }
             }
 
-            const toInject = [...sharedCore, ...personalProtos];
-            this.#updateSemanticProtos(idx, toInject);
-            this.#updateSemanticStats(idx);
+            const toInject = [...sharedCores, ...personalProtos];
+            if (toInject.length > 0) {
+                this.#updateSemanticProtos(idx, toInject);
+                this.#updateSemanticStats(idx);
+            }
 
-            const after = this.#semanticProtos[idx].length;
-            totalInjected += Math.max(0, after - before);
+            totalInjected += Math.max(0, this.#semanticProtos[idx].length - before);
         }
 
         const finalTotal = this.#semanticProtos.reduce((acc, arr) => acc + arr.length, 0);

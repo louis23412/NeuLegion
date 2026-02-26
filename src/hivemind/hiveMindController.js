@@ -640,7 +640,7 @@ class HiveMindController {
             this.#memoryBroadcast = this.#hivemind.broadcastMemory(features.flat(), bcR);
             this.#globalAccuracy.memoriesSent += this.#memoryBroadcast.totalBroadcast;
 
-            const translation = this.#hivemind.translateMemory(sharedMemories, injR);
+            const translation = this.#hivemind.translateMemory(sharedMemories, features.flat(), injR);
             this.#globalAccuracy.memoriesReceived += translation.memoriesInjected;
 
             memoryChange = translation.injectedRatio;
@@ -706,7 +706,7 @@ class HiveMindController {
             lastMemoriesPerMember : memoriesPerMember,
             currentMemories,
 
-            memoryBroadcast : this.#memoryBroadcast,
+            memoryBroadcast : this.#memoryBroadcast
         };
     }
 }

@@ -48,7 +48,6 @@ const CONFIG = {
     coreConsolidationThreshold: 0.01,
     consolidationPromoteCount: 25,
     coreCapacityRatio: 0.333,
-    performanceBoostFactor: 1.001,
     maxVaultCandidates: 5000,
     memoryVaultCapacity: 5000000,
     volatileConsolidationLimit: 1000,
@@ -62,7 +61,13 @@ const CONFIG = {
     coreMinNeighbors: 6,
     coreMaxNeighbors: 24,
     volatileMinNeighbors: 4,
-    volatileMaxNeighbors: 16
+    volatileMaxNeighbors: 16,
+
+    newMemorySize: 1.0,
+    newMemoryAccessCount: 1.0,
+    newMemoryImportance: 10.0,
+    baseAccessBoost: 1.001,
+    performanceBoostFactor: 1.002
 };
 
 class PriorityQueue {
@@ -257,34 +262,8 @@ const insertCompatNeg = memoryDb.prepare('INSERT INTO compat_negative (compatibi
 const getCompatIdPos = memoryDb.prepare('SELECT id FROM compat_positive WHERE compatibility = ?');
 const getCompatIdNeg = memoryDb.prepare('SELECT id FROM compat_negative WHERE compatibility = ?');
 
-const upsertCorePos = memoryDb.prepare(`
-    INSERT INTO core_positive (protoId, compat_id, mean, variance, size, accessCount, importance, hash, usageCount)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-    ON CONFLICT(protoId) DO UPDATE SET
-        mean = excluded.mean,
-        variance = excluded.variance,
-        size = excluded.size,
-        accessCount = excluded.accessCount,
-        importance = excluded.importance,
-        hash = excluded.hash,
-        usageCount = usageCount + 1
-`);
-
 const upsertVolatilePos = memoryDb.prepare(`
     INSERT INTO volatile_positive (protoId, compat_id, mean, variance, size, accessCount, importance, hash, usageCount)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-    ON CONFLICT(protoId) DO UPDATE SET
-        mean = excluded.mean,
-        variance = excluded.variance,
-        size = excluded.size,
-        accessCount = excluded.accessCount,
-        importance = excluded.importance,
-        hash = excluded.hash,
-        usageCount = usageCount + 1
-`);
-
-const upsertCoreNeg = memoryDb.prepare(`
-    INSERT INTO core_negative (protoId, compat_id, mean, variance, size, accessCount, importance, hash, usageCount)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
     ON CONFLICT(protoId) DO UPDATE SET
         mean = excluded.mean,
@@ -387,12 +366,6 @@ const selectTopVolNeg = memoryDb.prepare(`
     LIMIT ?
 `);
 
-const updateLastCorePos = memoryDb.prepare(
-    'UPDATE core_positive SET lastAccessed = ? WHERE protoId = ?'
-);
-const updateLastCoreNeg = memoryDb.prepare(
-    'UPDATE core_negative SET lastAccessed = ? WHERE protoId = ?'
-);
 const updateLastVolPos = memoryDb.prepare(
     'UPDATE volatile_positive SET lastAccessed = ? WHERE protoId = ?'
 );
@@ -405,9 +378,6 @@ const existsInCoreNeg = memoryDb.prepare('SELECT 1 FROM core_negative WHERE prot
 
 const existsInVolatilePos = memoryDb.prepare('SELECT 1 FROM volatile_positive WHERE protoId = ?').pluck();
 const existsInVolatileNeg = memoryDb.prepare('SELECT 1 FROM volatile_negative WHERE protoId = ?').pluck();
-
-const deleteFromVolatilePos = memoryDb.prepare('DELETE FROM volatile_positive WHERE protoId = ?');
-const deleteFromVolatileNeg = memoryDb.prepare('DELETE FROM volatile_negative WHERE protoId = ?');
 
 const updateControllerStmt = db.prepare(`
     UPDATE legion_controllers
@@ -466,7 +436,8 @@ const boostCorePos = memoryDb.prepare(`
     SET importance = importance * ?,
         accessCount = accessCount * ?,
         size = size * ?,
-        lastAccessed = ?
+        lastAccessed = ?,
+        usageCount = usageCount + 1
     WHERE protoId = ?
 `);
 
@@ -475,7 +446,8 @@ const boostCoreNeg = memoryDb.prepare(`
     SET importance = importance * ?,
         accessCount = accessCount * ?,
         size = size * ?,
-        lastAccessed = ?
+        lastAccessed = ?,
+        usageCount = usageCount + 1
     WHERE protoId = ?
 `);
 
@@ -484,7 +456,8 @@ const boostVolatilePos = memoryDb.prepare(`
     SET importance = importance * ?,
         accessCount = accessCount * ?,
         size = size * ?,
-        lastAccessed = ?
+        lastAccessed = ?,
+        usageCount = usageCount + 1
     WHERE protoId = ?
 `);
 
@@ -493,7 +466,28 @@ const boostVolatileNeg = memoryDb.prepare(`
     SET importance = importance * ?,
         accessCount = accessCount * ?,
         size = size * ?,
-        lastAccessed = ?
+        lastAccessed = ?,
+        usageCount = usageCount + 1
+    WHERE protoId = ?
+`);
+
+const boostExistingVolatilePos = memoryDb.prepare(`
+    UPDATE volatile_positive
+    SET importance = importance * ?,
+        accessCount = accessCount * ?,
+        size = size * ?,
+        lastAccessed = ?,
+        usageCount = usageCount + 1
+    WHERE protoId = ?
+`);
+
+const boostExistingVolatileNeg = memoryDb.prepare(`
+    UPDATE volatile_negative
+    SET importance = importance * ?,
+        accessCount = accessCount * ?,
+        size = size * ?,
+        lastAccessed = ?,
+        usageCount = usageCount + 1
     WHERE protoId = ?
 `);
 
@@ -564,18 +558,14 @@ const storeNewMemories = memoryDb.transaction((results, currentBatch) => {
 
         const mb = signal.memoryBroadcast;
         const compatStr = canonicalJSON(mb.compatibility);
-
         const isPositive = controller.type === 'positive';
+
         (isPositive ? posCompatSet : negCompatSet).add(compatStr);
 
         const targetArray = isPositive ? posMems : negMems;
         for (const indivMem of mb.memories) {
             if (!indivMem?.mean || !indivMem?.variance || !indivMem?.protoId) continue;
-            targetArray.push({
-                mem: indivMem,
-                compatStr,
-                isCore: !!indivMem.isCore
-            });
+            targetArray.push({ mem: indivMem, compatStr });
         }
     }
 
@@ -593,75 +583,85 @@ const storeNewMemories = memoryDb.transaction((results, currentBatch) => {
         if (row) negIdMap[str] = row.id;
     }
 
-    for (const { mem, compatStr, isCore } of posMems) {
+    for (const { mem, compatStr } of posMems) {
         const compat_id = posIdMap[compatStr];
         if (!compat_id) continue;
 
         const contentHash = computeContentHash(mem.mean);
+        const protoId = mem.protoId;
 
-        if (isCore) {
-            deleteFromVolatilePos.run(mem.protoId);
-            if (existsInCorePos.get(mem.protoId)) continue;
-            upsertCorePos.run(
-                mem.protoId,
-                compat_id,
-                vectorToBlob(mem.mean),
-                vectorToBlob(mem.variance),
-                mem.size ?? 0.0,
-                mem.accessCount ?? 0.0,
-                mem.importance ?? 0.0,
-                contentHash
+        const inCore = existsInCorePos.get(protoId);
+        const inVol  = existsInVolatilePos.get(protoId);
+
+        if (inCore) {
+            boostCorePos.run(
+                CONFIG.baseAccessBoost, 
+                CONFIG.baseAccessBoost, 
+                CONFIG.baseAccessBoost, 
+                currentBatch, 
+                protoId
             );
-            updateLastCorePos.run(currentBatch, mem.protoId);
+        } else if (inVol) {
+            boostExistingVolatilePos.run(
+                CONFIG.baseAccessBoost, 
+                CONFIG.baseAccessBoost, 
+                CONFIG.baseAccessBoost, 
+                currentBatch, 
+                protoId
+            );
         } else {
-            if (existsInCorePos.get(mem.protoId) || existsInVolatilePos.get(mem.protoId)) continue;
             upsertVolatilePos.run(
-                mem.protoId,
+                protoId,
                 compat_id,
                 vectorToBlob(mem.mean),
                 vectorToBlob(mem.variance),
-                mem.size ?? 0.0,
-                mem.accessCount ?? 0.0,
-                mem.importance ?? 0.0,
+                CONFIG.newMemorySize,
+                CONFIG.newMemoryAccessCount,
+                CONFIG.newMemoryImportance,
                 contentHash
             );
-            updateLastVolPos.run(currentBatch, mem.protoId);
+            updateLastVolPos.run(currentBatch, protoId);
         }
     }
 
-    for (const { mem, compatStr, isCore } of negMems) {
+    for (const { mem, compatStr } of negMems) {
         const compat_id = negIdMap[compatStr];
         if (!compat_id) continue;
 
         const contentHash = computeContentHash(mem.mean);
+        const protoId = mem.protoId;
 
-        if (isCore) {
-            deleteFromVolatileNeg.run(mem.protoId);
-            if (existsInCoreNeg.get(mem.protoId)) continue;
-            upsertCoreNeg.run(
-                mem.protoId,
-                compat_id,
-                vectorToBlob(mem.mean),
-                vectorToBlob(mem.variance),
-                mem.size ?? 0.0,
-                mem.accessCount ?? 0.0,
-                mem.importance ?? 0.0,
-                contentHash
+        const inCore = existsInCoreNeg.get(protoId);
+        const inVol  = existsInVolatileNeg.get(protoId);
+
+        if (inCore) {
+            boostCoreNeg.run(
+                CONFIG.baseAccessBoost, 
+                CONFIG.baseAccessBoost, 
+                CONFIG.baseAccessBoost, 
+                currentBatch, 
+                protoId
             );
-            updateLastCoreNeg.run(currentBatch, mem.protoId);
+        } else if (inVol) {
+            boostExistingVolatileNeg.run(
+                CONFIG.baseAccessBoost, 
+                CONFIG.baseAccessBoost, 
+                CONFIG.baseAccessBoost, 
+                currentBatch, 
+                protoId
+            );
         } else {
-            if (existsInCoreNeg.get(mem.protoId) || existsInVolatileNeg.get(mem.protoId)) continue;
             upsertVolatileNeg.run(
-                mem.protoId,
+                protoId,
                 compat_id,
                 vectorToBlob(mem.mean),
                 vectorToBlob(mem.variance),
-                mem.size ?? 0.0,
-                mem.accessCount ?? 0.0,
-                mem.importance ?? 0.0,
+                CONFIG.newMemorySize,
+                CONFIG.newMemoryAccessCount,
+                CONFIG.newMemoryImportance,
                 contentHash
             );
-            updateLastVolNeg.run(currentBatch, mem.protoId);
+            updateLastVolNeg.run(currentBatch, protoId);
         }
     }
 
@@ -1336,23 +1336,23 @@ const processBatch = async () => {
     if (performing.length > 0) {
         performing.sort((a, b) => b.avgScore - a.avgScore);
 
-        const topCount = Math.max(1, Math.ceil(performing.length * 0.3));
-        const threshold = performing[topCount - 1].avgScore;
-
-        const boostFactor = CONFIG.performanceBoostFactor;
-
         memoryDb.transaction(() => {
-            for (const p of performing) {
-                if (p.avgScore < threshold) continue;
+            for (const res of results) {
+                const mb = res.controller?.lastSignal?.memoryBroadcast;
+                if (!mb?.vaultAccess?.length) continue;
 
-                const isPositive = p.ctrl.type === 'positive';
+                const isPositive = res.controller.type === 'positive';
+                const avgScore = res.controller.scoreHistory.slice(-10).reduce((a,b)=>a+b,0) / 10 || 0;
+                const isTopPerformer = avgScore >= (performing.length ? performing[Math.floor(performing.length * 0.3)]?.avgScore || 0 : 0);
 
-                for (const mem of p.mb.vaultAccess) {
+                const boostF = isTopPerformer ? CONFIG.performanceBoostFactor : CONFIG.baseAccessBoost;
+
+                for (const mem of mb.vaultAccess) {
                     const stmt = mem.isCore
                         ? (isPositive ? boostCorePos : boostCoreNeg)
                         : (isPositive ? boostVolatilePos : boostVolatileNeg);
 
-                    stmt.run(boostFactor, boostFactor, boostFactor, currentBatch, mem.protoId);
+                    stmt.run(boostF, boostF, boostF, currentBatch, mem.protoId);
                 }
             }
         })();
