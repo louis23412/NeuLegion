@@ -7,13 +7,15 @@ import { Worker } from 'node:worker_threads';
 import { performance } from 'node:perf_hooks';
 import { availableParallelism } from 'node:os';
 
+const scriptStart = performance.now();
+
 let cache = [];
 let structureMap;
 let candleCounter = 0;
 let httpWorker = null;
 
 const CONFIG = {
-    cutoff: null,
+    cutoff: 1,
     baseProcessCount: 1,
     forceMin: true,
     httpPort: 3001,
@@ -164,6 +166,10 @@ db.exec(`
         signal_history TEXT NOT NULL DEFAULT '[]',
         prob_history TEXT NOT NULL DEFAULT '[]',
         score_history TEXT NOT NULL DEFAULT '[]',
+        lifetime_min_score REAL NOT NULL DEFAULT 100,
+        lifetime_max_score REAL NOT NULL DEFAULT 0,
+        lifetime_min_prob  REAL NOT NULL DEFAULT 100,
+        lifetime_max_prob  REAL NOT NULL DEFAULT 0,
         PRIMARY KEY (group_id, section_id, layer_id, cluster_id)
     );
 `);
@@ -389,7 +395,11 @@ const updateControllerStmt = db.prepare(`
         last_signal = ?,
         signal_history = ?,
         prob_history = ?,
-        score_history = ?
+        score_history = ?,
+        lifetime_min_score = ?,
+        lifetime_max_score = ?,
+        lifetime_min_prob = ?,
+        lifetime_max_prob = ?
     WHERE group_id = ? AND section_id = ? AND layer_id = ? AND cluster_id = ?
 `);
 
@@ -758,16 +768,21 @@ const spawnDedicatedHttpServer = () => {
 };
 
 const getCleanLegionState = () => {
-    return structureMap.flat(3).map((c) => {
+    const cleanControllers = structureMap.flat(3).map((c) => {
+        const entryPrice = c.lastSignal?.entryPrice;
+        const exitPrice = c.lastSignal?.sellPrice;
+        const stopLoss = c.lastSignal?.stopLoss;
+
+        const profitPct = Math.abs(Number((((exitPrice - entryPrice) / entryPrice) * 100).toFixed(3)));
+        const stopLossPct = Math.abs(Number((((stopLoss - entryPrice) / entryPrice) * 100).toFixed(3)));
+
         return {
             id : c.lastSignal?.controllerId,
             polarity : c.type,
-            signalSpeed : c.signalSpeed,
+            signalSpeed : Number((c.signalSpeed / 1000).toFixed(4)),
 
             hiveConnection : c.lastSignal?.hiveConnection,
             lastSaveStatus : c.lastSignal?.lastSaveStatus,
-
-            legionPosition : [c.group, c.section, c.layer, c.id],
 
             params : {
                 population : c.lastSignal?.pop,
@@ -782,20 +797,29 @@ const getCleanLegionState = () => {
             },
 
             price : {
-                entryPrice : c.lastSignal?.entryPrice,
-                exitPrice : c.lastSignal?.sellPrice,
-                stopLoss : c.lastSignal?.stopLoss
+                entryPrice,
+                exitPrice,
+                stopLoss,
+
+                profitPct,
+                stopLossPct
             },
 
             stats : {
                 probability : c.lastSignal?.prob,
+                lifetimeMinProb : c.lifetimeMinProb  ?? 100,
+                lifetimeMaxProb : c.lifetimeMaxProb  ?? 0,
+
                 accuracyScore : c.lastSignal?.score,
+                lifetimeMinScore: c.lifetimeMinScore ?? 100,
+                lifetimeMaxScore: c.lifetimeMaxScore ?? 0,
+
                 tradeAccuracy : c.lastSignal?.tradeAcc,
                 probabilityAccuracy : c.lastSignal?.trueAcc,
                 trainingSteps : c.lastSignal?.lastTrainingStep,
                 skippedTraining : c.lastSignal?.skippedTraining,
                 openSimulations : c.lastSignal?.openSimulations,
-                pendingClosedTrades : c.lastSignal?.pendingClosedTrades
+                pendingClosedTrades : c.lastSignal?.pendingClosedTrades,
             },
 
             memory : {
@@ -811,6 +835,50 @@ const getCleanLegionState = () => {
             }
         }
     });
+
+    const rankedAllControllers = cleanControllers.sort((b, c) => c.stats.accuracyScore - b.stats.accuracyScore);
+
+    const pControllers = rankedAllControllers.filter(a => a.polarity === 'positive').map((obj) => {
+        const {polarity, ...newObj} = obj;
+        return newObj;
+    });
+
+    const allPSpeeds = pControllers.map(x => x.signalSpeed);
+    const allPScores = pControllers.map(x => x.stats.accuracyScore);
+
+    const nControllers = rankedAllControllers.filter(a => a.polarity === 'negative').map((obj) => {
+        const {polarity, ...newObj} = obj;
+        return newObj;
+    });
+
+    const allNSpeeds = nControllers.map(x => x.signalSpeed);
+    const allNScores = nControllers.map(x => x.stats.accuracyScore);
+
+    return {
+        positive : {
+            bestScore : Math.max(...allPScores),
+            worstScore : Math.min(...allPScores),
+            avgScore : Number((allPScores.reduce((acc, val) => acc += val, 0) / allPScores.length).toFixed(3)),
+
+            fastest : Math.min(...allPSpeeds),
+            slowest : Math.max(...allPSpeeds),
+            avgSpeed : Number((allPSpeeds.reduce((acc, val) => acc += val, 0) / allPSpeeds.length).toFixed(3)),
+
+            voters : pControllers,
+        },
+
+        negative : {
+            bestScore : Math.max(...allNScores),
+            worstScore : Math.min(...allNScores),
+            avgScore : Number((allNScores.reduce((acc, val) => acc += val, 0) / allNScores.length).toFixed(3)),
+
+            fastest : Math.min(...allNSpeeds),
+            slowest : Math.max(...allNSpeeds),
+            avgSpeed : Number((allNSpeeds.reduce((acc, val) => acc += val, 0) / allNSpeeds.length).toFixed(3)),
+            
+            voters : nControllers  
+        }
+    };
 }
 
 const getCurrentMarketContext = () => {
@@ -1047,20 +1115,23 @@ const resolveConsensus = (agg, market) => {
             : entry * (1 + market.atrProxy * 2);
     }
 
-    if (direction === 'BUY') {
-        stop = Math.min(stop, entry * (1 - market.atrProxy));
-        exit = Math.max(exit, entry * (1 + market.atrProxy));
-    } else {
-        stop = Math.max(stop, entry * (1 + market.atrProxy));
-        exit = Math.min(exit, entry * (1 - market.atrProxy));
-    }
+    const entryPrice = Number(entry.toFixed(4));
+    const exitPrice = Number(exit.toFixed(4));
+    const stopLoss = Number(stop.toFixed(4));
+
+    const profitPct = Math.abs(Number((((exitPrice - entryPrice) / entryPrice) * 100).toFixed(3)));
+    const stopLossPct = Math.abs(Number((((stopLoss - entryPrice) / entryPrice) * 100).toFixed(3)));
 
     return {
         direction,
         confidence: Number(confidence.toFixed(3)),
-        entryPrice: Number(entry.toFixed(4)),
-        exitPrice: Number(exit.toFixed(4)),
-        stopLoss: Number(stop.toFixed(4))
+
+        entryPrice,
+        exitPrice,
+        profitPct,
+
+        stopLoss,
+        stopLossPct
     };
 };
 
@@ -1073,19 +1144,67 @@ const getLegionConsensus = () => {
     return resolveConsensus(agg, market);
 };
 
-const broadcastLegionState = (status) => {
+const getMemoryVaultStats = () => {
+    const volatilePos = countVolPos.get();
+    const volatileNeg = countVolNeg.get();
+    const totalVolatile = volatilePos + volatileNeg;
+
+    const corePos = countCorePos.get();
+    const coreNeg = countCoreNeg.get();
+    const totalCore = corePos + coreNeg;
+
+    const totalVaultMemories = totalVolatile + totalCore;
+
+    return {
+        volatilePos,
+        volatileNeg,
+        totalVolatile,
+
+        corePos,
+        coreNeg,
+        totalCore,
+
+        totalVaultMemories,
+        volatileMemoriesPct : Number(((totalVolatile / totalVaultMemories) * 100).toFixed(3)),
+        coreMemoriesPct : Number(((totalCore / totalVaultMemories) * 100).toFixed(3)),
+
+        vaultFillPercentage : Number(((totalVaultMemories / CONFIG.memoryVaultCapacity) * 100).toFixed(3))
+    }
+}
+
+const broadcastLegionState = (status, statusOnly = false, updateTime = null) => {
     if (!httpWorker) return;
 
-    const allControllers = getCleanLegionState();
-    const legionConsensus = getLegionConsensus();
+    const scriptUpdate = performance.now();
+    const scriptUpdateTime = Number(((scriptUpdate - scriptStart) / 1000).toFixed(3));
 
-    httpWorker.postMessage({
-        type: 'UPDATE_STATE',
-        status,
-        candleCounter,
-        consensus : legionConsensus,
-        controllers: allControllers
-    });
+    if (statusOnly) {
+        httpWorker.postMessage({
+            type: 'UPDATE_STATUS',
+            status,
+            runtimeSeconds : scriptUpdateTime
+        });
+    } else {
+        const controllers = getCleanLegionState();
+        const consensus = getLegionConsensus();
+        const memoryVaultStats = getMemoryVaultStats();
+
+        const overview = {
+            status,
+            candleCounter,
+            updateTime : updateTime,
+            runtimeSeconds : scriptUpdateTime,
+            population : structureMap.flat(3).reduce((acc, val ) => acc += val.lastSignal.pop, 0)
+        }
+
+        httpWorker.postMessage({
+            type: 'UPDATE_FULL_STATE',
+            overview,
+            memoryVaultStats,
+            consensus,
+            controllers
+        });
+    }
 };
 
 const getLocalIP = () => {
@@ -1178,7 +1297,11 @@ const buildFreshStructure = () => {
                         lastSignal: {},
                         signalHistory : [],
                         probHistory : [],
-                        scoreHistory : []
+                        scoreHistory : [],
+                        lifetimeMinScore: 100,
+                        lifetimeMaxScore: 0,
+                        lifetimeMinProb: 100,
+                        lifetimeMaxProb: 0
                     };
                 })
             )
@@ -1234,6 +1357,10 @@ const saveLegionState = () => {
                 JSON.stringify(ctrl.signalHistory ?? []),
                 JSON.stringify(ctrl.probHistory ?? []),
                 JSON.stringify(ctrl.scoreHistory ?? []),
+                ctrl.lifetimeMinScore ?? 100,
+                ctrl.lifetimeMaxScore ?? 0,
+                ctrl.lifetimeMinProb  ?? 100,
+                ctrl.lifetimeMaxProb  ?? 0,
                 ctrl.group,
                 ctrl.section,
                 ctrl.layer,
@@ -1251,7 +1378,6 @@ const initLegion = () => {
         db.prepare('INSERT INTO legion_state (singleton, candle_counter) VALUES (1, 0)').run();
     }
 
-    const expectedCount = CONFIG.dims.reduce((a, b) => a * b, 1);
     const currentCount = db.prepare('SELECT COUNT(*) AS count FROM legion_controllers').get().count;
 
     if (currentCount === 0) {
@@ -1317,7 +1443,11 @@ const initLegion = () => {
                                 lastSignal: {},
                                 signalHistory: [],
                                 probHistory: [],
-                                scoreHistory: []
+                                scoreHistory: [],
+                                lifetimeMinScore: 100,
+                                lifetimeMaxScore: 0,
+                                lifetimeMinProb: 100,
+                                lifetimeMaxProb: 0
                             };
                         }
 
@@ -1335,7 +1465,11 @@ const initLegion = () => {
                             lastSignal: JSON.parse(row.last_signal ?? '{}'),
                             signalHistory: JSON.parse(row.signal_history ?? '[]'),
                             probHistory: JSON.parse(row.prob_history ?? '[]'),
-                            scoreHistory: JSON.parse(row.score_history ?? '[]')
+                            scoreHistory: JSON.parse(row.score_history ?? '[]'),
+                            lifetimeMinScore: row.lifetime_min_score ?? 100,
+                            lifetimeMaxScore: row.lifetime_max_score ?? 0,
+                            lifetimeMinProb:  row.lifetime_min_prob  ?? 100,
+                            lifetimeMaxProb:  row.lifetime_max_prob  ?? 0
                         };
                     })
                 )
@@ -1355,7 +1489,10 @@ const processBatch = async () => {
 
     console.log('--');
     const controllerStart = performance.now();
-    console.log(`> Processing controllers - ${progressTracker}/${allControllers.length} (${((progressTracker / allControllers.length) * 100).toFixed(2)}%)...`);
+
+    let updateMessage = `Processing controllers - ${progressTracker}/${allControllers.length} (${((progressTracker / allControllers.length) * 100).toFixed(2)}%)...`
+    console.log('>', updateMessage);
+    broadcastLegionState(updateMessage, true);
 
     for (let index = 0; index < allControllers.length; index += CONFIG.maxWorkers) {
         const chunk = allControllers.slice(index, index + CONFIG.maxWorkers);
@@ -1372,8 +1509,10 @@ const processBatch = async () => {
         chunkResults.forEach(result => {
             progressTracker++;
 
+            updateMessage = `Processing controllers - ${progressTracker}/${allControllers.length} (${((progressTracker / allControllers.length) * 100).toFixed(2)}%)...`
             process.stdout.moveCursor(0, -1);
-            console.log(`> Processing controllers - ${progressTracker}/${allControllers.length} (${((progressTracker / allControllers.length) * 100).toFixed(2)}%)...`);
+            console.log('>', updateMessage);
+            broadcastLegionState(updateMessage, true)
 
             results.push(result);
         });
@@ -1384,7 +1523,9 @@ const processBatch = async () => {
     console.log('--');
 
     const memoryAnalyzeStart = performance.now();
-    console.log(`> Analyzing controller memories...`);
+    const analyzeUpdateMessage = `Analyzing controller memories...`;
+    console.log('>', analyzeUpdateMessage);
+    broadcastLegionState(analyzeUpdateMessage, true);
 
     for (const { controller, signal, duration } of results) {
         controller.lastSignal = signal;
@@ -1398,6 +1539,12 @@ const processBatch = async () => {
 
         controller.scoreHistory.push(signal.score);
         if (controller.scoreHistory.length > 100) controller.scoreHistory.shift();
+
+        if (signal.score > 0 && signal.score < controller.lifetimeMinScore) controller.lifetimeMinScore = signal.score;
+        if (signal.score > 0 && signal.score > controller.lifetimeMaxScore) controller.lifetimeMaxScore = signal.score;
+
+        if (signal.prob < controller.lifetimeMinProb && signal.prob !== -1) controller.lifetimeMinProb = signal.prob;
+        if (signal.prob > controller.lifetimeMaxProb && signal.prob !== -1) controller.lifetimeMaxProb = signal.prob;
 
         const mb = controller.lastSignal.memoryBroadcast;
 
@@ -1743,7 +1890,9 @@ const processBatch = async () => {
     const allDeltas = [];
 
     let consolProgress = 0;
-    console.log(`> Consolidating vault memories - ${consolProgress}/${consolidationTasks.length} (${((consolProgress / (consolidationTasks.length || 1)) * 100).toFixed(2)}%)...`);
+    let consolidateUpdateMessage = `Consolidating vault memories - ${consolProgress}/${consolidationTasks.length} (${((consolProgress / (consolidationTasks.length || 1)) * 100).toFixed(2)}%)...`
+    console.log('>', consolidateUpdateMessage);
+    broadcastLegionState(consolidateUpdateMessage, true);
 
     for (let index = 0; index < consolidationTasks.length; index += CONFIG.maxWorkers) {
         const chunk = consolidationTasks.slice(index, index + CONFIG.maxWorkers);
@@ -1756,7 +1905,9 @@ const processBatch = async () => {
 
         consolProgress += chunk.length;
         process.stdout.moveCursor(0, -1);
-        console.log(`> Consolidating vault memories - ${consolProgress}/${consolidationTasks.length} (${((consolProgress / (consolidationTasks.length || 1)) * 100).toFixed(2)}%)...`);
+        consolidateUpdateMessage = `Consolidating vault memories - ${consolProgress}/${consolidationTasks.length} (${((consolProgress / (consolidationTasks.length || 1)) * 100).toFixed(2)}%)...`
+        console.log('>', consolidateUpdateMessage);
+        broadcastLegionState(consolidateUpdateMessage, true);
     }
 
     const memoryConsolidateEnd = performance.now();
@@ -1764,7 +1915,9 @@ const processBatch = async () => {
     console.log('--');
 
     const vaultStateStart = performance.now();
-    console.log(`> Updating memory vault state...`);
+    const vaultUpdateMessage = 'Updating memory vault state...';
+    console.log(`>`, vaultUpdateMessage);
+    broadcastLegionState(vaultUpdateMessage, true);
 
     applyBulkDeltas(allDeltas);
 
@@ -1943,10 +2096,8 @@ const processCandles = async () => {
         crlfDelay: Infinity,
     });
 
-    const ipAddress = getLocalIP();
-
     const rebuildCounter = initLegion();
-
+    const ipAddress = getLocalIP();
     spawnDedicatedHttpServer();
 
     const maxGroup = CONFIG.dims[0] - 1;
@@ -1955,6 +2106,7 @@ const processCandles = async () => {
     const maxCacheFactor = (1 + CONFIG.groupCacheBoost * maxGroup) * (1 + CONFIG.sectionCacheBoost * maxSection) * (1 + CONFIG.layerCacheBoost * maxLayer);
     const maxCache = Math.round(CONFIG.baseCache * maxCacheFactor);
 
+    let finalTime = 0;
     for await (const line of rd) {
         if (!line.trim()) continue;
 
@@ -1980,18 +2132,20 @@ const processCandles = async () => {
 
             await processBatch();
             saveLegionState();
-            broadcastLegionState('running');
 
             const finalEnd = performance.now();
-            console.log(`> All completed in ${((finalEnd - finalStart) / 1000).toFixed(3)} seconds`);
+            finalTime = Number(((finalEnd - finalStart) / 1000).toFixed(3));
 
+            broadcastLegionState('running', false, finalTime);
+
+            console.log(`> All completed in ${finalTime} seconds`);
             console.log('-------------------------------------------------------');
 
             if (CONFIG.cutoff && candleCounter % CONFIG.cutoff === 0) {
                 console.log(`Cutoff reached (${candleCounter}). Candle processing stopped.`);
                 console.log(`HTTP state server is still running - http://${ipAddress}:${CONFIG.httpPort}`);
 
-                broadcastLegionState('Stopped - Cuttoff reached');
+                broadcastLegionState('Stopped - Cuttoff reached', true);
 
                 fileStream.destroy();
                 rd.close();
@@ -2003,7 +2157,7 @@ const processCandles = async () => {
     console.log('End of file reached. Processing complete.');
     console.log(`HTTP state server is still running - http://${ipAddress}:${CONFIG.httpPort}`);
 
-    broadcastLegionState(`Stopped - End of file reached`);
+    broadcastLegionState(`Stopped - End of file reached`, true);
 
     await new Promise(() => {});
 };
