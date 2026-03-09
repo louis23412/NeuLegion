@@ -788,7 +788,7 @@ const getCleanLegionState = () => {
                 population : c.lastSignal?.pop,
                 cacheSize : c.lastSignal?.cache,
                 inputSize : c.lastSignal?.inputSize,
-                candlesUesd : c.lastSignal?.candlesUsed,
+                candlesUsed : c.lastSignal?.candlesUsed,
                 indicatorsUsed : c.lastSignal?.indicatorsUsed,
                 atrFactor : c.lastSignal?.atrFactor,
                 stopFactor : c.lastSignal?.stopFactor,
@@ -1088,21 +1088,20 @@ const hierarchicalAggregate = (propagated) => {
 const resolveConsensus = (agg, market) => {
     const net = agg.totalPos - agg.totalNeg;
     const totalAbs = agg.totalPos + agg.totalNeg || 1;
-    const rawConf = Math.abs(net) / totalAbs;
-    const conflict = Math.min(agg.totalPos, agg.totalNeg) / totalAbs;
-    const agreement = 1 - conflict * 1.5;
-
-    let confidence = Math.max(0, Math.min(100,
-        rawConf * agreement * 100 * (1 + market.volatility * 5)
-    ));
-
     const direction = net > 0 ? 'BUY' : 'SELL';
+
+    const majority = Math.max(agg.totalPos, agg.totalNeg);
+    let confidence = (majority / totalAbs) * 100;
+
+    confidence *= (1 + market.volatility * 1.5);
+
+    confidence = Math.max(50, Math.min(100, confidence));
+
     const winningPrices = direction === 'BUY' ? agg.posPrices : agg.negPrices;
     const wSum = direction === 'BUY' ? agg.posW : agg.negW;
-
     let entry = (wSum > 0 ? winningPrices.entry / wSum : market.price);
-    let exit  = (wSum > 0 ? winningPrices.exit  / wSum : 0);
-    let stop  = (wSum > 0 ? winningPrices.stop  / wSum : 0);
+    let exit = (wSum > 0 ? winningPrices.exit / wSum : 0);
+    let stop = (wSum > 0 ? winningPrices.stop / wSum : 0);
 
     if (exit === 0) {
         exit = direction === 'BUY'
@@ -1118,18 +1117,15 @@ const resolveConsensus = (agg, market) => {
     const entryPrice = Number(entry.toFixed(4));
     const exitPrice = Number(exit.toFixed(4));
     const stopLoss = Number(stop.toFixed(4));
-
     const profitPct = Math.abs(Number((((exitPrice - entryPrice) / entryPrice) * 100).toFixed(3)));
     const stopLossPct = Math.abs(Number((((stopLoss - entryPrice) / entryPrice) * 100).toFixed(3)));
 
     return {
         direction,
         confidence: Number(confidence.toFixed(3)),
-
         entryPrice,
         exitPrice,
         profitPct,
-
         stopLoss,
         stopLossPct
     };
