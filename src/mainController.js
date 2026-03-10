@@ -14,8 +14,21 @@ let structureMap;
 let candleCounter = 0;
 let httpWorker = null;
 
+const legionAccuracy = {
+    longWin : 0,
+    longLoss : 0,
+    longPoints : 0,
+
+    shortWin : 0,
+    shortLoss : 0,
+    shortPoints : 0,
+
+    longTotalPoints : 0,
+    shortTotalPoints : 0
+};
+
 const CONFIG = {
-    cutoff: 1,
+    cutoff: null,
     baseProcessCount: 1,
     forceMin: true,
     httpPort: 3001,
@@ -131,7 +144,7 @@ class PriorityQueue {
             idx = smallest;
         }
     }
-}
+};
 
 fs.existsSync(path.join(CONFIG.stateFolder, 'main')) ? null : fs.mkdirSync(path.join(CONFIG.stateFolder, 'main'), { recursive: true });
 
@@ -171,6 +184,20 @@ db.exec(`
         lifetime_min_prob  REAL NOT NULL DEFAULT 100,
         lifetime_max_prob  REAL NOT NULL DEFAULT 0,
         PRIMARY KEY (group_id, section_id, layer_id, cluster_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS open_simulations (
+        id TEXT PRIMARY KEY,
+        direction TEXT NOT NULL,
+        entryPrice REAL NOT NULL,
+        exitPrice REAL NOT NULL,
+        stopLoss REAL NOT NULL,
+        confidence REAL NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS legion_accuracy (
+        key TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
     );
 `);
 
@@ -553,6 +580,30 @@ const selectMemCorePos = memoryDb.prepare('SELECT mean, variance, size, accessCo
 const selectMemCoreNeg = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash, lastAccessed FROM core_negative WHERE protoId = ?');
 const selectMemVolPos = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash, lastAccessed FROM volatile_positive WHERE protoId = ?');
 const selectMemVolNeg = memoryDb.prepare('SELECT mean, variance, size, accessCount, importance, hash, lastAccessed FROM volatile_negative WHERE protoId = ?');
+
+const insertSimStmt = db.prepare(`
+    INSERT INTO open_simulations (id, direction, entryPrice, exitPrice, stopLoss, confidence)
+    VALUES (?, ?, ?, ?, ?, ?)
+`);
+
+const selectAllSims = db.prepare(`
+    SELECT id, direction, entryPrice, exitPrice, stopLoss, confidence
+    FROM open_simulations
+`);
+
+const countSims = db.prepare(`SELECT COUNT(*) FROM open_simulations`).pluck();
+
+const deleteOpenSim = db.prepare(`DELETE FROM open_simulations WHERE id = ?`);
+
+const upsertAccValue = db.prepare(`
+    INSERT INTO legion_accuracy (key, value)
+    VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+`);
+
+const selectAccValue = db.prepare(`
+    SELECT value FROM legion_accuracy WHERE key = ?
+`);
 
 const getNeighbors = memoryDb.prepare(`
     SELECT parent_proto AS neighbor_proto, accum_distance FROM proto_edges WHERE source = ? AND polarity = ? AND child_proto = ?
@@ -1131,13 +1182,101 @@ const resolveConsensus = (agg, market) => {
     };
 };
 
-const getLegionConsensus = () => {
+const updateLegionAccuracy = (candle, consensus) => {
+    const currentOpenSimulations = selectAllSims.all();
+
+    for (const trade of currentOpenSimulations) {
+        const isLong = trade.exitPrice > trade.entryPrice;
+
+        const hitTakeProfit = isLong
+            ? Number(candle.high) >= trade.exitPrice
+            : Number(candle.low) <= trade.exitPrice;
+
+        const hitStopLoss = isLong
+            ? Number(candle.low) <= trade.stopLoss
+            : Number(candle.high) >= trade.stopLoss;
+
+        if (hitTakeProfit || hitStopLoss) {
+            const outcome = hitTakeProfit ? 1 : 0;
+
+            if (trade.direction === 'BUY') {
+                legionAccuracy.longTotalPoints += 100;
+
+                if (outcome === 1) {
+                    legionAccuracy.longWin++;
+                    legionAccuracy.longPoints += trade.confidence;
+                } else {
+                    legionAccuracy.longLoss++;
+                    legionAccuracy.longPoints += 100 - trade.confidence;
+                }
+            }
+            
+            else {
+                legionAccuracy.shortTotalPoints += 100;
+
+                if (outcome === 1) {
+                    legionAccuracy.shortWin++;
+                    legionAccuracy.shortPoints += trade.confidence;
+                } else {
+                    legionAccuracy.shortLoss++;
+                    legionAccuracy.shortPoints += 100 - trade.confidence;
+                }
+            }
+
+            deleteOpenSim.run(trade.id);
+        }
+    }
+
+    const longTradeAcc = legionAccuracy.longTotalPoints > 0 ? Number(((legionAccuracy.longWin / (legionAccuracy.longWin + legionAccuracy.longLoss)) * 100).toFixed(3)) : 0;
+    const longTrueAcc = legionAccuracy.longTotalPoints > 0 ? Number(((legionAccuracy.longPoints / legionAccuracy.longTotalPoints) * 100).toFixed(3)) : 0;
+    const longAccuracyScore = Number(((longTradeAcc + longTrueAcc) / 2).toFixed(3));
+
+    const shortTradeAcc = legionAccuracy.shortTotalPoints > 0 ? Number(((legionAccuracy.shortWin / (legionAccuracy.shortWin + legionAccuracy.shortLoss)) * 100).toFixed(3)) : 0;
+    const shortTrueAcc = legionAccuracy.shortTotalPoints > 0 ? Number(((legionAccuracy.shortPoints / legionAccuracy.shortTotalPoints) * 100).toFixed(3)) : 0;
+    const shortAccuracyScore = Number(((shortTradeAcc + shortTrueAcc) / 2).toFixed(3));
+
+    const finalConsensusAccuracyScore = Number(((longAccuracyScore + shortAccuracyScore) / 2).toFixed(3));
+
+    insertSimStmt.run(
+        candle.timestamp,
+        consensus.direction,
+        consensus.entryPrice,
+        consensus.exitPrice,
+        consensus.stopLoss,
+        consensus.confidence
+    );
+
+    const finalOpenSimulations = countSims.get();
+
+    consensus.record = {
+        buyTradeAccuracy : longTradeAcc,
+        buyConfidenceAccuracy : longTrueAcc,
+        buyAccuracyScore : longAccuracyScore,
+
+        sellTradeAccuracy : shortTradeAcc,
+        sellConfidenceAccuracy : shortTrueAcc,
+        sellAccuracyScore : shortAccuracyScore,
+
+        finalAccuracyScore : finalConsensusAccuracyScore,
+        openSimulations : finalOpenSimulations
+    }
+
+    return consensus;
+};
+
+const getLegionConsensus = (candle) => {
     const market = getCurrentMarketContext();
+
     let signals = collectAndEnrichSignals();
     signals = computeDynamicWeights(signals);
     signals = propagateInfluence(signals);
+
     const agg = hierarchicalAggregate(signals);
-    return resolveConsensus(agg, market);
+
+    const rawAnswer = resolveConsensus(agg, market);
+    const finalAnswer = updateLegionAccuracy(candle, rawAnswer);
+
+    return finalAnswer;
 };
 
 const getMemoryVaultStats = () => {
@@ -1168,7 +1307,7 @@ const getMemoryVaultStats = () => {
     }
 }
 
-const broadcastLegionState = (status, statusOnly = false, updateTime = null) => {
+const broadcastLegionState = (status, statusOnly = false, updateTime = null, candle = null) => {
     if (!httpWorker) return;
 
     const scriptUpdate = performance.now();
@@ -1182,8 +1321,19 @@ const broadcastLegionState = (status, statusOnly = false, updateTime = null) => 
         });
     } else {
         const controllers = getCleanLegionState();
-        const consensus = getLegionConsensus();
+        const consensus = getLegionConsensus(candle);
         const memoryVaultStats = getMemoryVaultStats();
+
+        const lastCandles = cache.slice(-10).map((x) => {
+            return {
+                id : x.timestamp,
+                open : Number(x.open),
+                close : Number(x.close),
+                high : Number(x.high),
+                low : Number(x.low),
+                volume : Number(x.volume)
+            }
+        });
 
         const overview = {
             status,
@@ -1198,6 +1348,7 @@ const broadcastLegionState = (status, statusOnly = false, updateTime = null) => 
             overview,
             memoryVaultStats,
             consensus,
+            lastCandles,
             controllers
         });
     }
@@ -1345,6 +1496,7 @@ const getControllerParams = (group, section, layer) => {
 const saveLegionState = () => {
     db.transaction(() => {
         const controllers = structureMap.flat(3);
+
         for (const ctrl of controllers) {
             updateControllerStmt.run(
                 ctrl.signalSpeed ?? 0,
@@ -1363,7 +1515,18 @@ const saveLegionState = () => {
                 ctrl.id
             );
         }
+
         upsertCounterStmt.run(candleCounter);
+
+        upsertAccValue.run('long_win', legionAccuracy.longWin);
+        upsertAccValue.run('long_loss', legionAccuracy.longLoss);
+        upsertAccValue.run('long_points', legionAccuracy.longPoints);
+        upsertAccValue.run('long_total_points', legionAccuracy.longTotalPoints);
+
+        upsertAccValue.run('short_win', legionAccuracy.shortWin);
+        upsertAccValue.run('short_loss', legionAccuracy.shortLoss);
+        upsertAccValue.run('short_points', legionAccuracy.shortPoints);
+        upsertAccValue.run('short_total_points', legionAccuracy.shortTotalPoints);
     })();
 };
 
@@ -1372,6 +1535,46 @@ const initLegion = () => {
     let loadedCounter = counterRow ? counterRow.candle_counter : 0;
     if (!counterRow) {
         db.prepare('INSERT INTO legion_state (singleton, candle_counter) VALUES (1, 0)').run();
+    }
+
+    const longWinRaw = selectAccValue.get('long_win');
+    if (longWinRaw) {
+        legionAccuracy.longWin = longWinRaw.value;
+    }
+
+    const shortWinRaw = selectAccValue.get('short_win');
+    if (shortWinRaw) {
+        legionAccuracy.shortWin = shortWinRaw.value;
+    }
+
+    const longLossRaw = selectAccValue.get('long_loss');
+    if (longLossRaw) {
+        legionAccuracy.longLoss = longLossRaw.value;
+    }
+
+    const shortLossRaw = selectAccValue.get('short_loss');
+    if (shortLossRaw) {
+        legionAccuracy.shortLoss = shortLossRaw.value;
+    }
+
+    const longPointsRaw = selectAccValue.get('long_points');
+    if (longPointsRaw) {
+        legionAccuracy.longPoints = longPointsRaw.value;
+    }
+
+    const shortPointsRaw = selectAccValue.get('short_points');
+    if (shortPointsRaw) {
+        legionAccuracy.shortPoints = shortPointsRaw.value;
+    }
+
+    const longTotalPointsRaw = selectAccValue.get('long_total_points');
+    if (longTotalPointsRaw) {
+        legionAccuracy.longTotalPoints = longTotalPointsRaw.value;
+    }
+
+    const shortTotalPointsRaw = selectAccValue.get('short_total_points');
+    if (shortTotalPointsRaw) {
+        legionAccuracy.shortTotalPoints = shortTotalPointsRaw.value;
     }
 
     const currentCount = db.prepare('SELECT COUNT(*) AS count FROM legion_controllers').get().count;
@@ -2132,7 +2335,7 @@ const processCandles = async () => {
             const finalEnd = performance.now();
             finalTime = Number(((finalEnd - finalStart) / 1000).toFixed(3));
 
-            broadcastLegionState('running', false, finalTime);
+            broadcastLegionState('running', false, finalTime, cache.at(-1));
 
             console.log(`> All completed in ${finalTime} seconds`);
             console.log('-------------------------------------------------------');

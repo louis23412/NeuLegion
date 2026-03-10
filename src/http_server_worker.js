@@ -10,6 +10,7 @@ const currentLegionState = {
     },
     memoryVaultStats : {},
     consensus : {},
+    lastCandles : [],
     controllers: []
 };
 
@@ -18,6 +19,7 @@ parentPort.on('message', (msg) => {
         currentLegionState.overview = msg.overview
         currentLegionState.memoryVaultStats = msg.memoryVaultStats
         currentLegionState.consensus = msg.consensus
+        currentLegionState.lastCandles = msg.lastCandles
         currentLegionState.controllers = msg.controllers
     }
 
