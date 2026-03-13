@@ -1,5 +1,6 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import http from 'node:http';
+import os from 'os';
 
 const { ip, port } = workerData;
 
@@ -29,8 +30,26 @@ parentPort.on('message', (msg) => {
     }
 });
 
+const getLocalIP = () => {
+  const interfaces = os.networkInterfaces();
+  let ipAddress;
+
+  Object.keys(interfaces).forEach((ifaceName) => {
+    interfaces[ifaceName].forEach((iface) => {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        ipAddress = iface.address;
+      }
+    });
+  });
+
+  return ipAddress;
+}
+
 const server = http.createServer((req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    const trustedIp = getLocalIP();
+    const trustedPort = 3001;
+
+    res.setHeader('Access-Control-Allow-Origin', `http://${trustedIp}:${trustedPort}`);
     res.setHeader('Content-Type', 'application/json');
 
     if (req.url === '/') {

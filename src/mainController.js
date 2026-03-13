@@ -1,4 +1,3 @@
-import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
@@ -14,24 +13,11 @@ let structureMap;
 let candleCounter = 0;
 let httpWorker = null;
 
-const legionAccuracy = {
-    longWin : 0,
-    longLoss : 0,
-    longPoints : 0,
-
-    shortWin : 0,
-    shortLoss : 0,
-    shortPoints : 0,
-
-    longTotalPoints : 0,
-    shortTotalPoints : 0
-};
-
 const CONFIG = {
     cutoff: null,
     baseProcessCount: 1,
     forceMin: true,
-    httpPort: 3001,
+    httpPort: 3000,
     maxWorkers: Math.max(1, Math.floor(availableParallelism() * 0.25)),
     file: path.join(import.meta.dirname, 'candles.jsonl'),
     stateFolder : path.join(import.meta.dirname, '..', 'state'),
@@ -144,6 +130,19 @@ class PriorityQueue {
             idx = smallest;
         }
     }
+};
+
+const legionAccuracy = {
+    longWin : 0,
+    longLoss : 0,
+    longPoints : 0,
+
+    shortWin : 0,
+    shortLoss : 0,
+    shortPoints : 0,
+
+    longTotalPoints : 0,
+    shortTotalPoints : 0
 };
 
 fs.existsSync(path.join(CONFIG.stateFolder, 'main')) ? null : fs.mkdirSync(path.join(CONFIG.stateFolder, 'main'), { recursive: true });
@@ -804,7 +803,7 @@ const applyBulkDeltas = memoryDb.transaction((deltas) => {
 const spawnDedicatedHttpServer = () => {
     httpWorker = new Worker(new URL('./http_server_worker.js', import.meta.url), {
         workerData : {
-            ip : getLocalIP(),
+            ip : 'localhost',
             port : CONFIG.httpPort
         }
     });
@@ -834,6 +833,8 @@ const getCleanLegionState = () => {
 
             hiveConnection : c.lastSignal?.hiveConnection,
             lastSaveStatus : c.lastSignal?.lastSaveStatus,
+
+            influence : 0,
 
             params : {
                 population : c.lastSignal?.pop,
@@ -981,6 +982,7 @@ const collectAndEnrichSignals = () => {
             group: ctrl.group,
             section: ctrl.section,
             layer: ctrl.layer,
+            cluster : ctrl.id,
             recentPerf,
             compatibility: mb.compatibility ? canonicalJSON(mb.compatibility) : null
         });
@@ -1067,6 +1069,8 @@ const hierarchicalAggregate = (propagated) => {
 
     propagated.forEach(s => {
         const key = `${s.group}-${s.section}-${s.layer}-${s.direction}`;
+        s.tempId = `G${s.group}S${s.section}L${s.layer}C${s.cluster}`;
+
         if (!layerAgg.has(key)) {
             layerAgg.set(key, {
                 strength: 0,
@@ -1090,6 +1094,10 @@ const hierarchicalAggregate = (propagated) => {
         if (s.stopLoss > 0) {
             agg.stopSum += s.stopLoss * s.finalWeight;
         }
+    });
+
+    const influencelist = propagated.map((x) => { 
+        return { id : x.tempId, weight : x.finalWeight };
     });
 
     let totalPosStrength = 0;
@@ -1132,7 +1140,8 @@ const hierarchicalAggregate = (propagated) => {
         posPrices: { entry: posEntrySum, exit: posExitSum, stop: posStopSum },
         negPrices: { entry: negEntrySum, exit: negExitSum, stop: negStopSum },
         posCount,
-        negCount
+        negCount,
+        influencelist
     };
 };
 
@@ -1264,6 +1273,26 @@ const updateLegionAccuracy = (candle, consensus) => {
     return consensus;
 };
 
+const updateInfluenceValues = (controllers, influenceList) => {
+    const totalWeight = influenceList.reduce((acc, val) => acc += val.weight, 0);
+
+    for (const c of controllers.positive.voters) {
+        for (const w of influenceList) {
+            if (c.id === w.id) {
+                c.influence = Number(((w.weight / totalWeight) * 100).toFixed(4))
+            }
+        }
+    }
+
+    for (const c of controllers.negative.voters) {
+        for (const w of influenceList) {
+            if (c.id === w.id) {
+                c.influence = Number(((w.weight / totalWeight) * 100).toFixed(4))
+            }
+        }
+    }
+};
+
 const getLegionConsensus = (candle) => {
     const market = getCurrentMarketContext();
 
@@ -1276,7 +1305,10 @@ const getLegionConsensus = (candle) => {
     const rawAnswer = resolveConsensus(agg, market);
     const finalAnswer = updateLegionAccuracy(candle, rawAnswer);
 
-    return finalAnswer;
+    return { 
+        consensus : finalAnswer,
+        influenceList : agg.influencelist
+    };
 };
 
 const getMemoryVaultStats = () => {
@@ -1321,8 +1353,10 @@ const broadcastLegionState = (status, statusOnly = false, updateTime = null, can
         });
     } else {
         const controllers = getCleanLegionState();
-        const consensus = getLegionConsensus(candle);
         const memoryVaultStats = getMemoryVaultStats();
+        const { consensus, influenceList } = getLegionConsensus(candle);
+
+        updateInfluenceValues(controllers, influenceList);
 
         const lastCandles = cache.slice(-10).map((x) => {
             return {
@@ -1353,21 +1387,6 @@ const broadcastLegionState = (status, statusOnly = false, updateTime = null, can
         });
     }
 };
-
-const getLocalIP = () => {
-  const interfaces = os.networkInterfaces();
-  let ipAddress;
-
-  Object.keys(interfaces).forEach((ifaceName) => {
-    interfaces[ifaceName].forEach((iface) => {
-      if (iface.family === 'IPv4' && !iface.internal) {
-        ipAddress = iface.address;
-      }
-    });
-  });
-
-  return ipAddress;
-}
 
 const vectorToBlob = (vec) => {
     if (!Array.isArray(vec) || vec.length === 0) return Buffer.allocUnsafe(0);
@@ -2296,7 +2315,6 @@ const processCandles = async () => {
     });
 
     const rebuildCounter = initLegion();
-    const ipAddress = getLocalIP();
     spawnDedicatedHttpServer();
 
     const maxGroup = CONFIG.dims[0] - 1;
@@ -2327,7 +2345,7 @@ const processCandles = async () => {
             if (candleCounter <= rebuildCounter) continue;
 
             const finalStart = performance.now();
-            console.log(`New candle (${candleCounter}) - http://${ipAddress}:${CONFIG.httpPort}`);
+            console.log(`New candle (${candleCounter}) - http://localhost:${CONFIG.httpPort}`);
 
             await processBatch();
             saveLegionState();
@@ -2342,7 +2360,7 @@ const processCandles = async () => {
 
             if (CONFIG.cutoff && candleCounter % CONFIG.cutoff === 0) {
                 console.log(`Cutoff reached (${candleCounter}). Candle processing stopped.`);
-                console.log(`HTTP state server is still running - http://${ipAddress}:${CONFIG.httpPort}`);
+                console.log(`HTTP state server is still running - http://localhost:${CONFIG.httpPort}`);
 
                 broadcastLegionState('Stopped - Cuttoff reached', true);
 
@@ -2354,7 +2372,7 @@ const processCandles = async () => {
     }
 
     console.log('End of file reached. Processing complete.');
-    console.log(`HTTP state server is still running - http://${ipAddress}:${CONFIG.httpPort}`);
+    console.log(`HTTP state server is still running - http://localhost:${CONFIG.httpPort}`);
 
     broadcastLegionState(`Stopped - End of file reached`, true);
 
