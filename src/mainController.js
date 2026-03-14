@@ -1,3 +1,4 @@
+import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
@@ -800,10 +801,10 @@ const applyBulkDeltas = memoryDb.transaction((deltas) => {
     promotes.coreNeg.forEach(p => insertCoreNegMain.run(...p));
 });
 
-const spawnDedicatedHttpServer = () => {
+const spawnDedicatedHttpServer = (ip) => {
     httpWorker = new Worker(new URL('./http_server_worker.js', import.meta.url), {
         workerData : {
-            ip : 'localhost',
+            ip,
             port : CONFIG.httpPort
         }
     });
@@ -2307,6 +2308,21 @@ const runConsolidationWorker = async (compat_id, isPositive, currentBatch) => {
     });
 };
 
+const getLocalIP = () => {
+  const interfaces = os.networkInterfaces();
+  let ipAddress;
+
+  Object.keys(interfaces).forEach((ifaceName) => {
+    interfaces[ifaceName].forEach((iface) => {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        ipAddress = iface.address;
+      }
+    });
+  });
+
+  return ipAddress;
+}
+
 const processCandles = async () => {
     const fileStream = fs.createReadStream(CONFIG.file);
     const rd = readline.createInterface({
@@ -2315,7 +2331,9 @@ const processCandles = async () => {
     });
 
     const rebuildCounter = initLegion();
-    spawnDedicatedHttpServer();
+    const ipAddress = getLocalIP();
+
+    spawnDedicatedHttpServer(ipAddress);
 
     const maxGroup = CONFIG.dims[0] - 1;
     const maxSection = CONFIG.dims[1] - 1;
@@ -2345,7 +2363,7 @@ const processCandles = async () => {
             if (candleCounter <= rebuildCounter) continue;
 
             const finalStart = performance.now();
-            console.log(`New candle (${candleCounter}) - http://localhost:${CONFIG.httpPort}`);
+            console.log(`New candle (${candleCounter})`);
 
             await processBatch();
             saveLegionState();
@@ -2360,9 +2378,9 @@ const processCandles = async () => {
 
             if (CONFIG.cutoff && candleCounter % CONFIG.cutoff === 0) {
                 console.log(`Cutoff reached (${candleCounter}). Candle processing stopped.`);
-                console.log(`HTTP state server is still running - http://localhost:${CONFIG.httpPort}`);
+                console.log(`HTTP state server is still running.`);
 
-                broadcastLegionState('Stopped - Cuttoff reached', true);
+                broadcastLegionState('Stopped - Cutoff reached', true);
 
                 fileStream.destroy();
                 rd.close();
@@ -2372,7 +2390,7 @@ const processCandles = async () => {
     }
 
     console.log('End of file reached. Processing complete.');
-    console.log(`HTTP state server is still running - http://localhost:${CONFIG.httpPort}`);
+    console.log(`HTTP state server is still running.`);
 
     broadcastLegionState(`Stopped - End of file reached`, true);
 

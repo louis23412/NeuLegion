@@ -1,6 +1,5 @@
-import { parentPort, workerData } from 'node:worker_threads';
 import http from 'node:http';
-import os from 'os';
+import { parentPort, workerData } from 'node:worker_threads';
 
 const { ip, port } = workerData;
 
@@ -30,32 +29,28 @@ parentPort.on('message', (msg) => {
     }
 });
 
-const getLocalIP = () => {
-  const interfaces = os.networkInterfaces();
-  let ipAddress;
-
-  Object.keys(interfaces).forEach((ifaceName) => {
-    interfaces[ifaceName].forEach((iface) => {
-      if (iface.family === 'IPv4' && !iface.internal) {
-        ipAddress = iface.address;
-      }
-    });
-  });
-
-  return ipAddress;
-}
-
 const server = http.createServer((req, res) => {
-    const trustedIp = getLocalIP();
-    const trustedPort = 3001;
+    const trustedAddress = `http://${ip}:3001`
 
-    res.setHeader('Access-Control-Allow-Origin', `http://${trustedIp}:${trustedPort}`);
+    res.setHeader('Access-Control-Allow-Origin', trustedAddress);
+    res.setHeader('Access-Control-Allow-Methods', 'GET');
     res.setHeader('Content-Type', 'application/json');
+
+    const origin = req.headers.origin;
+
+    if (origin !== trustedAddress) {
+        res.writeHead(403);
+        res.end(JSON.stringify({ error : 'access denied' }));
+        return;
+    }
 
     if (req.url === '/') {
         res.writeHead(200);
         res.end(JSON.stringify(currentLegionState, null, 2));
-    } else {
+        return;
+    }
+    
+    else {
         res.writeHead(404);
         res.end(JSON.stringify({ error: 'Not Found' }));
     }
