@@ -1706,13 +1706,6 @@ const processBatch = async () => {
 
     const allControllers = structureMap.flat(3);
 
-    console.log('--');
-    const controllerStart = performance.now();
-
-    let updateMessage = `Processing controllers - ${progressTracker}/${allControllers.length} (${((progressTracker / allControllers.length) * 100).toFixed(2)}%)...`
-    console.log('>', updateMessage);
-    broadcastLegionState(updateMessage, true);
-
     for (let index = 0; index < allControllers.length; index += CONFIG.maxWorkers) {
         const chunk = allControllers.slice(index, index + CONFIG.maxWorkers);
         const promises = chunk.map(controller => runWorker(controller));
@@ -1727,24 +1720,9 @@ const processBatch = async () => {
 
         chunkResults.forEach(result => {
             progressTracker++;
-
-            updateMessage = `Processing controllers - ${progressTracker}/${allControllers.length} (${((progressTracker / allControllers.length) * 100).toFixed(2)}%)...`
-            process.stdout.moveCursor(0, -1);
-            console.log('>', updateMessage);
-            broadcastLegionState(updateMessage, true)
-
             results.push(result);
         });
     }
-
-    const controllersEnd = performance.now();
-    console.log(`> Processed all controllers in ${((controllersEnd - controllerStart) / 1000).toFixed(3)} seconds`);
-    console.log('--');
-
-    const memoryAnalyzeStart = performance.now();
-    const analyzeUpdateMessage = `Analyzing controller memories...`;
-    console.log('>', analyzeUpdateMessage);
-    broadcastLegionState(analyzeUpdateMessage, true);
 
     for (const { controller, signal, duration } of results) {
         controller.lastSignal = signal;
@@ -2090,12 +2068,6 @@ const processBatch = async () => {
         })();
     }
 
-    const memoryAnalyzeEnd = performance.now();
-    console.log(`> Analyzed controller memories in ${((memoryAnalyzeEnd - memoryAnalyzeStart) / 1000).toFixed(3)} seconds`);
-    console.log('--');
-
-    const memoryConsolidateStart = performance.now();
-
     const { posIdMap, negIdMap } = storeNewMemories(results, currentBatch);
 
     const consolidationTasks = [];
@@ -2108,11 +2080,6 @@ const processBatch = async () => {
 
     const allDeltas = [];
 
-    let consolProgress = 0;
-    let consolidateUpdateMessage = `Consolidating vault memories - ${consolProgress}/${consolidationTasks.length} (${((consolProgress / (consolidationTasks.length || 1)) * 100).toFixed(2)}%)...`
-    console.log('>', consolidateUpdateMessage);
-    broadcastLegionState(consolidateUpdateMessage, true);
-
     for (let index = 0; index < consolidationTasks.length; index += CONFIG.maxWorkers) {
         const chunk = consolidationTasks.slice(index, index + CONFIG.maxWorkers);
         const promises = chunk.map(task => 
@@ -2121,22 +2088,7 @@ const processBatch = async () => {
 
         const chunkDeltas = await Promise.all(promises);
         allDeltas.push(...chunkDeltas);
-
-        consolProgress += chunk.length;
-        process.stdout.moveCursor(0, -1);
-        consolidateUpdateMessage = `Consolidating vault memories - ${consolProgress}/${consolidationTasks.length} (${((consolProgress / (consolidationTasks.length || 1)) * 100).toFixed(2)}%)...`
-        console.log('>', consolidateUpdateMessage);
-        broadcastLegionState(consolidateUpdateMessage, true);
     }
-
-    const memoryConsolidateEnd = performance.now();
-    console.log(`> Consolidated vault memories in ${((memoryConsolidateEnd- memoryConsolidateStart) / 1000).toFixed(3)} seconds`);
-    console.log('--');
-
-    const vaultStateStart = performance.now();
-    const vaultUpdateMessage = 'Updating memory vault state...';
-    console.log(`>`, vaultUpdateMessage);
-    broadcastLegionState(vaultUpdateMessage, true);
 
     applyBulkDeltas(allDeltas);
 
@@ -2191,10 +2143,6 @@ const processBatch = async () => {
 
         currentTotal -= purgedVol;
     }
-
-    const vaultStateEnd = performance.now();
-    console.log(`> Updated memory vault state in ${((vaultStateEnd- vaultStateStart) / 1000).toFixed(3)} seconds`);
-    console.log('--');
 };
 
 const runWorker = async (controller) => {
@@ -2363,7 +2311,10 @@ const processCandles = async () => {
             if (candleCounter <= rebuildCounter) continue;
 
             const finalStart = performance.now();
-            console.log(`New candle (${candleCounter})`);
+            const updateMessage = `processing candle #${candleCounter}`;
+
+            console.log(updateMessage);
+            broadcastLegionState(updateMessage, true);
 
             await processBatch();
             saveLegionState();
@@ -2371,16 +2322,14 @@ const processCandles = async () => {
             const finalEnd = performance.now();
             finalTime = Number(((finalEnd - finalStart) / 1000).toFixed(3));
 
-            broadcastLegionState('running', false, finalTime, cache.at(-1));
-
-            console.log(`> All completed in ${finalTime} seconds`);
-            console.log('-------------------------------------------------------');
+            const finalMessage = `completed in ${finalTime} seconds`
+            console.log(finalMessage);
+            broadcastLegionState(finalMessage, false, finalTime, cache.at(-1));
+            
 
             if (CONFIG.cutoff && candleCounter % CONFIG.cutoff === 0) {
-                console.log(`Cutoff reached (${candleCounter}). Candle processing stopped.`);
-                console.log(`HTTP state server is still running.`);
-
-                broadcastLegionState('Stopped - Cutoff reached', true);
+                console.log('Cutoff reached, HTTP state server is still running.');
+                broadcastLegionState('stopped - cutoff', true);
 
                 fileStream.destroy();
                 rd.close();
@@ -2389,10 +2338,8 @@ const processCandles = async () => {
         }
     }
 
-    console.log('End of file reached. Processing complete.');
-    console.log(`HTTP state server is still running.`);
-
-    broadcastLegionState(`Stopped - End of file reached`, true);
+    console.log('End of file reached, HTTP state server is still running.');
+    broadcastLegionState(`stopped - end of file`, true);
 
     await new Promise(() => {});
 };
