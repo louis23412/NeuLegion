@@ -233,17 +233,17 @@ class HiveMindController {
                 }
             }
 
-            const fetchCandlesStmt = this.#db.prepare(`
-                SELECT * FROM candles ORDER BY timestamp ASC LIMIT ${this.#cacheSize}
-            `);
-            fullCandles = fetchCandlesStmt.all();
-
             const cleanupStmt = this.#db.prepare(`
                 DELETE FROM candles WHERE timestamp NOT IN (
                     SELECT timestamp FROM candles ORDER BY timestamp DESC LIMIT ${this.#cacheSize}
                 )
             `);
             cleanupStmt.run();
+
+            const fetchCandlesStmt = this.#db.prepare(`
+                SELECT * FROM candles ORDER BY timestamp ASC LIMIT ${this.#cacheSize}
+            `);
+            fullCandles = fetchCandlesStmt.all();
         });
         transaction();
 
