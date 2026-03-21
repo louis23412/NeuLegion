@@ -8,7 +8,6 @@ const currentLegionState = {
         status : 'initializing',
         runtimeSeconds : 0
     },
-    memoryVaultStats : {},
     consensus : {},
     lastCandles : [],
     controllers: []
@@ -17,7 +16,6 @@ const currentLegionState = {
 parentPort.on('message', (msg) => {
     if (msg.type === 'UPDATE_FULL_STATE') {
         currentLegionState.overview = msg.overview
-        currentLegionState.memoryVaultStats = msg.memoryVaultStats
         currentLegionState.consensus = msg.consensus
         currentLegionState.lastCandles = msg.lastCandles
         currentLegionState.controllers = msg.controllers

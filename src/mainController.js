@@ -143,7 +143,19 @@ const legionAccuracy = {
     shortPoints : 0,
 
     longTotalPoints : 0,
-    shortTotalPoints : 0
+    shortTotalPoints : 0,
+
+    maxBuyScore : 0,
+    minBuyScore : 100,
+    buyScoreHistory : [],
+
+    maxSellScore : 0,
+    minSellScore : 100,
+    sellScoreHistory : [],
+
+    maxFinalScore : 0,
+    minFinalScore : 100,
+    finalScoreHistory : []
 };
 
 fs.existsSync(path.join(CONFIG.stateFolder, 'main')) ? null : fs.mkdirSync(path.join(CONFIG.stateFolder, 'main'), { recursive: true });
@@ -197,7 +209,7 @@ db.exec(`
 
     CREATE TABLE IF NOT EXISTS legion_accuracy (
         key TEXT PRIMARY KEY,
-        value INTEGER NOT NULL
+        value TEXT NOT NULL
     );
 `);
 
@@ -591,8 +603,6 @@ const selectAllSims = db.prepare(`
     FROM open_simulations
 `);
 
-const countSims = db.prepare(`SELECT COUNT(*) FROM open_simulations`).pluck();
-
 const deleteOpenSim = db.prepare(`DELETE FROM open_simulations WHERE id = ?`);
 
 const upsertAccValue = db.prepare(`
@@ -832,9 +842,6 @@ const getCleanLegionState = () => {
             polarity : c.type,
             signalSpeed : Number((c.signalSpeed / 1000).toFixed(4)),
 
-            hiveConnection : c.lastSignal?.hiveConnection,
-            lastSaveStatus : c.lastSignal?.lastSaveStatus,
-
             influence : 0,
 
             params : {
@@ -860,12 +867,7 @@ const getCleanLegionState = () => {
 
             stats : {
                 probability : c.lastSignal?.prob,
-                lifetimeMinProb : c.lifetimeMinProb  ?? 100,
-                lifetimeMaxProb : c.lifetimeMaxProb  ?? 0,
-
                 accuracyScore : c.lastSignal?.score,
-                lifetimeMinScore: c.lifetimeMinScore ?? 100,
-                lifetimeMaxScore: c.lifetimeMaxScore ?? 0,
 
                 tradeAccuracy : c.lastSignal?.tradeAcc,
                 probabilityAccuracy : c.lastSignal?.trueAcc,
@@ -896,39 +898,17 @@ const getCleanLegionState = () => {
         return newObj;
     });
 
-    const allPSpeeds = pControllers.map(x => x.signalSpeed);
-    const allPScores = pControllers.map(x => x.stats.accuracyScore);
-
     const nControllers = rankedAllControllers.filter(a => a.polarity === 'negative').map((obj) => {
         const {polarity, ...newObj} = obj;
         return newObj;
     });
 
-    const allNSpeeds = nControllers.map(x => x.signalSpeed);
-    const allNScores = nControllers.map(x => x.stats.accuracyScore);
-
     return {
         positive : {
-            bestScore : Math.max(...allPScores),
-            worstScore : Math.min(...allPScores),
-            avgScore : Number((allPScores.reduce((acc, val) => acc += val, 0) / allPScores.length).toFixed(3)),
-
-            fastest : Math.min(...allPSpeeds),
-            slowest : Math.max(...allPSpeeds),
-            avgSpeed : Number((allPSpeeds.reduce((acc, val) => acc += val, 0) / allPSpeeds.length).toFixed(3)),
-
             voters : pControllers,
         },
 
         negative : {
-            bestScore : Math.max(...allNScores),
-            worstScore : Math.min(...allNScores),
-            avgScore : Number((allNScores.reduce((acc, val) => acc += val, 0) / allNScores.length).toFixed(3)),
-
-            fastest : Math.min(...allNSpeeds),
-            slowest : Math.max(...allNSpeeds),
-            avgSpeed : Number((allNSpeeds.reduce((acc, val) => acc += val, 0) / allNSpeeds.length).toFixed(3)),
-            
             voters : nControllers  
         }
     };
@@ -1192,8 +1172,70 @@ const resolveConsensus = (agg, market) => {
     };
 };
 
+const updateAccValues = (updateH = false) => {
+    const longTradeAcc = legionAccuracy.longTotalPoints > 0 ? Number(((legionAccuracy.longWin / (legionAccuracy.longWin + legionAccuracy.longLoss)) * 100).toFixed(3)) : 0;
+    const longTrueAcc = legionAccuracy.longTotalPoints > 0 ? Number(((legionAccuracy.longPoints / legionAccuracy.longTotalPoints) * 100).toFixed(3)) : 0;
+    const longAccuracyScore = Number(((longTradeAcc + longTrueAcc) / 2).toFixed(3));
+
+    if (legionAccuracy.longTotalPoints > 0) {
+        if (longAccuracyScore > legionAccuracy.maxBuyScore) legionAccuracy.maxBuyScore = longAccuracyScore;
+        else if (longAccuracyScore < legionAccuracy.minBuyScore) legionAccuracy.minBuyScore = longAccuracyScore;
+    }
+
+    const shortTradeAcc = legionAccuracy.shortTotalPoints > 0 ? Number(((legionAccuracy.shortWin / (legionAccuracy.shortWin + legionAccuracy.shortLoss)) * 100).toFixed(3)) : 0;
+    const shortTrueAcc = legionAccuracy.shortTotalPoints > 0 ? Number(((legionAccuracy.shortPoints / legionAccuracy.shortTotalPoints) * 100).toFixed(3)) : 0;
+    const shortAccuracyScore = Number(((shortTradeAcc + shortTrueAcc) / 2).toFixed(3));
+
+    if (legionAccuracy.shortTotalPoints > 0) {
+        if (shortAccuracyScore > legionAccuracy.maxSellScore) legionAccuracy.maxSellScore = shortAccuracyScore;
+        else if (shortAccuracyScore < legionAccuracy.minSellScore) legionAccuracy.minSellScore = shortAccuracyScore;
+    }
+
+    const finalConsensusAccuracyScore = Number(((longAccuracyScore + shortAccuracyScore) / 2).toFixed(3));
+
+    if (legionAccuracy.longTotalPoints > 0 || legionAccuracy.shortTotalPoints > 0) {
+        if (finalConsensusAccuracyScore > legionAccuracy.maxFinalScore) legionAccuracy.maxFinalScore = finalConsensusAccuracyScore;
+        else if (finalConsensusAccuracyScore < legionAccuracy.minFinalScore) legionAccuracy.minFinalScore = finalConsensusAccuracyScore;
+
+        if (updateH) {
+            legionAccuracy.buyScoreHistory.push(longAccuracyScore);
+            if (legionAccuracy.buyScoreHistory.length > 100) legionAccuracy.buyScoreHistory.shift();
+
+            legionAccuracy.sellScoreHistory.push(shortAccuracyScore);
+            if (legionAccuracy.sellScoreHistory.length > 100) legionAccuracy.sellScoreHistory.shift();
+
+            legionAccuracy.finalScoreHistory.push(finalConsensusAccuracyScore);
+            if (legionAccuracy.finalScoreHistory.length > 100) legionAccuracy.finalScoreHistory.shift();
+        }
+    }
+
+    const finalScoreArray = legionAccuracy.finalScoreHistory.map((score, i) => ({
+        buyScore: legionAccuracy.buyScoreHistory[i],
+        sellScore: legionAccuracy.sellScoreHistory[i],
+        finalScore : score
+    }));
+
+    return {
+        buyAccuracyScore : longAccuracyScore,
+        minBuyAccuracyScore : legionAccuracy.minBuyScore,
+        maxBuyAccuracyScore : legionAccuracy.maxBuyScore,
+
+        sellAccuracyScore : shortAccuracyScore,
+        minSellAccuracyScore : legionAccuracy.minSellScore,
+        maxSellAccuracyScore : legionAccuracy.maxSellScore,
+
+        finalAccuracyScore : finalConsensusAccuracyScore,
+        minFinalAccuracy : legionAccuracy.minFinalScore,
+        maxFinalAccuracy : legionAccuracy.maxFinalScore,
+
+        scoreHistories : finalScoreArray
+    }
+};
+
 const updateLegionAccuracy = (candle, consensus) => {
     const currentOpenSimulations = selectAllSims.all();
+
+    let finalObject;
 
     for (const trade of currentOpenSimulations) {
         const isLong = trade.exitPrice > trade.entryPrice;
@@ -1234,18 +1276,11 @@ const updateLegionAccuracy = (candle, consensus) => {
             }
 
             deleteOpenSim.run(trade.id);
+            finalObject = updateAccValues(true);
         }
     }
 
-    const longTradeAcc = legionAccuracy.longTotalPoints > 0 ? Number(((legionAccuracy.longWin / (legionAccuracy.longWin + legionAccuracy.longLoss)) * 100).toFixed(3)) : 0;
-    const longTrueAcc = legionAccuracy.longTotalPoints > 0 ? Number(((legionAccuracy.longPoints / legionAccuracy.longTotalPoints) * 100).toFixed(3)) : 0;
-    const longAccuracyScore = Number(((longTradeAcc + longTrueAcc) / 2).toFixed(3));
-
-    const shortTradeAcc = legionAccuracy.shortTotalPoints > 0 ? Number(((legionAccuracy.shortWin / (legionAccuracy.shortWin + legionAccuracy.shortLoss)) * 100).toFixed(3)) : 0;
-    const shortTrueAcc = legionAccuracy.shortTotalPoints > 0 ? Number(((legionAccuracy.shortPoints / legionAccuracy.shortTotalPoints) * 100).toFixed(3)) : 0;
-    const shortAccuracyScore = Number(((shortTradeAcc + shortTrueAcc) / 2).toFixed(3));
-
-    const finalConsensusAccuracyScore = Number(((longAccuracyScore + shortAccuracyScore) / 2).toFixed(3));
+    if (!finalObject) finalObject = updateAccValues(false);
 
     insertSimStmt.run(
         candle.timestamp,
@@ -1256,20 +1291,7 @@ const updateLegionAccuracy = (candle, consensus) => {
         consensus.confidence
     );
 
-    const finalOpenSimulations = countSims.get();
-
-    consensus.record = {
-        buyTradeAccuracy : longTradeAcc,
-        buyConfidenceAccuracy : longTrueAcc,
-        buyAccuracyScore : longAccuracyScore,
-
-        sellTradeAccuracy : shortTradeAcc,
-        sellConfidenceAccuracy : shortTrueAcc,
-        sellAccuracyScore : shortAccuracyScore,
-
-        finalAccuracyScore : finalConsensusAccuracyScore,
-        openSimulations : finalOpenSimulations
-    }
+    consensus.record = finalObject;
 
     return consensus;
 };
@@ -1312,34 +1334,6 @@ const getLegionConsensus = (candle) => {
     };
 };
 
-const getMemoryVaultStats = () => {
-    const volatilePos = countVolPos.get();
-    const volatileNeg = countVolNeg.get();
-    const totalVolatile = volatilePos + volatileNeg;
-
-    const corePos = countCorePos.get();
-    const coreNeg = countCoreNeg.get();
-    const totalCore = corePos + coreNeg;
-
-    const totalVaultMemories = totalVolatile + totalCore;
-
-    return {
-        volatilePos,
-        volatileNeg,
-        totalVolatile,
-
-        corePos,
-        coreNeg,
-        totalCore,
-
-        totalVaultMemories,
-        volatileMemoriesPct : Number(((totalVolatile / totalVaultMemories) * 100).toFixed(3)),
-        coreMemoriesPct : Number(((totalCore / totalVaultMemories) * 100).toFixed(3)),
-
-        vaultFillPercentage : Number(((totalVaultMemories / CONFIG.memoryVaultCapacity) * 100).toFixed(3))
-    }
-}
-
 const broadcastLegionState = (status, statusOnly = false, updateTime = null, candle = null) => {
     if (!httpWorker) return;
 
@@ -1354,7 +1348,6 @@ const broadcastLegionState = (status, statusOnly = false, updateTime = null, can
         });
     } else {
         const controllers = getCleanLegionState();
-        const memoryVaultStats = getMemoryVaultStats();
         const { consensus, influenceList } = getLegionConsensus(candle);
 
         updateInfluenceValues(controllers, influenceList);
@@ -1381,7 +1374,6 @@ const broadcastLegionState = (status, statusOnly = false, updateTime = null, can
         httpWorker.postMessage({
             type: 'UPDATE_FULL_STATE',
             overview,
-            memoryVaultStats,
             consensus,
             lastCandles,
             controllers
@@ -1538,15 +1530,27 @@ const saveLegionState = () => {
 
         upsertCounterStmt.run(candleCounter);
 
-        upsertAccValue.run('long_win', legionAccuracy.longWin);
-        upsertAccValue.run('long_loss', legionAccuracy.longLoss);
-        upsertAccValue.run('long_points', legionAccuracy.longPoints);
-        upsertAccValue.run('long_total_points', legionAccuracy.longTotalPoints);
+        upsertAccValue.run('long_win', JSON.stringify(legionAccuracy.longWin));
+        upsertAccValue.run('long_loss', JSON.stringify(legionAccuracy.longLoss));
+        upsertAccValue.run('long_points', JSON.stringify(legionAccuracy.longPoints));
+        upsertAccValue.run('long_total_points', JSON.stringify(legionAccuracy.longTotalPoints));
 
-        upsertAccValue.run('short_win', legionAccuracy.shortWin);
-        upsertAccValue.run('short_loss', legionAccuracy.shortLoss);
-        upsertAccValue.run('short_points', legionAccuracy.shortPoints);
-        upsertAccValue.run('short_total_points', legionAccuracy.shortTotalPoints);
+        upsertAccValue.run('short_win', JSON.stringify(legionAccuracy.shortWin));
+        upsertAccValue.run('short_loss', JSON.stringify(legionAccuracy.shortLoss));
+        upsertAccValue.run('short_points', JSON.stringify(legionAccuracy.shortPoints));
+        upsertAccValue.run('short_total_points', JSON.stringify(legionAccuracy.shortTotalPoints));
+
+        upsertAccValue.run('max_buy_score', JSON.stringify(legionAccuracy.maxBuyScore));
+        upsertAccValue.run('max_sell_score', JSON.stringify(legionAccuracy.maxSellScore));
+        upsertAccValue.run('max_final_score', JSON.stringify(legionAccuracy.maxFinalScore));
+
+        upsertAccValue.run('min_buy_score', JSON.stringify(legionAccuracy.minBuyScore));
+        upsertAccValue.run('min_sell_score', JSON.stringify(legionAccuracy.minSellScore));
+        upsertAccValue.run('min_final_score', JSON.stringify(legionAccuracy.minFinalScore));
+
+        upsertAccValue.run('buy_score_history', JSON.stringify(legionAccuracy.buyScoreHistory));
+        upsertAccValue.run('sell_score_history', JSON.stringify(legionAccuracy.sellScoreHistory));
+        upsertAccValue.run('final_score_history', JSON.stringify(legionAccuracy.finalScoreHistory));
     })();
 };
 
@@ -1559,42 +1563,90 @@ const initLegion = () => {
 
     const longWinRaw = selectAccValue.get('long_win');
     if (longWinRaw) {
-        legionAccuracy.longWin = longWinRaw.value;
+        legionAccuracy.longWin = parseFloat(longWinRaw.value) || 0;
     }
 
     const shortWinRaw = selectAccValue.get('short_win');
     if (shortWinRaw) {
-        legionAccuracy.shortWin = shortWinRaw.value;
+        legionAccuracy.shortWin = parseFloat(shortWinRaw.value) || 0;
     }
 
     const longLossRaw = selectAccValue.get('long_loss');
     if (longLossRaw) {
-        legionAccuracy.longLoss = longLossRaw.value;
+        legionAccuracy.longLoss = parseFloat(longLossRaw.value) || 0;
     }
 
     const shortLossRaw = selectAccValue.get('short_loss');
     if (shortLossRaw) {
-        legionAccuracy.shortLoss = shortLossRaw.value;
+        legionAccuracy.shortLoss = parseFloat(shortLossRaw.value) || 0;
     }
 
     const longPointsRaw = selectAccValue.get('long_points');
     if (longPointsRaw) {
-        legionAccuracy.longPoints = longPointsRaw.value;
+        legionAccuracy.longPoints = parseFloat(longPointsRaw.value) || 0;
     }
 
     const shortPointsRaw = selectAccValue.get('short_points');
     if (shortPointsRaw) {
-        legionAccuracy.shortPoints = shortPointsRaw.value;
+        legionAccuracy.shortPoints = parseFloat(shortPointsRaw.value) || 0;
     }
 
     const longTotalPointsRaw = selectAccValue.get('long_total_points');
     if (longTotalPointsRaw) {
-        legionAccuracy.longTotalPoints = longTotalPointsRaw.value;
+        legionAccuracy.longTotalPoints = parseFloat(longTotalPointsRaw.value) || 0;
     }
 
     const shortTotalPointsRaw = selectAccValue.get('short_total_points');
     if (shortTotalPointsRaw) {
-        legionAccuracy.shortTotalPoints = shortTotalPointsRaw.value;
+        legionAccuracy.shortTotalPoints = parseFloat(shortTotalPointsRaw.value) || 0;
+    }
+
+    const maxBuyScoreRaw = selectAccValue.get('max_buy_score');
+    if (maxBuyScoreRaw) {
+        legionAccuracy.maxBuyScore = parseFloat(maxBuyScoreRaw.value) || 0;
+    }
+
+    const maxSellScoreRaw = selectAccValue.get('max_sell_score');
+    if (maxSellScoreRaw) {
+        legionAccuracy.maxSellScore = parseFloat(maxSellScoreRaw.value) || 0;
+    }
+
+    const maxFinalScoreRaw = selectAccValue.get('max_final_score');
+    if (maxFinalScoreRaw) {
+        legionAccuracy.maxFinalScore = parseFloat(maxFinalScoreRaw.value) || 0;
+    }
+
+    const minBuyScoreRaw = selectAccValue.get('min_buy_score');
+    if (minBuyScoreRaw) {
+        legionAccuracy.minBuyScore = parseFloat(minBuyScoreRaw.value) || 100;
+    }
+
+    const minSellScoreRaw = selectAccValue.get('min_sell_score');
+    if (minSellScoreRaw) {
+        legionAccuracy.minSellScore = parseFloat(minSellScoreRaw.value) || 100;
+    }
+
+    const minFinalScoreRaw = selectAccValue.get('min_final_score');
+    if (minFinalScoreRaw) {
+        legionAccuracy.minFinalScore = parseFloat(minFinalScoreRaw.value) || 100;
+    }
+
+    const buyRaw = selectAccValue.get('buy_score_history');
+    if (buyRaw?.value) {
+        try { legionAccuracy.buyScoreHistory = JSON.parse(buyRaw.value); }
+        catch (e) { legionAccuracy.buyScoreHistory = []; }
+    }
+
+    const sellRaw = selectAccValue.get('sell_score_history');
+    if (sellRaw?.value) {
+        try { legionAccuracy.sellScoreHistory = JSON.parse(sellRaw.value); }
+        catch (e) { legionAccuracy.sellScoreHistory = []; }
+    }
+
+    const finalRaw = selectAccValue.get('final_score_history');
+    if (finalRaw?.value) {
+        try { legionAccuracy.finalScoreHistory = JSON.parse(finalRaw.value); }
+        catch (e) { legionAccuracy.finalScoreHistory = []; }
     }
 
     const currentCount = db.prepare('SELECT COUNT(*) AS count FROM legion_controllers').get().count;
