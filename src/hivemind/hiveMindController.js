@@ -37,12 +37,13 @@ class HiveMindController {
     #directoryPath;
     #ensembleSize;
     #type;
+    #tier;
     #forceMin;
     #shouldDumpState;
-    #memoryBroadcast = null;
-    #lastSaveStatus = null;
+    #memoryBroadcast;
+    #lastSaveStatus;
 
-    constructor ( id, dp, cs, es, type, priceObj, forceMin = false ) {
+    constructor ( id, dp, cs, es, type, tier, priceObj, forceMin = false ) {
         this.#controllerID = id;
 
         try {
@@ -54,6 +55,7 @@ class HiveMindController {
         }
 
         this.#type = type;
+        this.#tier = tier;
         this.#cacheSize = cs;
         this.#ensembleSize = es;
 
@@ -297,43 +299,121 @@ class HiveMindController {
         });
     }
 
-    #extractFeatures (data, candleCount, indicatorCount) {
-        const indicators = [
-            'rsi',
-            'macdDiff',
-            'atr',
-            'ema100',
-            'stochasticDiff',
-            'bollingerPercentB',
-            'obv',
-            'adx',
-            'cci',
-            'williamsR'
-        ];
+    #computeProtoQuality(mem) {
+        if (!mem || typeof mem !== 'object') return 0;
 
-        const count = Math.max(0, Math.min(indicatorCount, indicators.length));
+        const importance = mem.importance ?? 1.0;
+        const size = mem.size ?? 1.0;
+        const accessCount = mem.accessCount ?? 1.0;
 
-        const normalized = [];
-        for (let i = 0; i < count; i++) {
-            const key = indicators[i];
-            normalized.push(this.#robustNormalize(data[key], candleCount));
+        const meanArr = Array.isArray(mem.mean) ? mem.mean : [];
+        const varArr  = Array.isArray(mem.variance) ? mem.variance : [];
+
+        const avgMean = meanArr.length > 0
+            ? meanArr.reduce((sum, val) => sum + (isValidNumber(val) ? val : 0), 0) / meanArr.length
+            : 0;
+
+        const avgVar = varArr.length > 0
+            ? varArr.reduce((sum, val) => sum + (isValidNumber(val) ? val : 0), 0) / varArr.length
+            : 0;
+
+        const q = importance
+            * Math.log(1 + accessCount + 1e-8)
+            * Math.pow(size + 1, -1.5)
+            * Math.pow(1 + avgMean, 0.8)
+            * Math.pow(1 + avgVar, -1.2);
+
+        return isValidNumber(q) ? q : 0;
+    }
+
+    #interleave (arr1, arr2) {
+        return arr1.reduce((acc, item, index) => {
+            acc.splice(index * 2, 0, item);
+            return acc;
+        }, [...arr2]);
+    }
+
+    #extractFeatures (data, childMemories) {
+        if (this.#tier === 1) {
+            const indicators = [
+                'rsi',
+                'macdDiff',
+                'atr',
+                'ema100',
+                'stochasticDiff',
+                'bollingerPercentB',
+                'obv',
+                'adx',
+                'cci',
+                'williamsR'
+            ];
+
+            const count = Math.max(0, Math.min(this.#trainingIndicators, indicators.length));
+
+            const normalized = [];
+            for (let i = 0; i < count; i++) {
+                const key = indicators[i];
+                normalized.push(this.#robustNormalize(data[key], this.#trainingCandleSize));
+            }
+
+            const result = Array.from({ length: this.#trainingCandleSize }, (_, i) => {
+                const row = [];
+                for (let j = 0; j < count; j++) {
+                    row.push(normalized[j][i]);
+                }
+                return row;
+            });
+
+            return result.flat();
         }
 
-        const result = Array.from({ length: candleCount }, (_, i) => {
-            const row = [];
-            for (let j = 0; j < count; j++) {
-                row.push(normalized[j][i]);
+        else {
+            const rawInputs = [];
+            for (const ctrl of childMemories) {
+                for (const mem of ctrl.memories) {
+                    rawInputs.push(mem);
+                }
             }
-            return row;
-        });
 
-        return result;
+            const sortedRawInputs = rawInputs
+                .map(mem => ({
+                    mem: mem,
+                    quality: this.#computeProtoQuality(mem)
+                }))
+                .sort((a, b) => b.quality - a.quality)
+                .map(item => item.mem);
+
+            const processedInputs = sortedRawInputs.map((mem) => {
+                const normMean = this.#robustNormalize(mem.mean, mem.mean.length);
+                const normVariance = this.#robustNormalize(mem.variance, mem.variance.length);
+
+                return this.#interleave(normMean, normVariance);
+            });
+
+            const finalInputs = processedInputs.flat().slice(0, this.#inputSize)
+
+            if (finalInputs.length < this.#inputSize) {
+                while (finalInputs.length < this.#inputSize) {
+                    finalInputs.push(0.5);
+                }
+            }
+
+            return finalInputs;
+        }
     }
 
     #chooseDimension () {
         const MIN_SIZE = 10;
         const MAX_SIZE = Math.floor(this.#cacheSize * 0.25);
         let desiredSize = Math.max(MIN_SIZE, MAX_SIZE);
+
+        if (this.#tier > 1) {
+            this.#inputSize = desiredSize;
+            this.#trainingCandleSize = 0;
+            this.#trainingIndicators = 0;
+
+            return;
+        }
 
         const searchRange = 2;
         const maxIndCap = 10;
@@ -521,7 +601,7 @@ class HiveMindController {
                 confidence: row.confidence
             };
 
-            const flatFeatures = trade.features.flat();
+            const flatFeatures = trade.features;
             const encodingString = `${flatFeatures.join(',')}|${trade.outcome}`;
             const encodingHash = crypto.createHash('sha256').update(encodingString).digest('hex');
 
@@ -572,7 +652,7 @@ class HiveMindController {
         }
     }
 
-    getSignal (candles, processCount = 1, bcR = 0.025, injR = 0.025, sharedMemories = []) {
+    getSignal (candles, processCount = 1, bcR = 0.025, injR = 0.025, sharedMemories = [], childMemories = []) {
         const { error, recentCandles, fullCandles } = this.#getRecentCandles(candles);
 
         if (error) return { error };
@@ -583,8 +663,8 @@ class HiveMindController {
 
         if (indicators.error) return { error: 'Indicators error' };
 
-        const features = this.#extractFeatures(indicators, this.#trainingCandleSize, this.#trainingIndicators);
-        
+        const features = this.#extractFeatures(indicators, childMemories);
+
         const entryPrice = indicators.lastClose;
 
         const direction = this.#type === 'positive' ? 1 : (this.#type === 'negative' ? -1 : 0);
@@ -613,7 +693,7 @@ class HiveMindController {
         if (!this.#hivemind && this.#globalAccuracy.trainingSteps > 0) {
             this.#hivemind = new HiveMind(this.#directoryPath, this.#ensembleSize, this.#inputSize, this.#controllerID, this.#forceMin);
 
-            const predictionVal = this.#hivemind.predict(features.flat());
+            const predictionVal = this.#hivemind.predict(features);
             prediction = Number((predictionVal * 100).toFixed(3));
 
             this.#shouldDumpState = true;
@@ -637,10 +717,10 @@ class HiveMindController {
         let currentMemories = 0;
         let memoriesPerMember = 0;
         if (this.#shouldDumpState && this.#hivemind) {
-            this.#memoryBroadcast = this.#hivemind.broadcastMemory(features.flat(), bcR);
+            this.#memoryBroadcast = this.#hivemind.broadcastMemory(features, bcR);
             this.#globalAccuracy.memoriesSent += this.#memoryBroadcast.totalBroadcast;
 
-            const translation = this.#hivemind.translateMemory(sharedMemories, features.flat(), injR);
+            const translation = this.#hivemind.translateMemory(sharedMemories, features, injR);
             this.#globalAccuracy.memoriesReceived += translation.memoriesInjected;
 
             memoryChange = translation.injectedRatio;

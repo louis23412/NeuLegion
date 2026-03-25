@@ -10,6 +10,7 @@ import { availableParallelism } from 'node:os';
 const scriptStart = performance.now();
 
 let cache = [];
+let structureDims = [];
 let structureMap;
 let candleCounter = 0;
 let httpWorker = null;
@@ -23,17 +24,27 @@ const CONFIG = {
     file: path.join(import.meta.dirname, 'candles.jsonl'),
     stateFolder : path.join(import.meta.dirname, '..', 'state'),
 
-    dims: [2, 2, 2, 4],
+    baseGroups : 2,
+    baseSections : 2,
+    baseLayers : 2,
+
+    basePairs : 2,
+    elderPairs : 2,
+
+    maxTier: 4,
+    tierWeightMultiplier: 0.5,
 
     basePop: 64,
     groupPopBoost: 0.05,
     sectionPopBoost: 0.15,
     layerPopBoost: 0.25,
+    tierPopBoost: 0.35,
 
     baseCache: 500,
     groupCacheBoost: 0.15,
     sectionCacheBoost: 0.25,
     layerCacheBoost: 0.35,
+    tierCacheBoost : 0.45,
 
     baseAtr: 2,
     baseStop: 1,
@@ -187,6 +198,7 @@ db.exec(`
         directory_path TEXT NOT NULL,
         signal_speed REAL NOT NULL DEFAULT 0,
         mem_connections INTEGER NOT NULL DEFAULT 0,
+        child_connections INTEGER NOT NULL DEFAULT 0,
         last_signal TEXT NOT NULL DEFAULT '{}',
         signal_history TEXT NOT NULL DEFAULT '[]',
         prob_history TEXT NOT NULL DEFAULT '[]',
@@ -195,6 +207,7 @@ db.exec(`
         lifetime_max_score REAL NOT NULL DEFAULT 0,
         lifetime_min_prob  REAL NOT NULL DEFAULT 100,
         lifetime_max_prob  REAL NOT NULL DEFAULT 0,
+        tier INTEGER NOT NULL DEFAULT 1,
         PRIMARY KEY (group_id, section_id, layer_id, cluster_id)
     );
 
@@ -431,6 +444,7 @@ const updateControllerStmt = db.prepare(`
     UPDATE legion_controllers
     SET signal_speed = ?,
         mem_connections = ?,
+        child_connections = ?,
         last_signal = ?,
         signal_history = ?,
         prob_history = ?,
@@ -438,7 +452,8 @@ const updateControllerStmt = db.prepare(`
         lifetime_min_score = ?,
         lifetime_max_score = ?,
         lifetime_min_prob = ?,
-        lifetime_max_prob = ?
+        lifetime_max_prob = ?,
+        tier = ?
     WHERE group_id = ? AND section_id = ? AND layer_id = ? AND cluster_id = ?
 `);
 
@@ -840,6 +855,7 @@ const getCleanLegionState = () => {
         return {
             id : c.lastSignal?.controllerId,
             polarity : c.type,
+            tier : c.tier,
             signalSpeed : Number((c.signalSpeed / 1000).toFixed(4)),
 
             influence : 0,
@@ -879,6 +895,7 @@ const getCleanLegionState = () => {
 
             memory : {
                 memoryConnections : c.memConnections,
+                childConnections : c.childConnections,
                 totalSent : c.lastSignal?.totalMemoriesSent,
                 totalReceived : c.lastSignal?.totalMemoriesReceived,
                 lastInjectedTotal : c.lastSignal?.lastMemoriesInjected,
@@ -955,7 +972,9 @@ const collectAndEnrichSignals = () => {
             prob: Math.max(0.01, Math.min(0.99, (sig.prob ?? 50) / 100)),
             score: (sig.score ?? 50) / 100,
             signalSpeed: ctrl.signalSpeed ?? 1000,
+            tier : ctrl.tier ?? 1,
             memConnections: ctrl.memConnections ?? 0,
+            childConnections : ctrl.childConnections ?? 0,
             vaultMemories: mb.vaultMemories ?? 0,
             entryPrice: sig.entryPrice ?? 0,
             exitPrice: sig.sellPrice ?? 0,
@@ -971,26 +990,30 @@ const collectAndEnrichSignals = () => {
     return signals;
 };
 
-const getHierarchyFactor = (group, section, layer) => {
-    const revG = CONFIG.dims[0] - 1 - group;
-    const revS = CONFIG.dims[1] - 1 - section;
-    const revL = CONFIG.dims[2] - 1 - layer;
-    return (1 + CONFIG.groupPopBoost * revG) *
-           (1 + CONFIG.sectionPopBoost * revS) *
-           (1 + CONFIG.layerPopBoost * revL);
+const getHierarchyFactor = (group, section, layer, tier) => {
+    const revG = structureDims[0] - 1 - group;
+    const revS = structureDims[1] - 1 - section;
+    const revL = structureDims[2] - 1 - layer;
+
+    return (1 + CONFIG.tierPopBoost * tier) * (1 + CONFIG.groupPopBoost * revG) * (1 + CONFIG.sectionPopBoost * revS) * (1 + CONFIG.layerPopBoost * revL);
 };
 
 const computeDynamicWeights = (signals) => {
-    const maxSpeed = Math.max(...signals.map(s => s.signalSpeed), 1000) || 1000;
     const maxMem = Math.max(...signals.map(s => s.memConnections), 1);
+    const maxChild = Math.max(...signals.map(s => s.childConnections), 1);
+    const maxTier = Math.max(...signals.map(s => s.tier), 1);
+
     return signals.map(s => {
-        const hier = getHierarchyFactor(s.group, s.section, s.layer);
-        const speedNorm = Math.max(0.1, 1 - (s.signalSpeed / maxSpeed));
+        const hier = getHierarchyFactor(s.group, s.section, s.layer, s.tier);
         const memNorm = 1 + (s.memConnections / maxMem) * 0.3;
+        const childNorm = 1 + (s.childConnections / maxChild) * 0.3;
+        const tierNorm = 1 + (s.tier / maxTier) * CONFIG.tierWeightMultiplier;
+
         const vaultBoost = 1 + s.vaultMemories * CONFIG.broadcastRatio * 2;
         const perfBoost = 1 + (s.recentPerf - 0.5) * 2;
         const base = s.prob * s.score * perfBoost;
-        const weight = base * speedNorm * memNorm * vaultBoost * hier * CONFIG.performanceBoostFactor;
+
+        const weight = base * memNorm * childNorm * tierNorm * vaultBoost * hier * CONFIG.performanceBoostFactor;
         return { ...s, weight: Math.max(0.01, weight) };
     });
 };
@@ -1019,17 +1042,19 @@ const propagateInfluence = (weightedSignals) => {
 
             const sameLevel = neigh.section === curr.section && neigh.layer === curr.layer;
             const sameCompat = curr.compatibility && neigh.compatibility && curr.compatibility === neigh.compatibility;
-            const proximity = Math.abs(neigh.group - curr.group) +
-                              Math.abs(neigh.section - curr.section) +
-                              Math.abs(neigh.layer - curr.layer);
+            const proximity = Math.abs(neigh.group - curr.group) + Math.abs(neigh.section - curr.section) + Math.abs(neigh.layer - curr.layer);
+            const tierDiff = Math.abs(neigh.tier - curr.tier);
+            const tierBonus = tierDiff === 0 ? (curr.tier === CONFIG.maxTier ? 1.4 : 1) : (curr.tier > neigh.tier ? 1.4 : 0.6);
 
             if (sameLevel || sameCompat || proximity <= 2) {
-                const edgeDist = sameCompat ? 0.5 : proximity * 0.3;
-                const newBoost = currBoost * Math.exp(-edgeDist * CONFIG.volatileHierarchyThreshold);
+                const edgeDist = sameCompat ? 0.5 : (proximity * 0.3) + (tierDiff * 0.2);
+                const newBoost = currBoost * tierBonus * Math.exp(-edgeDist * CONFIG.volatileHierarchyThreshold);
+
                 const newAccumDist = -newBoost;
 
                 const existing = visited.get(neigh.id) || 0;
                 if (newBoost > existing) {
+                    visited.set(neigh.id, newBoost);
                     pq.push({ ...neigh, accumDist: newAccumDist, depth: curr.depth + 1 });
                 }
             }
@@ -1436,16 +1461,26 @@ const computeGaussianDistance = (mu1, var1, mu2, var2) => {
     return (1/8) * mahalTerm + (1/2) * logDetTerm;
 };
 
+const getTierAndType = (cluster) => {
+    const perTier = CONFIG.elderPairs * 2;
+    const tier = Math.floor(cluster / perTier) + 1;
+    const local = cluster % perTier;
+    const halfLocal = Math.floor(perTier / 2);
+    const type = local < halfLocal ? 'positive' : 'negative';
+    return { tier, type };
+};
+
 const buildFreshStructure = () => {
-    const legionStructure = Array.from({ length: CONFIG.dims[0] }, (_, group) =>
-        Array.from({ length: CONFIG.dims[1] }, (_, section) =>
-            Array.from({ length: CONFIG.dims[2] }, (_, layer) =>
-                Array.from({ length: CONFIG.dims[3] }, (_, cluster) => {
-                    const half = Math.floor(CONFIG.dims[3] / 2);
+    const legionStructure = Array.from({ length: structureDims[0] }, (_, group) =>
+        Array.from({ length: structureDims[1] }, (_, section) =>
+            Array.from({ length: structureDims[2] }, (_, layer) =>
+                Array.from({ length: structureDims[3] }, (_, cluster) => {
+                    const { tier, type } = getTierAndType(cluster);
                     const directoryPath = path.join(CONFIG.stateFolder, 'clusters', `Group${group}`, `Section${section}`, `Layer${layer}`, `G${group}S${section}L${layer}C${cluster}`);
 
                     return {
-                        type: cluster < half ? 'positive' : 'negative',
+                        tier,
+                        type,
                         directoryPath,
                         group,
                         section,
@@ -1453,6 +1488,7 @@ const buildFreshStructure = () => {
                         id: cluster,
                         signalSpeed: 0,
                         memConnections : 0,
+                        childConnections : 0,
                         lastSignal: {},
                         signalHistory : [],
                         probHistory : [],
@@ -1476,9 +1512,9 @@ const buildFreshStructure = () => {
 };
 
 const getControllerParams = (group, section, layer) => {
-    const reversedGroup = CONFIG.dims[0] - 1 - group;
-    const reversedSection = CONFIG.dims[1] - 1 - section;
-    const reversedLayer = CONFIG.dims[2] - 1 - layer;
+    const reversedGroup = structureDims[0] - 1 - group;
+    const reversedSection = structureDims[1] - 1 - section;
+    const reversedLayer = structureDims[2] - 1 - layer;
 
     const groupCacheFactor = 1 + CONFIG.groupCacheBoost * group;
     const sectionCacheFactor = 1 + CONFIG.sectionCacheBoost * section;
@@ -1513,6 +1549,7 @@ const saveLegionState = () => {
             updateControllerStmt.run(
                 ctrl.signalSpeed ?? 0,
                 ctrl.memConnections ?? 0,
+                ctrl.childConnections ?? 0,
                 JSON.stringify(ctrl.lastSignal ?? {}),
                 JSON.stringify(ctrl.signalHistory ?? []),
                 JSON.stringify(ctrl.probHistory ?? []),
@@ -1521,6 +1558,7 @@ const saveLegionState = () => {
                 ctrl.lifetimeMaxScore ?? 0,
                 ctrl.lifetimeMinProb  ?? 100,
                 ctrl.lifetimeMaxProb  ?? 0,
+                ctrl.tier ?? 1,
                 ctrl.group,
                 ctrl.section,
                 ctrl.layer,
@@ -1656,8 +1694,8 @@ const initLegion = () => {
 
         const insertStmt = db.prepare(`
             INSERT INTO legion_controllers
-            (group_id, section_id, layer_id, cluster_id, controller_type, directory_path)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (group_id, section_id, layer_id, cluster_id, controller_type, directory_path, tier)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         `);
 
         db.transaction(() => {
@@ -1668,7 +1706,8 @@ const initLegion = () => {
                     ctrl.layer,
                     ctrl.id,
                     ctrl.type,
-                    ctrl.directoryPath
+                    ctrl.directoryPath,
+                    ctrl.tier
                 );
             });
         })();
@@ -1680,30 +1719,30 @@ const initLegion = () => {
             rowMap.set(key, row);
         });
 
-        structureMap = Array.from({ length: CONFIG.dims[0] }, (_, group) =>
-            Array.from({ length: CONFIG.dims[1] }, (_, section) =>
-                Array.from({ length: CONFIG.dims[2] }, (_, layer) =>
-                    Array.from({ length: CONFIG.dims[3] }, (_, cluster) => {
+        structureMap = Array.from({ length: structureDims[0] }, (_, group) =>
+            Array.from({ length: structureDims[1] }, (_, section) =>
+                Array.from({ length: structureDims[2] }, (_, layer) =>
+                    Array.from({ length: structureDims[3] }, (_, cluster) => {
                         const key = `${group}-${section}-${layer}-${cluster}`;
                         const row = rowMap.get(key);
 
                         if (!row) {
-                            const half = Math.floor(CONFIG.dims[3] / 2);
-                            const defType = cluster < half ? 'positive' : 'negative';
+                            const { tier, type } = getTierAndType(cluster);
                             const defDir = path.join(CONFIG.stateFolder, `Group${group}`, `Section${section}`, `Layer${layer}`, `G${group}S${section}L${layer}C${cluster}`);
                             fs.mkdirSync(defDir, { recursive: true });
 
                             db.prepare(`
                                 INSERT INTO legion_controllers
-                                (group_id, section_id, layer_id, cluster_id, controller_type, directory_path)
-                                VALUES (?, ?, ?, ?, ?, ?)
+                                (group_id, section_id, layer_id, cluster_id, controller_type, directory_path, tier)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
                             `).run(
                                 group, section, layer, cluster,
-                                defType, defDir
+                                type, defDir, tier
                             );
 
                             return {
-                                type: defType,
+                                tier,
+                                type,
                                 directoryPath: defDir,
                                 group,
                                 section,
@@ -1711,6 +1750,7 @@ const initLegion = () => {
                                 id: cluster,
                                 signalSpeed: 0,
                                 memConnections: 0,
+                                childConnections : 0,
                                 lastSignal: {},
                                 signalHistory: [],
                                 probHistory: [],
@@ -1718,7 +1758,7 @@ const initLegion = () => {
                                 lifetimeMinScore: 100,
                                 lifetimeMaxScore: 0,
                                 lifetimeMinProb: 100,
-                                lifetimeMaxProb: 0
+                                lifetimeMaxProb: 0,
                             };
                         }
 
@@ -1733,6 +1773,7 @@ const initLegion = () => {
                             id: row.cluster_id,
                             signalSpeed: row.signal_speed ?? 0,
                             memConnections: row.mem_connections ?? 0,
+                            childConnections : row.child_connections ?? 0,
                             lastSignal: JSON.parse(row.last_signal ?? '{}'),
                             signalHistory: JSON.parse(row.signal_history ?? '[]'),
                             probHistory: JSON.parse(row.prob_history ?? '[]'),
@@ -1740,7 +1781,8 @@ const initLegion = () => {
                             lifetimeMinScore: row.lifetime_min_score ?? 100,
                             lifetimeMaxScore: row.lifetime_max_score ?? 0,
                             lifetimeMinProb:  row.lifetime_min_prob  ?? 100,
-                            lifetimeMaxProb:  row.lifetime_max_prob  ?? 0
+                            lifetimeMaxProb:  row.lifetime_max_prob  ?? 0,
+                            tier : row.tier ?? 1
                         };
                     })
                 )
@@ -2215,12 +2257,30 @@ const runWorker = async (controller) => {
                 mainCompat &&
                 mainId !== peerId &&
                 c.type === controller.type &&
+                c.tier === controller.tier &&
+                canonicalJSON(mainCompat ?? {}) === canonicalJSON(peerCompat ?? {})
+            );
+        })
+        .map(c => c.lastSignal?.memoryBroadcast ?? {});
+
+    const childSharedMem = structureMap.flat(3)
+        .filter((c) => {
+            const peerId = `${c.group}${c.section}${c.layer}${c.id}`;
+            const peerCompat = c.lastSignal?.memoryBroadcast?.compatibility;
+
+            return (
+                mainCompat &&
+                mainId !== peerId &&
+                c.type === controller.type &&
+                controller.tier > 1 && 
+                c.tier < controller.tier &&
                 canonicalJSON(mainCompat ?? {}) === canonicalJSON(peerCompat ?? {})
             );
         })
         .map(c => c.lastSignal?.memoryBroadcast ?? {});
 
     controller.memConnections = peerSharedMem.length;
+    controller.childConnections = childSharedMem.length;
 
     return new Promise((resolve, reject) => {
         const worker = new Worker(new URL('./worker.js', import.meta.url), {
@@ -2231,6 +2291,7 @@ const runWorker = async (controller) => {
                 pop,
                 cache: recentCandles,
                 type: controller.type,
+                tier : controller.tier,
                 priceObj: {
                     atrFactor,
                     stopFactor,
@@ -2241,8 +2302,9 @@ const runWorker = async (controller) => {
                 forceMin: CONFIG.forceMin,
                 bcR : CONFIG.broadcastRatio,
                 injR : CONFIG.injectionRatio,
-                sharedMem : peerSharedMem
-            },
+                sharedMem : peerSharedMem,
+                childMem : childSharedMem
+            }
         });
 
         worker.on('message', (msg) => {
@@ -2330,15 +2392,21 @@ const processCandles = async () => {
         crlfDelay: Infinity,
     });
 
+    structureDims = [
+        CONFIG.baseGroups, CONFIG.baseSections, CONFIG.baseLayers,
+        (CONFIG.basePairs * 2) + ((CONFIG.maxTier - 1) * (CONFIG.elderPairs * 2))
+    ];
+
     const rebuildCounter = initLegion();
     const ipAddress = getLocalIP();
 
     spawnDedicatedHttpServer(ipAddress);
 
-    const maxGroup = CONFIG.dims[0] - 1;
-    const maxSection = CONFIG.dims[1] - 1;
-    const maxLayer = CONFIG.dims[2] - 1;
-    const maxCacheFactor = (1 + CONFIG.groupCacheBoost * maxGroup) * (1 + CONFIG.sectionCacheBoost * maxSection) * (1 + CONFIG.layerCacheBoost * maxLayer);
+    const maxGroup = structureDims[0] - 1;
+    const maxSection = structureDims[1] - 1;
+    const maxLayer = structureDims[2] - 1;
+    const maxCacheFactor = (1 + CONFIG.groupCacheBoost * maxGroup) * (1 + CONFIG.sectionCacheBoost * maxSection) * 
+        (1 + CONFIG.layerCacheBoost * maxLayer) * (1 + CONFIG.tierCacheBoost * CONFIG.maxTier);
     const maxCache = Math.round(CONFIG.baseCache * maxCacheFactor);
 
     let finalTime = 0;
@@ -2363,8 +2431,8 @@ const processCandles = async () => {
             if (candleCounter <= rebuildCounter) continue;
 
             const finalStart = performance.now();
-            const updateMessage = `processing candle #${candleCounter}`;
 
+            const updateMessage = `Processing candle #${candleCounter}...`;
             console.log(updateMessage);
             broadcastLegionState(updateMessage, true);
 
