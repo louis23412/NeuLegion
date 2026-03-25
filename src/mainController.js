@@ -32,19 +32,17 @@ const CONFIG = {
     elderPairs : 2,
 
     maxTier: 4,
-    tierWeightMultiplier: 0.5,
+    tierWeightMultiplier: 0.35,
 
     basePop: 64,
     groupPopBoost: 0.05,
     sectionPopBoost: 0.15,
     layerPopBoost: 0.25,
-    tierPopBoost: 0.35,
 
     baseCache: 500,
     groupCacheBoost: 0.15,
     sectionCacheBoost: 0.25,
     layerCacheBoost: 0.35,
-    tierCacheBoost : 0.45,
 
     baseAtr: 2,
     baseStop: 1,
@@ -990,12 +988,12 @@ const collectAndEnrichSignals = () => {
     return signals;
 };
 
-const getHierarchyFactor = (group, section, layer, tier) => {
+const getHierarchyFactor = (group, section, layer) => {
     const revG = structureDims[0] - 1 - group;
     const revS = structureDims[1] - 1 - section;
     const revL = structureDims[2] - 1 - layer;
 
-    return (1 + CONFIG.tierPopBoost * tier) * (1 + CONFIG.groupPopBoost * revG) * (1 + CONFIG.sectionPopBoost * revS) * (1 + CONFIG.layerPopBoost * revL);
+    return (1 + CONFIG.groupPopBoost * revG) * (1 + CONFIG.sectionPopBoost * revS) * (1 + CONFIG.layerPopBoost * revL);
 };
 
 const computeDynamicWeights = (signals) => {
@@ -1004,7 +1002,7 @@ const computeDynamicWeights = (signals) => {
     const maxTier = Math.max(...signals.map(s => s.tier), 1);
 
     return signals.map(s => {
-        const hier = getHierarchyFactor(s.group, s.section, s.layer, s.tier);
+        const hier = getHierarchyFactor(s.group, s.section, s.layer);
         const memNorm = 1 + (s.memConnections / maxMem) * 0.3;
         const childNorm = 1 + (s.childConnections / maxChild) * 0.3;
         const tierNorm = 1 + (s.tier / maxTier) * CONFIG.tierWeightMultiplier;
@@ -1462,11 +1460,27 @@ const computeGaussianDistance = (mu1, var1, mu2, var2) => {
 };
 
 const getTierAndType = (cluster) => {
-    const perTier = CONFIG.elderPairs * 2;
-    const tier = Math.floor(cluster / perTier) + 1;
-    const local = cluster % perTier;
-    const halfLocal = Math.floor(perTier / 2);
+    const baseBlock  = CONFIG.basePairs * 2;
+    const elderBlock = CONFIG.elderPairs * 2;
+
+    let tier;
+    let local;
+    let blockSize;
+
+    if (cluster < baseBlock) {
+        tier = 1;
+        local = cluster % baseBlock;
+        blockSize = baseBlock;
+    } else {
+        const remaining = cluster - baseBlock;
+        tier = 2 + Math.floor(remaining / elderBlock);
+        local = remaining % elderBlock;
+        blockSize = elderBlock;
+    }
+
+    const halfLocal = Math.floor(blockSize / 2);
     const type = local < halfLocal ? 'positive' : 'negative';
+
     return { tier, type };
 };
 
@@ -2371,18 +2385,18 @@ const runConsolidationWorker = async (compat_id, isPositive, currentBatch) => {
 };
 
 const getLocalIP = () => {
-  const interfaces = os.networkInterfaces();
-  let ipAddress;
+    const interfaces = os.networkInterfaces();
+    let ipAddress;
 
-  Object.keys(interfaces).forEach((ifaceName) => {
-    interfaces[ifaceName].forEach((iface) => {
-      if (iface.family === 'IPv4' && !iface.internal) {
-        ipAddress = iface.address;
-      }
+    Object.keys(interfaces).forEach((ifaceName) => {
+        interfaces[ifaceName].forEach((iface) => {
+            if (iface.family === 'IPv4' && !iface.internal) {
+                ipAddress = iface.address;
+            }
+        });
     });
-  });
 
-  return ipAddress;
+    return ipAddress;
 }
 
 const processCandles = async () => {
@@ -2405,8 +2419,7 @@ const processCandles = async () => {
     const maxGroup = structureDims[0] - 1;
     const maxSection = structureDims[1] - 1;
     const maxLayer = structureDims[2] - 1;
-    const maxCacheFactor = (1 + CONFIG.groupCacheBoost * maxGroup) * (1 + CONFIG.sectionCacheBoost * maxSection) * 
-        (1 + CONFIG.layerCacheBoost * maxLayer) * (1 + CONFIG.tierCacheBoost * CONFIG.maxTier);
+    const maxCacheFactor = (1 + CONFIG.groupCacheBoost * maxGroup) * (1 + CONFIG.sectionCacheBoost * maxSection) * (1 + CONFIG.layerCacheBoost * maxLayer);
     const maxCache = Math.round(CONFIG.baseCache * maxCacheFactor);
 
     let finalTime = 0;
