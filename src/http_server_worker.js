@@ -36,11 +36,11 @@ const server = http.createServer((req, res) => {
 
     const origin = req.headers.origin;
 
-    // if (origin !== trustedAddress) {
-    //     res.writeHead(403);
-    //     res.end(JSON.stringify({ error : 'access denied' }));
-    //     return;
-    // }
+    if (origin !== trustedAddress) {
+        res.writeHead(403);
+        res.end(JSON.stringify({ error : 'access denied' }));
+        return;
+    }
 
     if (req.url === '/') {
         res.writeHead(200);

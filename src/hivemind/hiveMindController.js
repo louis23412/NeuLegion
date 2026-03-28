@@ -317,11 +317,23 @@ class HiveMindController {
             ? varArr.reduce((sum, val) => sum + (isValidNumber(val) ? val : 0), 0) / varArr.length
             : 0;
 
+        let logArg = 1 + accessCount + 1e-8;
+        if (logArg <= 0) logArg = 1e-8;
+
+        let sizeBase = size + 1;
+        if (sizeBase <= 0) sizeBase = 1e-8;
+
+        let meanBase = 1 + avgMean;
+        if (meanBase <= 0) meanBase = 1e-8;
+
+        let varBase = 1 + avgVar;
+        if (varBase <= 0) varBase = 1e-8;
+
         const q = importance
-            * Math.log(1 + accessCount + 1e-8)
-            * Math.pow(size + 1, -1.5)
-            * Math.pow(1 + avgMean, 0.8)
-            * Math.pow(1 + avgVar, -1.2);
+            * Math.log(logArg)
+            * Math.pow(sizeBase, -1.5)
+            * Math.pow(meanBase, 0.8)
+            * Math.pow(varBase, -1.2);
 
         return isValidNumber(q) ? q : 0;
     }
