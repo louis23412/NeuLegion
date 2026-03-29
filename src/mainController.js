@@ -2277,18 +2277,13 @@ const runWorker = async (controller) => {
         })
         .map(c => c.lastSignal?.memoryBroadcast ?? {});
 
-    const childSharedMem = structureMap.flat(3)
+    const childSharedMem = (structureMap[controller.group][controller.section][controller.layer])
         .filter((c) => {
-            const peerId = `${c.group}${c.section}${c.layer}${c.id}`;
-            const peerCompat = c.lastSignal?.memoryBroadcast?.compatibility;
-
             return (
                 mainCompat &&
-                mainId !== peerId &&
                 c.type === controller.type &&
                 controller.tier > 1 && 
-                c.tier < controller.tier &&
-                canonicalJSON(mainCompat ?? {}) === canonicalJSON(peerCompat ?? {})
+                c.tier < controller.tier
             );
         })
         .map(c => c.lastSignal?.memoryBroadcast ?? {});
